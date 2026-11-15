@@ -93,3 +93,9 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Root cause:** `Ryujinx.Graphics.Shader` can declare an unused `cb0` (`OpVariable` + `OpDecorate Binding 1`) without adding it to `CBuffers`, causing `vk_pipeline.c` (`module_binding_missing`) to reject the pipeline.
 - **Fix:** In `runtime/gfx_shader.c` (`nvn2_offline_get`), scan the loaded SPIR-V for `OpDecorate ... Binding >= 1` and append any missing binding to `s->res[GFX_RES_UBO]`.
 - **Verification:** Graphics pipelines for `c674dc35b7a82578` and `2da4ab693163e08e` build cleanly with 0 skipped draws.
+
+### Q13: Black screen and no audio after boot (`StartVp9Decoder` ready-event race)
+- **Symptom:** `mtf-stage2.exe --boot` opened the Vulkan window and ran the main loop, but the screen stayed black with no audio output.
+- **Root cause:** `nro0` uses `main`'s `movie::VideoDecoder` (`nn::codec::Vp9Decoder`). `ov_vp9_ready_event` and `ov_vp9_acquire` signalled the submission-ready `SystemEvent` before `StartVp9Decoder` ran, while `StartVp9Decoder` was bound to `ov_ok` (no-op). `MovieEventHandler` (`nro0+0xd16460`) woke up early, called `ClearSystemEvent`, and posted an input-ready message to `MovieVideoHandler` (`nro0+0xd19c00`), which dropped it because `Start` had not yet set its active flag — leaving the decoder stalled on `RequestSyncPointEvent(0xc0de0000)`.
+- **Fix:** Bound `_ZN2nn5codec15StartVp9DecoderEPNS0_14Vp9DecoderTypeE` in `runtime/ov_codec.c` to `ov_vp9_start`, which signals the submission-ready `SystemEvent` via `kern_signal_system_event(event_for(c, key))`.
+- **Verification:** `mtf-stage2.exe --boot` decodes 2560x1440 VP9 video (`pass_0004_t0_2560x1440_43_rgba8srgb.png` at frame 120) and outputs non-zero audio (`first nonzero output after 182 frames`, 0 underruns).

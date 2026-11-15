@@ -201,6 +201,10 @@ def launch_gui() -> int:
             if done == total or label.startswith("Failed:"):
                 state["building"] = False
                 build_btn.configure(state=tk.NORMAL)
+                ver = ver_var.get().strip() or "327680"
+                exe_ready = (done == total and not label.startswith("Failed:")
+                             and (ROOT / f"build/v{ver}_stage2/mtf-stage2.exe").is_file())
+                launch_btn.configure(state=tk.NORMAL if exe_ready else tk.DISABLED)
         root.after(100, poll_queue)
 
     def on_build() -> None:
@@ -220,6 +224,7 @@ def launch_gui() -> int:
             return
         state["building"] = True
         build_btn.configure(state=tk.DISABLED)
+        launch_btn.configure(state=tk.DISABLED)
         progress_var.set(0.0)
         status_var.set("0/? (0%) — Starting...")
 
@@ -248,7 +253,10 @@ def launch_gui() -> int:
 
     build_btn.configure(command=on_build)
     build_btn.pack(side=tk.LEFT)
-    tk.Button(btns, text="Launch Game (Vulkan)", command=on_launch).pack(side=tk.LEFT, padx=(8, 0))
+    init_ver = ver_var.get().strip() or "327680"
+    launch_state = tk.NORMAL if (ROOT / f"build/v{init_ver}_stage2/mtf-stage2.exe").is_file() else tk.DISABLED
+    launch_btn = tk.Button(btns, text="Launch Game (Vulkan)", command=on_launch, state=launch_state)
+    launch_btn.pack(side=tk.LEFT, padx=(8, 0))
     root.after(100, poll_queue)
     root.mainloop()
     return 0

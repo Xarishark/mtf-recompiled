@@ -86,3 +86,8 @@
 - **Diagnostics (F7):** Ported MIT `runtime/flight.c`, `runtime/flight.h`, `runtime/rdoc.c`, `runtime/vk_headroom.c`, and `tools/flight_view.py` from `dkb-pc-recomp`; built `mtf-stage2.exe` cleanly in `0.5s`.
 - **Installer & Release Packaging (F8):** Implemented Tkinter/CLI local-build setup & launcher (`installer/mtf_setup.py`) and clean release packager (`tools/make_release.py`).
 - **Gate F8 verified:** `python tools/make_release.py` staged a clean source/launcher tree, passed `tools/check_content.py` (`0 violations`), and generated `build/release/mtf-recomp-0.1.0-dev-src.zip` (`2.79 MiB`).
+
+## 2026-11-15 — VP9 `StartVp9Decoder` Black-Screen/Audio Fix & Setup Launcher Polish
+- **Root cause & fix (`runtime/ov_codec.c`):** `nro0` uses `main`'s `movie::VideoDecoder`, which calls `nn::codec::StartVp9Decoder`. `StartVp9Decoder` was previously mapped to `ov_ok` (no-op), while `GetVp9DecoderSubmissionReadyEvent` signalled the ready event prematurely before `Start`; `MovieEventHandler` (`nro0+0xd16460`) cleared the event and posted to `MovieVideoHandler` (`nro0+0xd19c00`) before `Start` set its active flag, dropping the message and stalling both video and audio. Replaced `ov_ok` with `ov_vp9_start` to signal the submission-ready `SystemEvent` on `StartVp9Decoder`.
+- **Verification:** Rebuilt `mtf-stage2.exe` (`0.7s`), verified `TOTK_TRACE=audio` (`first nonzero output after 182 frames`, `0` underruns/overruns over `5.0 s`), and verified `TOTK_DUMP=120` (`work/dump_fixed/pass_0004_t0_2560x1440_43_rgba8srgb.png`) renders the 2560x1440 intro stadium movie frames.
+- **Installer UX (`installer/mtf_setup.py`):** Disabled `Launch Game (Vulkan)` until `mtf-stage2.exe` exists and while a build is running, re-enabling it only after a successful build.

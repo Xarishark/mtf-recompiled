@@ -125,12 +125,37 @@ static void require_cpu(void) {
 #endif
 }
 
+static void parse_trace(const char *s) {
+    if (!s || !*s) return;
+    static const struct { const char *name; unsigned bit; } bits[] = {
+        {"svc", RT_TRACE_SVC}, {"host", RT_TRACE_HOSTCALL}, {"ipc", RT_TRACE_IPC}, {"fs", RT_TRACE_FS},
+        {"gfx", RT_TRACE_GFX}, {"perf", RT_TRACE_PERF}, {"sched", RT_TRACE_SCHED}, {"audio", RT_TRACE_AUDIO},
+        {"present", RT_TRACE_PRESENT}, {"codec", RT_TRACE_CODEC},
+    };
+    const char *p = s;
+    while (*p) {
+        while (*p == ',' || *p == ' ') p++;
+        const char *q = p;
+        while (*q && *q != ',' && *q != ' ') q++;
+        size_t n = (size_t)(q - p);
+        if (n == 3 && !strncmp(p, "all", 3)) {
+            rt_trace = 0x3ffu;
+        } else {
+            for (size_t i = 0; i < sizeof bits / sizeof bits[0]; i++) {
+                if (strlen(bits[i].name) == n && !strncmp(p, bits[i].name, n)) rt_trace |= bits[i].bit;
+            }
+        }
+        p = q;
+    }
+}
+
 int main(int argc, char **argv) {
     require_cpu();
     mem_init();
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     plat_crash_hook(crash_handler);
+    parse_trace(getenv("TOTK_TRACE"));
 
     g_cfg = (RtConfig){
         .exefs = rt_default_exefs,
