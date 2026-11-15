@@ -10,12 +10,12 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 - [x] Port `tools/vendor/nup` and `profiles/0400D4201C6EA000/` (`profile.json`, `shader_facts.tsv`).
 - [x] **Gate F0:** `python tools/check_dump.py` validates `main`, `sdk`, `main.npdm`, `nrr.nrr` (NRR v1), and `romfs/42` (`CRA.`), and `python tools/check_content.py` passes with 0 violations.
 
-## F1 — Toolchain Setup & ARM64 Lifter (`main` + `sdk`)
+## F1 — Toolchain Setup & ARM64 Lifter (`main` + `sdk`) (Complete)
 
-- [ ] Install/configure build toolchain (`LLVM-MinGW` / `MSYS2 UCRT64 Clang`, `CMake`, `Ninja`, `.NET SDK`, `unicorn` for differential tests).
-- [ ] Port `recomp/` (`nso.py`, `module.py`, `lifter.py`, `simd_c.py`, `jumptables.py`, `gen.py`) from `LASRecomp` / `totk-pc-recomp`.
-- [ ] Support Switch 2 / ARMv8.3 instructions (`PAC` hints/branches, `LDAPR*`, `LSE` atomics, **`CRC32X`/`CRC32CX`**) and `DT_RELR` relocations.
-- [ ] **Gate F1:** 100% of `main` and `sdk` functions lift to C with 0 unsupported instructions, pass Unicorn differential tests, compile, and link.
+- [x] Install/configure build toolchain (`LLVM-MinGW 20261104-ucrt-x86_64` Clang 23.1.5 + `Ninja 1.13.2` in `toolchain/`, Python `lz4`/`zstandard`/`unicorn`).
+- [x] Port `recomp/` (`nso.py`, `module.py`, `lifter.py`, `simd_c.py`, `jumptables.py`, `gen.py`, `layout.py`, `patches.py`) from `totk-pc-recomp` / `LASRecomp`.
+- [x] Support Switch 2 / ARMv8.3 instructions (`PAC` hints/branches, `LDAPR*`, `LSE` atomics, `CRC32X`/`CRC32CX`) and `DT_RELR` relocations.
+- [x] **Gate F1:** 100% of `main` (1,589 fns) and `sdk` (47,907 fns) lift to C with 0 unsupported instructions, pass Unicorn differential tests (40,000 encodings, 119,955 cases, 0 failures), compile, and link (`mtf-stage1.exe`).
 
 ## F2 — Horizon OS HLE, Boot Stub (`nxboot`) & `nro0` Capture (24.7 MB)
 
