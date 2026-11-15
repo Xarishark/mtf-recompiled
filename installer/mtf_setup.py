@@ -48,15 +48,32 @@ def run_pipeline(dump_path: Path, update_version: str, log_fn=print) -> int:
     env = build_env()
     upd_dir = dump_path / "updates" / update_version
     exefs_dir = upd_dir / "exefs"
-    steps = [
+    rom42 = upd_dir / "romfs" / "42"
+    nro_path = ROOT / "build" / "nro" / "1ec347bc9f4664b467fc5f9b3a9336fe91e22e119fc7fb60f8cf44f0d30ce975.nro"
+    sh_dir = ROOT / f"build/v{update_version}/shaders-nvn2"
+    xlate_exe = sh_dir / "xlate" / "totk_xlate.exe"
+
+    steps: list[tuple[str, list[str]]] = [
         ("Validate dump", [sys.executable, "tools/check_dump.py"]),
         ("Verify content guard", [sys.executable, "tools/check_content.py"]),
-        ("Lift main & sdk", [sys.executable, "recomp/gen.py", "--exefs", str(exefs_dir), "--out", "generated/v327680", "--modules", "main,sdk", "--jobs", "8"]),
+        ("Lift main & sdk", [sys.executable, "recomp/gen.py", "--exefs", str(exefs_dir), "--out", f"generated/v{update_version}", "--modules", "main,sdk", "--jobs", "8"]),
         ("Build Stage-1", [sys.executable, "tools/build_stage1.py", "--jobs", "8"]),
-        ("Extract shaders", [sys.executable, "tools/shaders/extract.py"]),
-        ("Translate shaders", [sys.executable, "tools/shaders/translate.py"]),
-        ("Build Stage-2", [sys.executable, "tools/build_stage2.py", "--jobs", "16"]),
     ]
+
+    if nro_path.is_file():
+        if not (ROOT / f"generated/v{update_version}" / "nro0_tables.c").is_file():
+            steps.append(("Lift nro0", [sys.executable, "recomp/gen.py", "--exefs", str(exefs_dir), "--out", f"generated/v{update_version}", "--modules", "nro0", "--nro", f"nro0={nro_path}", "--jobs", "8"]))
+        if not (sh_dir / "shaders.bin").is_file():
+            steps.append(("Extract shaders", [sys.executable, "tools/shaders/extract.py", "--nro", str(nro_path), "--rom42", str(rom42), "--out", str(sh_dir)]))
+        if not xlate_exe.is_file():
+            dotnet = ROOT / "toolchain" / "dotnet" / "dotnet.exe"
+            steps.append(("Build shader translator", [str(dotnet), "publish", "tools/xlate/totk_xlate.csproj", "-c", "Release", "-o", str(xlate_exe.parent)]))
+        steps.append(("Translate shaders", [sys.executable, "tools/shaders/translate.py", "--pack", str(sh_dir / "shaders.bin"), "--xlate", str(xlate_exe), "--out", str(sh_dir / "spv"), "--skip-existing"]))
+    else:
+        log_fn(f"[setup] Note: {nro_path} not yet captured; skipping nro0/shader steps until Stage-2 capture.")
+
+    steps.append(("Build Stage-2", [sys.executable, "tools/build_stage2.py", "--jobs", "16"]))
+
     for title, cmd in steps:
         log_fn(f"\n=== {title} ===")
         proc = subprocess.Popen(
