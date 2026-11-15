@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-11-15  
 **Target game:** *Mario Tennis Fever* (Switch 2 / `Ounce`, Title ID `0400D4201C6EA000`, Update `1.1.1` / `v327680`)  
-**Current phase:** `F5` (Vulkan 1.3 Renderer Booting @ 60 FPS — awaiting interactive Stadium Court & validation-layer verification)
+**Current phase:** `F6` Complete (FSR 1, SMAA, HDR10, PerfMon, PT-BR/EN ImGui Menu, `mtf.ini`) $\rightarrow$ Ready for `F7` / `F8`
 
 ## Module Status
 

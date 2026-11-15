@@ -137,7 +137,7 @@ static const CfgMeta metas[] = {
     {"RUMBLE_TRIGGERS", "0", "0|1", LIVE}, {"PAD_LAYOUT", "auto", "auto|nintendo|xbox|xbox_prompts", LIVE},
     {"PAD_DEVICE", "auto", NULL, LIVE}, {"PAD_FULLSCREEN_HOLD", "0", "0|1", LIVE}, {"PAD_PROMPTS", "auto", "auto|switch|playstation", RESTART},
     {"STICK_DEADZONE", "8", "0..50", LIVE}, {"MOUSE_CAMERA", "0", "0|1", LIVE}, {"MOUSE_SENS", "1", "0..10", LIVE},
-    {"MENU_LANG", "", "en|ru", LIVE}, {"MENU_THEME", "dk", "dk|classic", LIVE},
+    {"MENU_LANG", "", "en|pt-BR|ru", LIVE}, {"MENU_THEME", "dk", "dk|classic", LIVE},
     // Advanced: scheduling
     {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
     {"REPLAY_THREADS", "", "0..16", RESTART},     // sliced passes (vk_exec.c par_threads): 0 off, else the recording threads; unset: 6 from 12 logical processors, 4 from 8, except on AMD, else 0
@@ -672,7 +672,7 @@ static int find_ini(void) {
     if (!cut) cut = strrchr(path, '/');
     if (!cut || cut + 10 >= path + sizeof path) return 0;
     // Bananza writes dkb.ini and reads an older totk.ini only while no dkb.ini exists; TotK keeps totk.ini.
-    strcpy(cut + 1, rt_game_version ? "totk.ini" : "dkb.ini");
+    strcpy(cut + 1, "mtf.ini");
     snprintf(ini_path, sizeof ini_path, "%s", path);
     if (!rt_game_version && !plat_file_exists(ini_path)) {
         // No dkb.ini yet: an existing totk.ini is copied to it, so the settings carry over and every later write

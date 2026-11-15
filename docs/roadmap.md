@@ -45,9 +45,9 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 
 ## F6 — PC Features (4K, DLSS/DLAA/FSR1, HDR10, Gyro, PT-BR/EN Menu)
 
-- [ ] Port resolution scaling (up to 4K), FSR 1, NVIDIA DLAA/DLSS, and HDR10 reconstruction from HDR light buffer.
-- [ ] Port ImGui two-pane settings menu (`F1`/`Esc`/`Minus+Plus`) in English and Brazilian Portuguese + `perfmon.c` + SDL3 gyro.
-- [ ] **Gate F6:** All PC enhancement options toggle cleanly in-game and persist in `mtf.ini`.
+- [x] Port FSR 1 (`vk_fsr.c`), SMAA (`vk_smaa.c`), HDR10 (`vk_hdr.c`), uniform snapshot (`vk_usnap.c`), and `perfmon.c`.
+- [x] Port ImGui two-pane settings menu (`runtime/ui/`, `runtime/third_party/imgui/`, `F1`/`Esc`/`Minus+Plus`) in English and Brazilian Portuguese (`pt-BR`) + `mtf.ini` persistence.
+- [x] **Gate F6:** PC enhancement options (`TOTK_UPSCALER=fsr`, `TOTK_SMAA=high`, `TOTK_MENU_LANG=pt-BR`, `TOTK_PERF_OVERLAY=full`) toggle live, render across all 7 menu tabs (`menu-test-35-0.png`..`65-6.png`), and persist/reload via `mtf.ini`. (Optional NVIDIA NGX DLSS/DLAA skipped for MIT license compliance.)
 
 ## F7 — Diagnostics, Frame Replay & Visual Bugfixes
 

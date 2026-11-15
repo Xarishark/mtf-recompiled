@@ -76,3 +76,8 @@
   - `runtime/gfx_shader.c` (`nvn2_offline_get`): backfilled unused `OpDecorate ... Binding >= 1` entries (`cb0`) into `GFX_RES_UBO` so `vk_pipeline.c` `layout_covers` builds all pipelines.
   - `runtime/nvn_api_cmd.c` (`bind_vertex_buffers`): silently ignored null clears on streams `16..31`.
 - **Verification:** `mtf-stage2.exe --boot` (`MTF_GPU=vulkan`, `TOTK_ASYNC_PREEMPT=0`) initializes Vulkan 1.3 on RTX 5070 Ti, opens swapchain (`1920x1061`, mailbox, 60 FPS), compiles compute + graphics pipelines with 0 failures, runs VP9 `2560x1440` decoder, and presents `600+` frames cleanly. (Note: `VK_LAYER_KHRONOS_validation` is not installed on the test machine.)
+
+## 2026-11-15 — Phase F6: PC Enhancements (FSR 1, SMAA, HDR10, PerfMon, PT-BR/EN ImGui Menu, `mtf.ini`)
+- **Graphics & Perf (`runtime/vk_fsr.c`, `vk_smaa.c`, `vk_hdr.c`, `vk_usnap.c`, `perfmon.c`):** Ported MIT implementations + SPIR-V headers and `runtime/shaders/smaa/{AreaTex.h,SearchTex.h}` from `dkb-pc-recomp`. Skipped `vk_dlss.c` (`GPL-2.0-or-later`) to maintain strict MIT license compliance.
+- **ImGui Settings Menu (`runtime/ui/`, `runtime/third_party/imgui/`, `runtime/ui_text.c`):** Ported Dear ImGui + `imgui_impl_vulkan` and the two-pane menu (`F1`/`Esc`/`Minus+Plus`). Added Brazilian Portuguese (`pt-BR`) catalog & auto-detection alongside English (`en`), branded to `MTF Recomp`, and switched config persistence (`runtime/cfg.c`) to `mtf.ini`.
+- **Gate F6 verified:** `TOTK_MENU_TEST=30:5 TOTK_MENU_TEST_SET=20:TOTK_UPSCALER=fsr,TOTK_SMAA=high,TOTK_MENU_LANG=pt-BR,SAVE=1 TOTK_PERF_OVERLAY=full` wrote `mtf.ini`, reloaded all 3 keys on the next run, and rendered all 7 menu tabs (`0.176 ms` CPU/frame) + performance overlay cleanly.
