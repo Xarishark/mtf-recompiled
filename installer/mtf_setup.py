@@ -42,7 +42,21 @@ def build_env() -> dict[str, str]:
     return env
 
 
+def is_game_running() -> bool:
+    if os.name != "nt":
+        return False
+    res = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq mtf-stage2.exe"],
+        capture_output=True,
+        text=True,
+    )
+    return "mtf-stage2.exe" in res.stdout.lower()
+
+
 def run_pipeline(dump_path: Path, update_version: str, log_fn=print) -> int:
+    if is_game_running():
+        log_fn("[setup] ERROR: mtf-stage2.exe is currently running. Close the game window before rebuilding.")
+        return 1
     write_config_local(dump_path, update_version)
     log_fn(f"[setup] Wrote {ROOT / 'config.local.toml'} -> {dump_path}")
     env = build_env()
