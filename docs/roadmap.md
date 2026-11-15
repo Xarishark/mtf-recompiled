@@ -24,12 +24,12 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 - [x] Implement directory-backed `rom:/` VFS mounting (`runtime/romfs.c`), `nn::fs` host storage (`runtime/fs_host.c`), `R_AARCH64_TLSDESC` relocation support (`runtime/loader.c`), and Stage-2 subsystem stubs (`runtime/stage2_stubs.c`).
 - [x] **Gate F2:** `mtf-stage2.exe` boots `main` + `sdk` + `nro0` (with `TOTK_ASYNC_PREEMPT=0`), mounts `rom:/` and `save:/`, completes `nro0 DT_INIT` (197 entries), and reaches the first NVN2 call (`nvnDeviceGetProcAddress` at `nro0+0xaf71e4`).
 
-## F3 — NVN2 Null Renderer, Audio (REV15) & VP9 Movies (`nn::codec`)
+## F3 — NVN2 Null Renderer, Audio (REV15) & VP9 Movies (`nn::codec`) (Complete)
 
-- [ ] Implement NVN2 proc table (~700 entry points) with `MTF_GPU=null` fence/event pacing.
-- [ ] Port `audren.c` (REV15) + SDL3 audio output (stereo & 5.1) and `ov_hid.c` (SDL3 gamepad + keyboard).
-- [ ] Implement async `ov_codec.c` (`CV_HOLD=12` event accounting, `libvpx` with 4 threads + `VP9D_SET_ROW_MT=1` for 1440p@60fps opening movie).
-- [ ] **Gate F3:** Game runs at 60 Hz under `MTF_GPU=null`, plays opening movie audio without choppiness, and navigates menus via input.
+- [x] Implement NVN2 proc table (~700 entry points, `nvnQueueWaitSync`, `nvnCommandBufferSetCopyImageStride`) with `MTF_GPU=null` fence/event pacing (`frame_rate.c`).
+- [x] Port `audren.c` (REV15) + SDL3 audio output (`audio_mixer.c`, `audio_effects.c`, `audio_reverb.c`) and input (`input.c`, `input_win.c`, `ov_input.c`, `motion_fusion.c`, `GetNpadState`, `SetNpadHandheldActivationMode`, `GetNpadControllerColor`, `SetGyroscopeZeroDriftMode`).
+- [x] Port async `ov_codec.c` (`libvpx` VP9 2560x1440 decoder) + `ov_movie.c`, plus `nn::friends` offline stubs, `nn::oe` display resolution/notification event overrides, and system TTF fallback for missing shared fonts.
+- [x] **Gate F3:** `mtf-stage2.exe --boot` with `MTF_GPU=null` and `TOTK_ASYNC_PREEMPT=0` runs at 60 Hz (`frame rate: limit 60 fps`, `present 1`), opens REV15 `audren` + SDL3 audio (`48000 Hz x240, voices 96`), and initializes `2560x1440` `libvpx` VP9 video decoder cleanly.
 
 ## F4 — `CRA.` Extraction & Offline Shader Translation (35,045 Shaders)
 

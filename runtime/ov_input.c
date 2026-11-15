@@ -69,6 +69,14 @@ static void ov_supported_styles(Cpu *c) {
     plat_mutex_unlock(&lock);
 }
 
+// NpadStyleSet GetSupportedNpadStyleSet()
+static void ov_get_supported_styles(Cpu *c) {
+    plat_mutex_lock_shared(&lock);
+    uint32_t v = styles;
+    plat_mutex_unlock_shared(&lock);
+    ret_x(c, v);
+}
+
 // NpadStyleSet GetNpadStyleSet(const NpadIdType &id)
 static void ov_style_set(Cpu *c) {
     uint32_t id = *need_id(c, 0, "GetNpadStyleSet");
@@ -76,6 +84,18 @@ static void ov_style_set(Cpu *c) {
     uint32_t v = enabled && allowed && id == pad_id() ? styles & pad_style() : 0;
     plat_mutex_unlock_shared(&lock);
     ret_x(c, v);
+}
+
+static void fill_npad_state(NpadState *out, uint32_t id, uint32_t want) {
+    plat_mutex_lock(&lock);
+    NpadState s = {.sampling = ++sample};
+    int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
+    plat_mutex_unlock(&lock);
+    if (live) {
+        s.attributes = ATTR_CONNECTED;
+        input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
+    }
+    *out = s;
 }
 
 // int GetNpadStates(<State> *out, int count, const NpadIdType &id): the newest state only. want: the style of the
@@ -86,20 +106,23 @@ static void npad_states(Cpu *c, uint32_t want) {
     uint32_t id = *need_id(c, 2, "GetNpadStates");
     if (max <= 0) { ret_x(c, 0); return; }
     if (!out) rt_fatal("nn::hid::GetNpadStates: null output");
-    plat_mutex_lock(&lock);
-    NpadState s = {.sampling = ++sample};
-    int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
-    plat_mutex_unlock(&lock);
-    if (live) {
-        s.attributes = ATTR_CONNECTED;
-        input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
-    }
-    *out = s;
+    fill_npad_state(out, id, want);
     ret_x(c, 1);
 }
 static void ov_states_full_key(Cpu *c) { npad_states(c, STYLE_FULL_KEY); }
 static void ov_states_handheld(Cpu *c) { npad_states(c, STYLE_HANDHELD); }
 static void ov_states_joycon(Cpu *c) { npad_states(c, 0); }
+
+// void GetNpadState(<State> *out, const NpadIdType &id)
+static void npad_state_one(Cpu *c, uint32_t want) {
+    NpadState *out = arg_p(c, 0);
+    uint32_t id = *need_id(c, 1, "GetNpadState");
+    if (!out) rt_fatal("nn::hid::GetNpadState: null output");
+    fill_npad_state(out, id, want);
+}
+static void ov_state_full_key(Cpu *c) { npad_state_one(c, STYLE_FULL_KEY); }
+static void ov_state_handheld(Cpu *c) { npad_state_one(c, STYLE_HANDHELD); }
+static void ov_state_joycon(Cpu *c) { npad_state_one(c, 0); }
 
 // void SetNpadJoyHoldType(NpadJoyHoldType type)
 static void ov_hold_type(Cpu *c) {
@@ -515,6 +538,41 @@ static void ov_touch_state1(Cpu *c) {
 // always a full controller, so the assignment mode changes nothing
 static void ov_joy_assignment(Cpu *c) { ret_x(c, 0); }
 
+// Result GetNpadControllerColor(NpadControllerColor *out, const NpadIdType &id)
+static void ov_controller_color(Cpu *c) {
+    uint32_t *out = arg_p(c, 0);
+    uint32_t id = *need_id(c, 1, "GetNpadControllerColor");
+    if (!out) rt_fatal("nn::hid::GetNpadControllerColor: null output");
+    (void)id;
+    out[0] = 0x323232ffu;
+    out[1] = 0xffffffffu;
+    ret_x(c, 0);
+}
+
+// Result GetNpadControllerColor(NpadControllerColor *left, NpadControllerColor *right, const NpadIdType &id)
+static void ov_controller_color_lr(Cpu *c) {
+    uint32_t *left = arg_p(c, 0), *right = arg_p(c, 1);
+    uint32_t id = *need_id(c, 2, "GetNpadControllerColor");
+    if (!left || !right) rt_fatal("nn::hid::GetNpadControllerColor: null output");
+    (void)id;
+    left[0] = 0x323232ffu; left[1] = 0xffffffffu;
+    right[0] = 0x323232ffu; right[1] = 0xffffffffu;
+    ret_x(c, 0);
+}
+
+// bool SetNpadJoyAssignmentModeSingle(NpadIdType *out, const NpadIdType &id, NpadJoyDeviceType)
+static void ov_joy_assignment_single_out(Cpu *c) {
+    uint32_t *out = arg_p(c, 0);
+    const uint32_t *id = arg_p(c, 1);
+    if (out && id) *out = *id;
+    ret_x(c, 0);
+}
+
+// void GetSixAxisSensorState(SixAxisSensorState *out, const SixAxisSensorHandle &)
+static void ov_six_state_public(Cpu *c) {
+    six_fill(arg_p(c, 0), 1, arg_p(c, 1), "GetSixAxisSensorState");
+}
+
 HOST_OVERRIDE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_start);
 HOST_OVERRIDE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE",
               ov_six_states_public);
@@ -526,6 +584,18 @@ HOST_OVERRIDE("_ZN2nn3hid19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT
 HOST_OVERRIDE("_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj", ov_joy_assignment);
 HOST_OVERRIDE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE", ov_joy_assignment);
 HOST_OVERRIDE("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", ov_joy_assignment);
+HOST_OVERRIDE("_ZN2nn3hid29SetNpadHandheldActivationModeENS0_26NpadHandheldActivationModeE", ov_joy_assignment);
+HOST_OVERRIDE("_ZN2nn3hid6detail29SetNpadHandheldActivationModeENS0_26NpadHandheldActivationModeE", ov_joy_assignment);
+HOST_OVERRIDE("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE", ov_joy_assignment);
+HOST_OVERRIDE("_ZN2nn3hid6detail25SetGyroscopeZeroDriftModeENS0_19SixAxisSensorHandleENS0_22GyroscopeZeroDriftModeE", ov_joy_assignment);
+HOST_OVERRIDE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", ov_six_state_public);
+HOST_OVERRIDE("_ZN2nn3hid24GetSupportedNpadStyleSetEv", ov_get_supported_styles);
+HOST_OVERRIDE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorERKj", ov_controller_color);
+HOST_OVERRIDE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj", ov_controller_color_lr);
+HOST_OVERRIDE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", ov_joy_assignment);
+HOST_OVERRIDE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleEPjRKjNS0_17NpadJoyDeviceTypeE", ov_joy_assignment_single_out);
+HOST_OVERRIDE("_ZN2nn3hid18SwapNpadAssignmentERKjS2_", ov_joy_assignment);
+HOST_OVERRIDE("_ZN2nn3hid24ShowControllerStrapGuideEv", ov_joy_assignment);
 
 HOST_OVERRIDE("_ZN2nn3hid14InitializeNpadEv", ov_initialize_npad);
 HOST_OVERRIDE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", ov_supported_ids);
@@ -536,6 +606,11 @@ HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", ov_state
 HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", ov_states_joycon);
 HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", ov_states_joycon);
 HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", ov_states_handheld);
+HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", ov_state_full_key);
+HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", ov_state_joycon);
+HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", ov_state_joycon);
+HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", ov_state_joycon);
+HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", ov_state_handheld);
 HOST_OVERRIDE("_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", ov_hold_type);
 HOST_OVERRIDE("_ZN2nn3hid14DisconnectNpadERKj", ov_disconnect);
 HOST_OVERRIDE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",

@@ -57,3 +57,20 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Root Cause:** MTF clears 32 vertex streams (`16..31` with null ranges) before every model, and renders at `2048x1152` inside a `2560x1440` window texture cropped via `nvnWindowSetCrop`.
 - **Solution (F5):** Ignore vertex stream binds with `first + count > 16` cleanly in `nvn_api_cmd.c`, and honor `nvnWindowSetCrop` in the Vulkan swapchain blit.
 - **Verification:** 0 Vulkan validation errors during gameplay; clean full-frame presentation.
+
+### Q8: `nn::hid::GetNpadState` (singular) vs `GetNpadStates` (plural) in MTF `nro0`
+- **Symptom:** `sdk+0x64d420` aborted with `Result 0x58cca` even though `GetNpadStates` was overridden.
+- **Root cause:** MTF's `nro0` imports `nn::hid::GetNpadState` (singular, 2 args) in addition to `GetNpadStates` (plural, 3 args), plus `SetNpadHandheldActivationMode`, `GetNpadControllerColor`, and `SetGyroscopeZeroDriftMode`.
+- **Fix:** Extracted `fill_npad_state()` in `runtime/ov_input.c` and registered `HOST_OVERRIDE`s for all singular `GetNpadState` overloads and the remaining `nn::hid` symbols.
+- **Verification:** `mtf-stage2.exe --boot` initializes all HID controllers, six-axis sensors, and vibration devices without hitting `sm: service "hid"`.
+
+### Q9: `nn::oe` & `nn::friends` system events + missing shared fonts
+- **Symptom:** After overriding `nn::oe::Initialize` and `nn::friends::Initialize`, `GetDefaultDisplayResolutionChangeEvent`, `GetNotificationMessageEvent`, and `GetFriendInvitationNotificationEvent` returned uninitialized `SystemEvent` pointers or hit `friend:u`, and `nn::pl::GetSharedFontSize(0)` aborted when Switch firmware `.bfttf` files were not provided.
+- **Root cause:** MTF polls `nn::oe::GetNotificationMessageEvent` via `TimedWaitSystemEvent` and initializes `nn::friends` and `nn::fontll` during boot.
+- **Fix:** Added `nn::friends` offline overrides and `nn::oe` event/resolution overrides in `runtime/ov_system.c` using `kern_bind_system_event`, plus a `C:/Windows/Fonts/arial.ttf` fallback when `.bfttf` shared fonts are absent.
+- **Verification:** `mtf-stage2.exe --boot` passes `nn::friends`, `nn::oe`, and `nn::fontll` initialization cleanly.
+
+### Q10: NVN2 `BindVertexBuffers` slots `16..31`
+- **Symptom:** `nvnCommandBufferBindVertexBuffers` logs `nvn: BindVertexBuffers first 16..31 n 1` during rendering under `MTF_GPU=null`.
+- **Root cause:** Switch 2 NVN2 exposes 32 vertex buffer binding slots (`0..31`), while the ported `dkb-pc-recomp` check in `runtime/nvn_api_cmd.c` caps `first + n <= 16`.
+- **Fix / Note for F5:** Harmless under `MTF_GPU=null`; in Phase F5 (Vulkan 1.3 backend), expand/ignore unused null vertex streams `16..31` cleanly as noted in `docs/roadmap.md`.

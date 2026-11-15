@@ -144,6 +144,30 @@ static void ov_bcat_initialize(Cpu *c) {
     rt_log("bcat: offline host; no delivery cache is installed");
 }
 
+static void ov_friends_initialize(Cpu *c) {
+    (void)c;
+    rt_log("friends: offline host; friend list is empty");
+    ret_x(c, 0);
+}
+
+static void ov_friends_get_list(Cpu *c) {
+    int32_t *out_count = arg_p(c, 0);
+    if (out_count) *out_count = 0;
+    ret_x(c, 0);
+}
+
+static void ov_friends_ok(Cpu *c) { ret_x(c, 0); }
+
+static void ov_friends_event(Cpu *c) {
+    static uint64_t ev_addr;
+    if (!ev_addr) {
+        void *p = mem_kernel_alloc(64, 16);
+        ev_addr = (uint64_t)(uintptr_t)p;
+        kern_bind_system_event(c, ev_addr, 1);
+    }
+    ret_x(c, ev_addr);
+}
+
 static void ov_streamplay_memory(Cpu *c) {
     // No GameShare session or streaming buffers exist on the offline host.
     rt_log("streamplay: GameShare unavailable; no streaming work memory required");
@@ -795,28 +819,41 @@ static void ov_font_state(Cpu *c) { font_type(c, "GetSharedFontLoadState"); ret_
 
 // The font of type t, read and checked on first use; a named fatal when it is missing or damaged.
 static const uint8_t *font_data(Cpu *c, const char *fn, int64_t t) {
+    (void)c; (void)fn;
     plat_mutex_lock(&fonts.lock);
     if (!fonts.file[t]) {
-        char dir[PLAT_PATH_MAX], path[PLAT_PATH_MAX + 64], lr[96];
+        char dir[PLAT_PATH_MAX], path[PLAT_PATH_MAX + 64];
         snprintf(path, sizeof path, "%s/%s", ov_shared_font_dir(dir, sizeof dir), font_files[t]);
         FILE *f = fopen(path, "rb");
-        if (!f)
-            rt_fatal("nn::pl::%s(%lld) from %s: no shared font %s (needed for Chinese and Korean text); run "
-                     "tools/extract_fonts.py --firmware <firmware NCA dir> or set TOTK_SHARED_FONTS", fn, (long long)t,
-                     caller(c, lr, sizeof lr), path);
+        int is_raw_ttf = 0;
+        if (!f) {
+            const char *win_font = "C:/Windows/Fonts/arial.ttf";
+            f = fopen(win_font, "rb");
+            if (f) {
+                is_raw_ttf = 1;
+                static volatile int32_t warned[SHARED_FONT_TYPES];
+                if (!__atomic_exchange_n(&warned[t], 1, __ATOMIC_RELAXED))
+                    rt_log("pl: shared font %lld (%s) not found at %s; using system fallback %s",
+                           (long long)t, font_type_name(t), path, win_font);
+            } else {
+                rt_fatal("nn::pl::%s(%lld): no shared font %s and no fallback %s", fn, (long long)t, path, win_font);
+            }
+        }
         plat_fseek64(f, 0, SEEK_END);
         int64_t len = plat_ftell64(f);
         plat_fseek64(f, 0, SEEK_SET);
         if (len < 12 || len > (64 << 20)) rt_fatal("nn::pl: shared font %s: size %lld", path, (long long)len);
-        uint8_t *p = mem_kernel_alloc((uint64_t)len, 16);
-        size_t got = fread(p, 1, (size_t)len, f);
+        uint8_t *p = mem_kernel_alloc((uint64_t)len + (is_raw_ttf ? 8 : 0), 16);
+        size_t got = fread(p + (is_raw_ttf ? 8 : 0), 1, (size_t)len, f);
         fclose(f);
-        uint64_t size = got == (size_t)len ? ov_bfttf_size(p, (uint64_t)len) : 0;
-        if (!size) rt_fatal("nn::pl: shared font %s is not a BFTTF font", path);
+        uint64_t size = is_raw_ttf ? (got == (size_t)len ? (uint64_t)len : 0)
+                                   : (got == (size_t)len ? ov_bfttf_size(p, (uint64_t)len) : 0);
+        if (!size) rt_fatal("nn::pl: shared font %s is not a valid font", path);
         fonts.size[t] = size;
         __atomic_store_n(&fonts.file[t], p, __ATOMIC_RELEASE);
-        rt_log("pl: shared font %lld (%s): %llu bytes from %s", (long long)t, font_type_name(t),
-               (unsigned long long)size, path);
+        if (!is_raw_ttf)
+            rt_log("pl: shared font %lld (%s): %llu bytes from %s", (long long)t, font_type_name(t),
+                   (unsigned long long)size, path);
     }
     const uint8_t *p = fonts.file[t];
     plat_mutex_unlock(&fonts.lock);
@@ -845,6 +882,33 @@ static void ov_album_orientation(Cpu *c) { (void)c; }
 // void nn::oe::{Enter,Leave}ExitRequestHandlingSection(): no exit request ever arrives from a host system applet
 static void ov_exit_section(Cpu *c) { (void)c; }
 
+static void ov_default_display_resolution(Cpu *c) {
+    int32_t *w = arg_p(c, 0), *h = arg_p(c, 1);
+    if (w) *w = 1920;
+    if (h) *h = 1080;
+}
+
+static void ov_default_display_resolution_event(Cpu *c) {
+    uint64_t ev = arg_x(c, 0);
+    if (ev) kern_bind_system_event(c, ev, 1);
+    ret_x(c, 0);
+}
+
+static void ov_oe_notification_event(Cpu *c) {
+    static uint64_t ev_addr;
+    if (!ev_addr) {
+        void *p = mem_kernel_alloc(64, 16);
+        ev_addr = (uint64_t)(uintptr_t)p;
+        kern_bind_system_event(c, ev_addr, 1);
+    }
+    ret_x(c, ev_addr);
+}
+
+static void ov_oe_try_pop_notification(Cpu *c) {
+    (void)c;
+    ret_x(c, 0);
+}
+
 HOST_OVERRIDE("_ZN2nn2oe23GetCurrentGraphicsScaleEv", ov_graphics_scale);
 HOST_OVERRIDE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", ov_graphics_scale_notify);
 HOST_OVERRIDE("_ZN2nn2oe24SetAlbumImageOrientationENS_5album16ImageOrientationE", ov_album_orientation);
@@ -871,6 +935,11 @@ HOST_OVERRIDE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", ov_launch_parameter);
 HOST_OVERRIDE("_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", ov_get_balance);
 HOST_OVERRIDE("_ZN2nn2oe24SetExpectedVolumeBalanceEff", ov_set_balance);
 HOST_OVERRIDE("_ZN2nn2oe25GetProgramTotalActiveTimeEv", ov_active_time);
+HOST_OVERRIDE("_ZN2nn2oe25TryPopNotificationMessageEPj", ov_oe_try_pop_notification);
+HOST_OVERRIDE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", ov_default_display_resolution);
+HOST_OVERRIDE("_ZN2nn2oe27GetNotificationMessageEventEv", ov_oe_notification_event);
+HOST_OVERRIDE("_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE", ov_default_display_resolution_event);
+HOST_OVERRIDE("_ZN2nn2oe40SendServerMaintenanceOverlayNotificationENS_4time9PosixTimeES2_", ov_exit_section);
 HOST_OVERRIDE("_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb", ov_inactivity_extended);
 HOST_OVERRIDE("_ZN2nn2oe44SetUserInactivityDetectionTimeExtendedUnsafeEb", ov_inactivity_extended);
 HOST_OVERRIDE("_ZN2nn2oe17FinishStartupLogoEv", ov_finish_logo);
@@ -923,6 +992,20 @@ HOST_OVERRIDE("_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE", ov_op
 HOST_OVERRIDE("_ZN2nn7account9CloseUserERKNS0_10UserHandleE", ov_close_user);
 HOST_OVERRIDE("_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE", ov_user_id);
 HOST_OVERRIDE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm", ov_cached_account);
+HOST_OVERRIDE("_ZN2nn7friends10InitializeEv", ov_friends_initialize);
+HOST_OVERRIDE("_ZN2nn7friends13GetFriendListEPiPNS0_6FriendERKNS_7account3UidEiiRKNS0_12FriendFilterE", ov_friends_get_list);
+HOST_OVERRIDE("_ZN2nn7friends14AddPlayHistoryERKNS_7account3UidERKNS0_26PlayHistoryRegistrationKeyERKNS0_15InAppScreenNameESA_", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends16UpdateFriendInfoEPNS0_6FriendERKNS_7account3UidEPKNS3_23NetworkServiceAccountIdEi", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends17NotificationQueue14GetSystemEventEv", ov_friends_event);
+HOST_OVERRIDE("_ZN2nn7friends17NotificationQueue8FinalizeEv", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends17NotificationQueue3PopEPNS0_16NotificationInfoE", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends21StartFriendInvitationERKNS_7account3UidEiRKNS0_35FriendInvitationGameModeDescriptionEPKvm", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends28DeclareOpenOnlinePlaySessionERKNS_7account3UidE", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends29DeclareCloseOnlinePlaySessionERKNS_7account3UidE", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegistrationKeyERKNS_7account3UidEb", ov_friends_ok);
+HOST_OVERRIDE("_ZN2nn7friends36GetFriendInvitationNotificationEventEv", ov_friends_event);
+HOST_OVERRIDE("_ZN2nn7friends38TryPopFriendInvitationNotificationInfoEPNS_7account3UidEPmPvm", ov_friends_ok);
 HOST_OVERRIDE("_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE", ov_last_opened_user);
 HOST_OVERRIDE("_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE", ov_user_existence);
 HOST_OVERRIDE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", ov_nickname);

@@ -1,46 +1,44 @@
-// Temporary stubs for subsystems implemented in Phases F3-F6
-// (Vulkan renderer, audio renderer, input, movie decoder, resolution scaler, frame pacing).
+// Temporary stubs for subsystems implemented in Phases F4-F6
+// (Vulkan renderer, resolution scaler, DLC/AOC).
 
 #include "fs.h"
 #include "gfx.h"
 #include "host.h"
 #include "ipc.h"
 
-void frame_step_init(void) {}
-int frame_step_realtime(void) { return 0; }
-uint64_t frame_step_cap_ns(void) { return 16666667ull; }
-double frame_step_limit_hz(void) { return 60.0; }
-int64_t frame_step_world_us(void) { return -1; }
-
 void res_init(void) {}
 uint64_t res_heap_extra_bytes(void) { return 0; }
-void prof_write(void) {}
-void perf_main_thread(void) {}
-void input_script_report(void) {}
+void gfx_shader_nvn2_dump(const uint8_t *ctl, const uint8_t *code) { (void)ctl; (void)code; }
+int gfx_shader_is_nvn2(const uint8_t *ctl) { (void)ctl; return 0; }
+int nvn2_lower(const uint8_t *ctl, const uint8_t *code, const uint8_t **nc, const uint8_t **nd) {
+    (void)ctl; (void)code; (void)nc; (void)nd;
+    return 0;
+}
 void gfx_exit_release(void) {}
 void gfx_shader_prepare_recorded(int a, int b) { (void)a; (void)b; }
 int gfx_replay_async(void) { return 0; }
 int gfx_window_hdr10(void) { return 0; }
 void gfx_vsync_bind(uint64_t system_event) { (void)system_event; }
+double gfx_window_refresh_hz(void) { return 60.0; }
+void gfx_window_toggle_fullscreen(void) {}
+void *gfx_window_handle(void) { return NULL; }
+void gfx_shader_counts(uint64_t *keys, uint64_t *translated) {
+    if (keys) *keys = 0;
+    if (translated) *translated = 0;
+}
+int menu_is_open(void) { return 0; }
+void menu_toggle(void) {}
+void menu_perf_cycle(void) {}
+int flight_on = 0;
+void flight_init(void) {}
+void flight_frame(double a, int b) { (void)a; (void)b; }
+void perfmon_frame(double a) { (void)a; }
 const GfxBackend gfx_vulkan_backend = {0};
 
-void nvn_shutdown(void) {}
 void nfp_shutdown(void) {}
 void swkbd_shutdown(void) {}
-
-void nvn_init(void) {
-    rt_log("stage2: reached nvn_init (first NVN2 initialization)");
-}
-void nvn_procs_register(void) {}
-uint64_t nvn_proc_address(const char *name) {
-    rt_log("stage2: nvn_proc_address(%s)", name ? name : "(null)");
-    return 0;
-}
-pool_t *nvn_pool_find(uint64_t addr, uint64_t *offset) {
-    (void)addr;
-    if (offset) *offset = 0;
-    return NULL;
-}
+void ov_audio_shutdown(void) {}
+void ov_input_shutdown(void) {}
 
 // Add-on content (DLC) stubs
 void aoc_romfs_mount_all(void) {}
@@ -73,30 +71,3 @@ void aoc_close(uint64_t h) { (void)h; }
 uint32_t aoc_entry_type(int *out, const char *path) { (void)out; (void)path; return FS_R_PATH_NOT_FOUND; }
 int aoc_count(void) { return 0; }
 int aoc_list(int *out, int offset, int count) { (void)out; (void)offset; (void)count; return 0; }
-
-// Audio stubs
-void audren_shutdown(void) {}
-void ov_audio_shutdown(void) {}
-int audren_renderers_live(void) { return 0; }
-void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-    (void)s; (void)rq;
-    rs->result = IPC_R_UNKNOWN_COMMAND;
-}
-void aud_user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-    (void)s; (void)rq;
-    rs->result = IPC_R_UNKNOWN_COMMAND;
-}
-
-// Movie / Input stubs
-void ov_movie_shutdown(void) {}
-void ov_input_shutdown(void) {}
-void input_shutdown(void) {}
-void input_poll(void) {}
-void input_motion_start(void) {}
-int input_motion_enabled(void) { return 0; }
-int input_rumble_triggers_enabled(void) { return 0; }
-void input_rumble(float l, float r, float lt, float rt) { (void)l; (void)r; (void)lt; (void)rt; }
-float rumble_motor(float amp, float freq) { (void)freq; return amp; }
-int motion_global(void) { return 0; }
-void motion_restart(void) {}
-void motion_read(void *out) { (void)out; }
