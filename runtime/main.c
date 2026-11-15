@@ -88,8 +88,25 @@ void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) {
     (void)x0;
 }
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 static void crash_handler(const PlatCrash *c) {
     uintptr_t base = plat_exe_base();
+#ifdef _WIN32
+    HMODULE mod = NULL;
+    char modname[260] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(uintptr_t)c->rip, &mod) && mod) {
+        GetModuleFileNameA(mod, modname, sizeof modname);
+        rt_log("CRASH: exception %#x at host rip=%#llx (%s+%#llx), addr=%#llx",
+               c->code, (unsigned long long)c->rip, modname,
+               (unsigned long long)(c->rip - (uintptr_t)mod), (unsigned long long)c->addr);
+        fflush(stderr);
+        return;
+    }
+#endif
     rt_log("CRASH: exception %#x at host rip=%#llx (exe+%#llx), addr=%#llx",
            c->code, (unsigned long long)c->rip, (unsigned long long)(c->rip - base),
            (unsigned long long)c->addr);

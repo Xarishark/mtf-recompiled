@@ -77,6 +77,19 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Verification:** `mtf-stage2.exe --boot` passes `nn::friends`, `nn::oe`, and `nn::fontll` initialization cleanly.
 
 ### Q10: NVN2 `BindVertexBuffers` slots `16..31`
-- **Symptom:** `nvnCommandBufferBindVertexBuffers` logs `nvn: BindVertexBuffers first 16..31 n 1` during rendering under `MTF_GPU=null`.
-- **Root cause:** Switch 2 NVN2 exposes 32 vertex buffer binding slots (`0..31`), while the ported `dkb-pc-recomp` check in `runtime/nvn_api_cmd.c` caps `first + n <= 16`.
-- **Fix / Note for F5:** Harmless under `MTF_GPU=null`; in Phase F5 (Vulkan 1.3 backend), expand/ignore unused null vertex streams `16..31` cleanly as noted in `docs/roadmap.md`.
+- **Symptom:** `nvnCommandBufferBindVertexBuffers` logs `nvn: BindVertexBuffers first 16..31 n 1` during rendering.
+- **Root cause:** Switch 2 NVN2 exposes 32 vertex buffer binding slots (`0..31`), while `vk_pipeline` / `nvn_api_cmd.c` caps vertex buffer bindings at `0..15`.
+- **Fix:** Silently ignore `first >= 16 && n >= 0 && first + n <= 32` in `runtime/nvn_api_cmd.c` (`bind_vertex_buffers`).
+- **Verification:** Confirmed zero `BindVertexBuffers` log spam during Vulkan boot.
+
+### Q11: `nvgpucomp64.dll+0x1909f2` Crash on `OpFunctionCall` Pointer Type Mismatch & Mid-Function `OpVariable`
+- **Symptom:** `vkCreateComputePipelines` crashed inside `nvgpucomp64.dll+0x1909f2` (`addr=0x10`) on compute shader `ec0cf68e68e5f636` (and `68c74a61e9b34c61`), even though `vkCreateShaderModule` succeeded.
+- **Root cause:** (a) `Spv.Generator.Module.AddLocalVariable` appended `OpVariable`s to the current block when called mid-function by `GenerateCall`; (b) `Instructions.GenerateCall` passed `LocalVariable` pointers directly even when `local.VarType != function.GetArgumentType(i)` (e.g., passing `float*` to an `int*` parameter, affecting 433 shaders).
+- **Fix:** Updated `Module.AddLocalVariable` to insert at the end of the function's entry-block `OpVariable` list, and updated `Instructions.GenerateCall` to materialize a `Function`-scope `tempVar` of `argType` with bitcast copy-in (`i < InArguments.Length`) / copy-out (`i >= InArguments.Length`) whenever `local.VarType != argType`. Re-translated all 35,045 shaders.
+- **Verification:** `ec0cf68e68e5f636` and all subsequent compute/graphics pipelines compile cleanly on RTX 5070 Ti.
+
+### Q12: Unused `OpDecorate Binding` (`cb0`) Omitted from `.res.json` Reflection
+- **Symptom:** `vk_pipeline: graphics pipeline not built: the vertex shader uses binding 1, which its reflection and layout lack` on `c674dc35b7a82578` and `2da4ab693163e08e`.
+- **Root cause:** `Ryujinx.Graphics.Shader` can declare an unused `cb0` (`OpVariable` + `OpDecorate Binding 1`) without adding it to `CBuffers`, causing `vk_pipeline.c` (`module_binding_missing`) to reject the pipeline.
+- **Fix:** In `runtime/gfx_shader.c` (`nvn2_offline_get`), scan the loaded SPIR-V for `OpDecorate ... Binding >= 1` and append any missing binding to `s->res[GFX_RES_UBO]`.
+- **Verification:** Graphics pipelines for `c674dc35b7a82578` and `2da4ab693163e08e` build cleanly with 0 skipped draws.

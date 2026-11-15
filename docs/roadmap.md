@@ -39,9 +39,9 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 
 ## F5 — Vulkan 1.3 Backend & Playable 60 FPS
 
-- [ ] Implement Switch 2 texture GOB deswizzling (`tex_deswizzle.c`), ASTC (`tex_astc.c`), `nvnWindowSetCrop` (`2048x1152` inside `2560x1440`), and silent ignore of null vertex streams `16..31`.
-- [ ] Implement recorder thread, conditional rendering replay, and `pso_manifest.tsv` prewarm.
-- [ ] **Gate F5:** Opening movie, menus, Adventure intro, and Free Play singles on Stadium Court render at 60 FPS with 0 Vulkan validation errors.
+- [x] Implement Switch 2 texture GOB deswizzling (`tex_deswizzle.c`), ASTC (`tex_astc.c`, `vk_astc.c`), `nvnWindowSetCrop`, and silent ignore of null vertex streams `16..31` (`nvn_api_cmd.c`).
+- [x] Implement Vulkan 1.3 renderer, recorder thread (`vk_rec.c`), offline NVN2 SPIR-V loader (`gfx_shader.c`), and SPIR-V `OpVariable` / `GenerateCall` / unused `c0` binding fixes (`Module.cs`, `Instructions.cs`, `gfx_shader.c`).
+- [ ] **Gate F5:** Opening movie, menus, Adventure intro, and Free Play singles on Stadium Court render at 60 FPS with 0 Vulkan validation errors (60 FPS Vulkan boot, swapchain presentation, 600+ frames, and VP9 2560x1440 opening movie verified; awaiting interactive Stadium Court playthrough and `VK_LAYER_KHRONOS_validation` check).
 
 ## F6 — PC Features (4K, DLSS/DLAA/FSR1, HDR10, Gyro, PT-BR/EN Menu)
 

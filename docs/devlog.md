@@ -65,4 +65,14 @@
   - Synced `seedds/nxnative` (MIT) `Ryujinx.Graphics.Shader` (`sm86`) and `dmsh_xlate/Program.cs` (`totk_xlate.exe` via `tools/build_xlate.py`).
   - Fixed `GenerateCall` (`CodeGen/Spirv/Instructions.cs` + `CodeGenContext.TryGetLocalPointer`) to materialize temporary `Function`-storage-class `OpVariable`s for non-`LocalVariable` call arguments emitted by `AstOptimizer`.
 - **Gate F4 verified:** `python tools/shaders/translate.py` translated **35,045 / 35,045 shaders in 53.6s (654.7 shaders/s, 0 failed)** into `build/v327680/shaders-spv/`.
-- **Next:** Begin Phase F5 — implement Vulkan 1.3 renderer (`runtime/vk_*.c`) and render the first 3D frame.
+
+## 2026-11-15 — Phase F5: Vulkan 1.3 Backend, Offline NVN2 Shader Loader & 60 FPS Boot
+- **Vulkan 1.3 + Window + ASTC + SPIR-V runtime (`runtime/vk_*.c`, `gfx_window*.c`, `tex_astc*.c`, `spirv_*.c`):** Ported from `dkb-pc-recomp` (MIT), integrated `clang++` (`-std=c++20`) + `-lvulkan-1 -ldwmapi -lc++` into `tools/build_stage2.py`, and pruned F5 stubs in `runtime/stage2_stubs.c`.
+- **NVN2 shader loading (`runtime/vk_exec_draw.c`, `runtime/gfx_shader.c`):** Added NVN2 control header stage/length decoding (`c[0x56]`, `*(uint32_t*)(c + 0x44)`) and `nvn2_offline_get` to load pre-translated `<key16>.spv` + `<key16>.res.json` from `build/v327680/shaders-nvn2/spv/`.
+- **Boot & SPIR-V fixes discovered on RTX 5070 Ti:**
+  - `runtime/kernel.c` (`StartThread`): added brief startup yield (`plat_process_uptime_ns() < 2s`) to eliminate `nxboot` 6-thread stack-slot argument race.
+  - `tools/vendor/ryujinx/src/Spv.Generator/Module.cs` (`AddLocalVariable`): placed function-scope `OpVariable`s in the entry block right after `OpLabel` instead of mid-function.
+  - `tools/vendor/ryujinx/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs` (`GenerateCall`): materialized typed `Function`-scope `tempVar`s (with bitcast copy-in / copy-out) when passing a `LocalVariable` whose `VarType` differs from `function.GetArgumentType(i)` (fixed `nvgpucomp64.dll+0x1909f2` crash across 433 affected shaders). Re-translated all **35,045 / 35,045** shaders (`79.9s`, `0 failed`).
+  - `runtime/gfx_shader.c` (`nvn2_offline_get`): backfilled unused `OpDecorate ... Binding >= 1` entries (`cb0`) into `GFX_RES_UBO` so `vk_pipeline.c` `layout_covers` builds all pipelines.
+  - `runtime/nvn_api_cmd.c` (`bind_vertex_buffers`): silently ignored null clears on streams `16..31`.
+- **Verification:** `mtf-stage2.exe --boot` (`MTF_GPU=vulkan`, `TOTK_ASYNC_PREEMPT=0`) initializes Vulkan 1.3 on RTX 5070 Ti, opens swapchain (`1920x1061`, mailbox, 60 FPS), compiles compute + graphics pipelines with 0 failures, runs VP9 `2560x1440` decoder, and presents `600+` frames cleanly. (Note: `VK_LAYER_KHRONOS_validation` is not installed on the test machine.)

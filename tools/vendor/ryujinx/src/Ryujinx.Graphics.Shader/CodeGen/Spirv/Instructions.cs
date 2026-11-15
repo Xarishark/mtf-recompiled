@@ -323,20 +323,40 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             (StructuredFunction function, SpvInstruction spvFunc) = context.GetFunction(funcId.Value);
 
             SpvInstruction[] args = new SpvInstruction[operation.SourcesCount - 1];
+            (SpvInstruction localPtr, AggregateType localType, SpvInstruction tempVar, AggregateType argType)[] outFixups = null;
 
             for (int i = 0; i < args.Length; i++)
             {
                 IAstNode operand = operation.GetSource(i + 1);
+                AggregateType argType = function.GetArgumentType(i);
 
                 if (operand is AstOperand local &&
                     local.Type == OperandType.LocalVariable &&
                     context.TryGetLocalPointer(local, out SpvInstruction localPtr))
                 {
-                    args[i] = localPtr;
+                    if (local.VarType == argType)
+                    {
+                        args[i] = localPtr;
+                    }
+                    else
+                    {
+                        SpvInstruction tempPtrType = context.TypePointer(StorageClass.Function, context.GetType(argType));
+                        SpvInstruction tempVar = context.Variable(tempPtrType, StorageClass.Function);
+                        context.AddLocalVariable(tempVar);
+                        if (i < function.InArguments.Length)
+                        {
+                            context.Store(tempVar, context.Get(argType, operand));
+                        }
+                        else
+                        {
+                            outFixups ??= new (SpvInstruction, AggregateType, SpvInstruction, AggregateType)[args.Length];
+                            outFixups[i] = (localPtr, local.VarType, tempVar, argType);
+                        }
+                        args[i] = tempVar;
+                    }
                 }
                 else
                 {
-                    AggregateType argType = function.GetArgumentType(i);
                     SpvInstruction tempPtrType = context.TypePointer(StorageClass.Function, context.GetType(argType));
                     SpvInstruction tempVar = context.Variable(tempPtrType, StorageClass.Function);
                     context.AddLocalVariable(tempVar);
@@ -347,6 +367,20 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             AggregateType retType = function.ReturnType;
             SpvInstruction result = context.FunctionCall(context.GetType(retType), spvFunc, args);
+
+            if (outFixups != null)
+            {
+                for (int i = 0; i < outFixups.Length; i++)
+                {
+                    if (outFixups[i].tempVar != null)
+                    {
+                        var (localPtr, localType, tempVar, argType) = outFixups[i];
+                        SpvInstruction loaded = context.Load(context.GetType(argType), tempVar);
+                        context.Store(localPtr, context.BitcastIfNeeded(localType, argType, loaded));
+                    }
+                }
+            }
+
             return new OperationResult(retType, result);
         }
 

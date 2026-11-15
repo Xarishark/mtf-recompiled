@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CLANG = ROOT / "toolchain" / "llvm-mingw-20261104-ucrt-x86_64" / "bin" / "clang.exe"
+CLANGXX = ROOT / "toolchain" / "llvm-mingw-20261104-ucrt-x86_64" / "bin" / "clang++.exe"
 NINJA = ROOT / "toolchain" / "ninja" / "ninja.exe"
 
 RT_FLAGS = [
@@ -31,15 +32,18 @@ RT_FLAGS = [
 
 LINK_LIBS = [
     f"-L{(ROOT / 'toolchain/deps-mingw/lib').as_posix()}",
+    "-lvulkan-1",
     "-lSDL3",
     "-l:libopus.a",
     "-l:libvpx.a",
     "-l:libzstd.a",
+    "-lc++",
     "-lpthread",
     "-lpsapi",
     "-lbcrypt",
     "-luser32",
     "-lgdi32",
+    "-ldwmapi",
     "-lwinmm",
     "-lole32",
     "-lshell32",
@@ -64,6 +68,10 @@ RT_SOURCES = [
     "fs_host.c",
     "gfx_c0.c",
     "gfx_null.c",
+    "gfx_shader.c",
+    "gfx_spirv.c",
+    "gfx_window.c",
+    "gfx_window_win.c",
     "hostfn.c",
     "input.c",
     "input_map.c",
@@ -93,9 +101,38 @@ RT_SOURCES = [
     "ro.c",
     "romfs.c",
     "sha256.c",
+    "spirv_hdr_shoulder.c",
+    "spirv_lq_fold.cpp",
+    "spirv_nan_guard.c",
+    "spirv_rewrite.c",
+    "spirv_screen_uv.c",
     "stage2_stubs.c",
     "svc.c",
     "sysinfo.c",
+    "tex_astc.c",
+    "tex_astc_mt.c",
+    "tex_deswizzle.c",
+    "vk_astc.c",
+    "vk_backend.c",
+    "vk_caps.c",
+    "vk_clear.c",
+    "vk_color.c",
+    "vk_crumbs.c",
+    "vk_device.c",
+    "vk_dump.c",
+    "vk_exec.c",
+    "vk_exec_draw.c",
+    "vk_exec_draw_helper.c",
+    "vk_exec_xfer.c",
+    "vk_formats.c",
+    "vk_memory.c",
+    "vk_pipeline.c",
+    "vk_present.c",
+    "vk_rec.c",
+    "vk_spec.c",
+    "vk_sync.c",
+    "vk_texture.c",
+    "vk_vma.cpp",
     "platform/common.c",
     "platform/win32.c",
 ]
@@ -216,6 +253,7 @@ def main() -> int:
     ninja_lines = [
         f"builddir = {npath(out_dir)}",
         f"cc = {CLANG.resolve().as_posix()}",
+        f"cxx = {CLANGXX.resolve().as_posix()}",
         f'rtflags = {" ".join(RT_FLAGS)} -I"{inc_rt}" -I"{inc_gen}"',
         "",
         "rule cc_rt",
@@ -223,6 +261,12 @@ def main() -> int:
         "  depfile = $out.d",
         "  deps = gcc",
         "  description = CC(rt) $out",
+        "",
+        "rule cxx_rt",
+        "  command = $cxx -std=c++20 $rtflags -MMD -MF $out.d -c $in -o $out",
+        "  depfile = $out.d",
+        "  deps = gcc",
+        "  description = CXX(rt) $out",
         "",
         "rule cc_gen",
         f'  command = $cc -O2 -fno-strict-aliasing -march=x86-64-v3 -I"{inc_rt}" -I"{inc_gen}" -c $in -o $out',
@@ -241,7 +285,8 @@ def main() -> int:
         src = ROOT / "runtime" / rel
         obj = obj_dir / (rel.replace("/", "_").replace("\\", "_") + ".o")
         rt_objs.append(obj)
-        ninja_lines.append(f"build {npath(obj)}: cc_rt {npath(src)}")
+        rule = "cxx_rt" if src.suffix == ".cpp" else "cc_rt"
+        ninja_lines.append(f"build {npath(obj)}: {rule} {npath(src)}")
 
     mod_obj = obj_dir / "modules.o"
     rt_objs.append(mod_obj)

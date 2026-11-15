@@ -1729,6 +1729,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
             plat_cond_signal(&t->cv);
         }
         unlock();
+        if (t && plat_process_uptime_ns() < 2000000000ull) plat_wait_ns(10000000);
         x[0] = t ? R_OK : R_BAD_HANDLE;
         return 1;
     }

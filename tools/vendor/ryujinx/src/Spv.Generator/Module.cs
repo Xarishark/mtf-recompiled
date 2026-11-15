@@ -192,7 +192,30 @@ namespace Spv.Generator
 
             variable.SetId(GetNewId());
 
-            AddToFunctionDefinitions(variable);
+            int insertIdx = _functionsDefinitions.Count;
+            for (int i = _functionsDefinitions.Count - 1; i >= 0; i--)
+            {
+                if (_functionsDefinitions[i].Opcode == Op.OpFunction)
+                {
+                    int j = i + 1;
+                    while (j < _functionsDefinitions.Count && _functionsDefinitions[j].Opcode == Op.OpFunctionParameter)
+                    {
+                        j++;
+                    }
+                    if (j < _functionsDefinitions.Count && _functionsDefinitions[j].Opcode == Op.OpLabel)
+                    {
+                        j++;
+                        while (j < _functionsDefinitions.Count && _functionsDefinitions[j].Opcode == Op.OpVariable)
+                        {
+                            j++;
+                        }
+                        insertIdx = j;
+                    }
+                    break;
+                }
+            }
+
+            _functionsDefinitions.Insert(insertIdx, variable);
         }
 
         public void AddGlobalVariable(Instruction variable)
