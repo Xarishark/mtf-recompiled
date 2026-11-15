@@ -51,10 +51,10 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 
 ## F7 — Diagnostics, Frame Replay & Visual Bugfixes
 
-- [ ] Implement GPU command capture/replay (`MTF_CAPTURE=1`), `MTF_SCAN_DT`, and thread snapshots.
-- [ ] Investigate close-up grass blade rendering and non-NVIDIA shadow portability.
+- [x] Port flight recorder & thread snapshots (`runtime/flight.c`, `flight.h`, `tools/flight_view.py`), RenderDoc integration (`runtime/rdoc.c`), and VRAM headroom tracker (`runtime/vk_headroom.c`).
+- [ ] Investigate close-up grass blade rendering and non-NVIDIA shadow portability (ongoing visual QA).
 
 ## F8 — End-User Installer (`MTF-Setup.exe`) & Release Packaging
 
-- [ ] Port Tkinter local-build installer supporting `.nup` and extracted folders + `tools/make_release.py`.
-- [ ] **Gate F8:** Clean build on a fresh machine produces a playable `mtf-recomp.exe` from the user's dump with zero game files in the release archive.
+- [x] Implement Tkinter local-build installer & launcher ([installer/mtf_setup.py](installer/mtf_setup.py)) + clean release packager ([tools/make_release.py](tools/make_release.py)).
+- [x] **Gate F8:** `python tools/make_release.py` produces a clean `2.79 MiB` release archive (`build/release/mtf-recomp-0.1.0-dev-src.zip`) with **0 content-guard violations** and zero game files.

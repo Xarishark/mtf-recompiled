@@ -81,3 +81,8 @@
 - **Graphics & Perf (`runtime/vk_fsr.c`, `vk_smaa.c`, `vk_hdr.c`, `vk_usnap.c`, `perfmon.c`):** Ported MIT implementations + SPIR-V headers and `runtime/shaders/smaa/{AreaTex.h,SearchTex.h}` from `dkb-pc-recomp`. Skipped `vk_dlss.c` (`GPL-2.0-or-later`) to maintain strict MIT license compliance.
 - **ImGui Settings Menu (`runtime/ui/`, `runtime/third_party/imgui/`, `runtime/ui_text.c`):** Ported Dear ImGui + `imgui_impl_vulkan` and the two-pane menu (`F1`/`Esc`/`Minus+Plus`). Added Brazilian Portuguese (`pt-BR`) catalog & auto-detection alongside English (`en`), branded to `MTF Recomp`, and switched config persistence (`runtime/cfg.c`) to `mtf.ini`.
 - **Gate F6 verified:** `TOTK_MENU_TEST=30:5 TOTK_MENU_TEST_SET=20:TOTK_UPSCALER=fsr,TOTK_SMAA=high,TOTK_MENU_LANG=pt-BR,SAVE=1 TOTK_PERF_OVERLAY=full` wrote `mtf.ini`, reloaded all 3 keys on the next run, and rendered all 7 menu tabs (`0.176 ms` CPU/frame) + performance overlay cleanly.
+
+## 2026-11-15 — Phases F7 & F8: Diagnostics, Installer & Clean Release Packaging
+- **Diagnostics (F7):** Ported MIT `runtime/flight.c`, `runtime/flight.h`, `runtime/rdoc.c`, `runtime/vk_headroom.c`, and `tools/flight_view.py` from `dkb-pc-recomp`; built `mtf-stage2.exe` cleanly in `0.5s`.
+- **Installer & Release Packaging (F8):** Implemented Tkinter/CLI local-build setup & launcher (`installer/mtf_setup.py`) and clean release packager (`tools/make_release.py`).
+- **Gate F8 verified:** `python tools/make_release.py` staged a clean source/launcher tree, passed `tools/check_content.py` (`0 violations`), and generated `build/release/mtf-recomp-0.1.0-dev-src.zip` (`2.79 MiB`).

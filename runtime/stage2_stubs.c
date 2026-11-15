@@ -25,19 +25,6 @@ int nvn2_lower(const uint8_t *ctl, const uint8_t *code, const uint8_t **nc, cons
     return 0;
 }
 uint64_t nvn2_origin(const uint8_t *code) { (void)code; return 0; }
-int flight_on = 0;
-void flight_init(void) {}
-void flight_frame(double a, int b) { (void)a; (void)b; }
-
-// RenderDoc & optional F6 Vulkan features (DLSS, FSR, SMAA, FG, HDR, USNAP, Headroom)
-void rdoc_init(void) {}
-int rdoc_active(void) { return 0; }
-void rdoc_after_present(uint64_t frame) { (void)frame; }
-
-const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void) { return NULL; }
-void vk_headroom_start(void) {}
-void vk_headroom_stop(void) {}
-
 int vk_dlss_wanted(void) { return 0; }
 int vk_dlss_instance_exts(const char **out, int max) { (void)out; (void)max; return 0; }
 int vk_dlss_device_exts(const char **out, int max) { (void)out; (void)max; return 0; }
