@@ -28,6 +28,7 @@ GEN_FLAGS = [
 STUB_C = """\
 #include <stdio.h>
 #include <stdlib.h>
+#define CPU_EXCL_DEFINE
 #include "cpu.h"
 
 extern const uint64_t main_fn_addrs[];
