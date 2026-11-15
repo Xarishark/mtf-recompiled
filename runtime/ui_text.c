@@ -393,7 +393,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_IS_DEFAULT] = "По умолчанию",
     [UI_MENU_AFTER_RESTART] = "Требуется перезапуск", [UI_MENU_SET_BY_ENV] = "Задано переменной окружения",
     [UI_MENU_SAVE_FAILED] = "не удалось сохранить настройки",
-    [UI_MENU_VERSION] = "DKB Recomp %s, игра %s",
+    [UI_MENU_VERSION] = "MTF Recomp %s, игра %s",
 
     [UI_MENU_FULLSCREEN] = "Полный экран", [UI_MENU_FULLSCREEN_DESC] = "Игра на весь экран; F11 переключает режим.",
     [UI_MENU_WINDOW_MODE] = "Режим окна",

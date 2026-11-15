@@ -53,9 +53,23 @@ def is_game_running() -> bool:
     return "mtf-stage2.exe" in res.stdout.lower()
 
 
-def run_pipeline(dump_path: Path, update_version: str, log_fn=print) -> int:
-    if is_game_running():
-        log_fn("[setup] ERROR: mtf-stage2.exe is currently running. Close the game window before rebuilding.")
+def is_exe_locked(exe_path: Path) -> bool:
+    if not exe_path.is_file():
+        return False
+    try:
+        with exe_path.open("r+b"):
+            return False
+    except OSError:
+        return True
+
+
+def run_pipeline(dump_path: Path, update_version: str, log_fn=print, progress_fn=None) -> int:
+    stage2_exe = ROOT / f"build/v{update_version}_stage2/mtf-stage2.exe"
+    if is_game_running() or is_exe_locked(stage2_exe):
+        log_fn(
+            "[setup] ERROR: mtf-stage2.exe is currently running or locked by another process. "
+            "Close the game window before rebuilding."
+        )
         return 1
     write_config_local(dump_path, update_version)
     log_fn(f"[setup] Wrote {ROOT / 'config.local.toml'} -> {dump_path}")
@@ -88,8 +102,11 @@ def run_pipeline(dump_path: Path, update_version: str, log_fn=print) -> int:
 
     steps.append(("Build Stage-2", [sys.executable, "tools/build_stage2.py", "--jobs", "16"]))
 
-    for title, cmd in steps:
-        log_fn(f"\n=== {title} ===")
+    total = len(steps)
+    for idx, (title, cmd) in enumerate(steps):
+        if progress_fn is not None:
+            progress_fn(idx, total, title)
+        log_fn(f"\n=== [{idx + 1}/{total}] {title} ===")
         proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
@@ -105,23 +122,31 @@ def run_pipeline(dump_path: Path, update_version: str, log_fn=print) -> int:
             log_fn(line.rstrip())
         rc = proc.wait()
         if rc != 0:
+            if progress_fn is not None:
+                progress_fn(idx, total, f"Failed: {title}")
             log_fn(f"[setup] Step failed ({rc}): {title}")
             return rc
+    if progress_fn is not None:
+        progress_fn(total, total, "Build complete")
     log_fn("\n[setup] Build complete! Ready to launch mtf-stage2.exe.")
     return 0
 
 
 def launch_gui() -> int:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, scrolledtext
+    from tkinter import filedialog, messagebox, scrolledtext, ttk
 
     root = tk.Tk()
     root.title("MTF Recomp — Setup & Launcher")
-    root.geometry("760x520")
+    root.geometry("760x560")
 
     dump_var = tk.StringVar()
     ver_var = tk.StringVar(value="327680")
+    progress_var = tk.DoubleVar(value=0.0)
+    status_var = tk.StringVar(value="Idle — 0%")
     q: queue.Queue[str] = queue.Queue()
+    prog_q: queue.Queue[tuple[int, int, str]] = queue.Queue()
+    state: dict[str, object] = {"building": False, "game_proc": None}
 
     frm = tk.Frame(root, padx=12, pady=10)
     frm.pack(fill=tk.BOTH, expand=True)
@@ -149,11 +174,17 @@ def launch_gui() -> int:
     tk.Label(ver_row, text="Update version:").pack(side=tk.LEFT)
     tk.Entry(ver_row, textvariable=ver_var, width=12).pack(side=tk.LEFT, padx=(6, 0))
 
-    log_box = scrolledtext.ScrolledText(frm, height=20, state=tk.DISABLED)
+    prog_frame = tk.Frame(frm)
+    prog_frame.pack(fill=tk.X, pady=(0, 8))
+    tk.Label(prog_frame, textvariable=status_var, anchor="w").pack(fill=tk.X)
+    ttk.Progressbar(prog_frame, variable=progress_var, maximum=100.0, mode="determinate").pack(fill=tk.X, pady=(2, 0))
+
+    log_box = scrolledtext.ScrolledText(frm, height=18, state=tk.DISABLED)
     log_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
     btns = tk.Frame(frm)
     btns.pack(fill=tk.X)
+    build_btn = tk.Button(btns, text="Validate & Build")
 
     def poll_queue() -> None:
         while not q.empty():
@@ -162,9 +193,23 @@ def launch_gui() -> int:
             log_box.insert(tk.END, msg + "\n")
             log_box.see(tk.END)
             log_box.configure(state=tk.DISABLED)
+        while not prog_q.empty():
+            done, total, label = prog_q.get_nowait()
+            pct = (done / total * 100.0) if total > 0 else 0.0
+            progress_var.set(pct)
+            status_var.set(f"{done}/{total} ({pct:.0f}%) — {label}")
+            if done == total or label.startswith("Failed:"):
+                state["building"] = False
+                build_btn.configure(state=tk.NORMAL)
         root.after(100, poll_queue)
 
     def on_build() -> None:
+        if state["building"]:
+            return
+        game_proc = state["game_proc"]
+        if isinstance(game_proc, subprocess.Popen) and game_proc.poll() is None:
+            messagebox.showerror("MTF Recomp", "Close the running game window before rebuilding.")
+            return
         raw = dump_var.get().strip()
         if not raw:
             messagebox.showerror("MTF Recomp", "Select a game dump folder or .nup file first.")
@@ -173,16 +218,36 @@ def launch_gui() -> int:
         if p.is_file() and p.suffix.lower() == ".nup":
             q.put("[setup] .nup extraction via tools/vendor/nup can be invoked here; please select extracted dump or extract .nup first.")
             return
-        threading.Thread(target=lambda: run_pipeline(p, ver_var.get().strip() or "327680", q.put), daemon=True).start()
+        state["building"] = True
+        build_btn.configure(state=tk.DISABLED)
+        progress_var.set(0.0)
+        status_var.set("0/? (0%) — Starting...")
+
+        def worker() -> None:
+            try:
+                rc = run_pipeline(
+                    p,
+                    ver_var.get().strip() or "327680",
+                    q.put,
+                    lambda d, t, lbl: prog_q.put((d, t, lbl)),
+                )
+                if rc != 0:
+                    prog_q.put((0, 1, "Failed: see log"))
+            finally:
+                state["building"] = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_launch() -> None:
-        exe = ROOT / "build" / "v327680_stage2" / "mtf-stage2.exe"
+        ver = ver_var.get().strip() or "327680"
+        exe = ROOT / f"build/v{ver}_stage2/mtf-stage2.exe"
         if not exe.is_file():
             messagebox.showerror("MTF Recomp", f"Executable not found:\n{exe}")
             return
-        subprocess.Popen([str(exe), "--boot"], cwd=str(ROOT), env=build_env())
+        state["game_proc"] = subprocess.Popen([str(exe), "--boot"], cwd=str(ROOT), env=build_env())
 
-    tk.Button(btns, text="Validate & Build", command=on_build).pack(side=tk.LEFT)
+    build_btn.configure(command=on_build)
+    build_btn.pack(side=tk.LEFT)
     tk.Button(btns, text="Launch Game (Vulkan)", command=on_launch).pack(side=tk.LEFT, padx=(8, 0))
     root.after(100, poll_queue)
     root.mainloop()
