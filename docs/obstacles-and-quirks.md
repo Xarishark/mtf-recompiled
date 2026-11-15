@@ -36,9 +36,15 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 
 ## 5. `CRA.` Single-File Scrambled RomFS (`rom:/42`)
 - **Symptom:** RomFS contains a single 8.17 GB file named `42` (`CRA.` magic) with no embedded directory tree.
-- **Root Cause:** Camelot's `nxe` engine stores the 8,671-entry file table, checksums, and suffix list inside `nro0`'s `.rodata`, scrambling 16-byte blocks with `crc32x`/`crc32cx` keys derived from `"UseUrSk1lls4G00d"` and `"Nintendo/CAMELOT"`.
-- **Solution (F4):** Port `nxnative`'s `cra.py` to locate the 3 tables in `nro0` and extract `BNSH` shaders for offline SPIR-V translation, while `runtime/romfs.c` serves `rom:/42` directly to the game's own reader.
-- **Verification:** All 35,045 shaders extract cleanly from `rom:/42` + `nro0`.
+- **Root Cause:** Camelot's `nxe` engine stores the 8,671-entry file table, checksums, and suffix list inside `nro0`'s `.rodata`, scrambling 16-byte blocks with `crc32x`/`crc32cx` keys derived from `"UseUrSk1lls4G00d"`, `"Nintendo/CAMELOT"`, and the constant offset `0xa756e6f0` (`_X10_XOR = 0x02052636 ^ 0xA756E6F0`).
+- **Solution (F4):** Implemented `tools/shaders/cra.py` + `tools/shaders/cra_fast.c` and `tools/shaders/extract.py` to decrypt `rom:/42` and unpack `MMMM`/`NARC`/`SARC`/`BNSH` shaders for offline SPIR-V translation, while `runtime/romfs.c` serves `rom:/42` directly to the game's own reader.
+- **Verification:** `cra.py --verify` passed with 0 errors, and `extract.py` extracted all 35,045 unique shaders (`50,287` `vs`/`ps` pairs) from `rom:/42` + `nro0`.
+
+## 5a. SPIR-V `GenerateCall` `InvalidCastException` / `KeyNotFoundException` on `sm86` Shaders
+- **Symptom:** 7/200 shaders in the initial `translate.py --limit 200` batch failed in `Ryujinx.Graphics.Shader.CodeGen.Spirv.Instructions.GenerateCall` with `InvalidCastException` (e.g., `pfx.narc`) or `KeyNotFoundException` (e.g., `sdf_font_compute.narc`).
+- **Root Cause:** `AstOptimizer` / `Simplification` can pass non-`LocalVariable` operands (constants, `AstOperation` expressions, or unregistered locals) as arguments to `Instruction.Call`, whereas SPIR-V `OpFunctionCall` requires pointer operands (`Function`-storage-class `OpVariable`).
+- **Solution (F4):** Added `CodeGenContext.TryGetLocalPointer` and updated `Instructions.GenerateCall` to allocate a temporary `Function`-storage-class `OpVariable` (`context.AddLocalVariable`) and store `context.Get(argType, operand)` into it whenever an argument is not a registered `LocalVariable`.
+- **Verification:** `python tools/shaders/translate.py` translated all **35,045 / 35,045** shaders in `53.6s` with **0 failures**.
 
 ## 6. VP9 1440p@60fps Opening Movie Black Frames & Choppy Audio (`nn::codec`)
 - **Symptom:** Title movie (368 MB VP9 2560x1440@60fps + Vorbis) shows black/corrupt frames or 60–80 ms audio gaps every 1–2 seconds.

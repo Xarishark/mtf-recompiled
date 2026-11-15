@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-11-15  
 **Target game:** *Mario Tennis Fever* (Switch 2 / `Ounce`, Title ID `0400D4201C6EA000`, Update `1.1.1` / `v327680`)  
-**Current phase:** `F3` (Complete) $\rightarrow$ Ready for `F4` (`CRA.` Extraction & Offline Shader Translation)
+**Current phase:** `F4` (Complete) $\rightarrow$ Ready for `F5` (Vulkan 1.3 Renderer & First 3D Frame)
 
 ## Module Status
 
@@ -21,5 +21,5 @@
 | Binary Index (`tools/analisis/bindb.py`) | **Ready** | `build/bindb.sqlite` indexes 98,560 fns, 29,422 syms, 573,750 calls, 54,969 strings |
 | Horizon Kernel & `ro::LoadModule` | **Booting** | `mtf-stage2.exe` boots `main` + `sdk` + `nro0` to 60 Hz null-GPU loop (`TOTK_ASYNC_PREEMPT=0`) |
 | NVN2 Front-End & Vulkan Backend | **F3 Null-GPU Ready** | NVN2 proc table, command recording, `nvnQueueWaitSync`, `SetCopyImageStride` under `MTF_GPU=null`; Vulkan backend planned for F5 |
-| Shader Pipeline (`CRA.` $\rightarrow$ SPIR-V) | Profile ready | `shader_facts.tsv` imported; `cra.py` planned for F4 |
+| Shader Pipeline (`CRA.` $\rightarrow$ SPIR-V) | **Ready (F4)** | `cra.py` + `extract.py` + `translate.py` (`sm86` `totk_xlate.exe`): **35,045 / 35,045** shaders translated to SPIR-V (0 failed, 53.6s) |
 | Audio (`audren` REV15) & Video (`ov_codec`) | **Ready (F3)** | REV15 `audren` + SDL3 (`48000 Hz x240`, 96 voices) & `libvpx` VP9 (`2560x1440`) active |

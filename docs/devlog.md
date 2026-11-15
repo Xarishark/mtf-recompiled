@@ -53,3 +53,16 @@
 - **Audio, Input, Pacing & Codec:** Ported `audren.c` (REV15), `audio_mixer.c`, `audio_effects.c`, `audio_reverb.c`, `input.c`, `input_map.c`, `input_script.c`, `input_win.c`, `motion_fusion.c`, `frame_rate.c`, `perf.c`, `ov_codec.c`, `ov_movie.c` from `dkb-pc-recomp`.
 - **HLE additions for MTF (`ov_input.c`, `ov_system.c`):** Added `nn::hid::GetNpadState` (singular), `SetNpadHandheldActivationMode`, `GetNpadControllerColor`, `SetGyroscopeZeroDriftMode`, `GetSixAxisSensorState`, `GetSupportedNpadStyleSet`, `SetNpadJoyAssignmentModeSingle`, `SwapNpadAssignment`, `ShowControllerStrapGuide`; added `nn::friends` offline stubs; added `nn::oe::GetDefaultDisplayResolution`, `GetDefaultDisplayResolutionChangeEvent`, `GetNotificationMessageEvent`, `TryPopNotificationMessage`, `SendServerMaintenanceOverlayNotification`; added `C:/Windows/Fonts/arial.ttf` fallback in `ov_system.c` when Switch shared `.bfttf` fonts are absent.
 - **Gate F3 verified:** `mtf-stage2.exe --boot` (`MTF_GPU=null`, `TOTK_ASYNC_PREEMPT=0`) reached `frame rate: limit 60 fps`, `present 1`, opened REV15 `audren` (`48000 Hz x240, mix buffers 30, voices 96, effects 14, sinks 2`) with SDL3 audio output, and initialized `2560x1440` `libvpx` VP9 decoder (`codec: VP9 decoder ... 2560x1440 on the host (libvpx)`).
+
+## 2026-11-15 — Phase F4: `CRA.` Decryption, Shader Extraction & Ampere SPIR-V Translation
+- **`rom:/42` (`CRA.`) decryption (`tools/shaders/cra.py`, `tools/shaders/cra_fast.c`):**
+  - Solved Camelot `CRA.` table derivation from `nro0` `.rodata`: `_X10_XOR = 0x02052636 ^ 0xA756E6F0`, all 8 `x26 & 7` block-scrambling cases (`swap_in = (case & 2) == 0`, `odd_out = (case & 1) != 0`), `0x00` null-terminated name decoding, and extension table at `0x7003556d18` (direct file offsets).
+  - Compiled `build/cra_fast.dll` with `clang -O3 -shared` for native decryption speed; verified `--pattern "ssg_system/*" --verify` (16/16 mod-16 entries, 0 errors) and `--pattern "shader/*" --verify` (8/8 mod-16 entries, 0 errors).
+- **Shader extraction (`tools/shaders/extract.py`):**
+  - Unpacked `MMMM` chunks, Zstd (`Z\0\0\0`), LZ4 (`0x94`), raw (`0x70`/`0x80`), zlib (`0x00`/`0x10`/`0x20`/`0x30`), `NARC`/`SARC`, and `BNSH`+`grsc` across 1,844 `rom:/42` entries + `nro0` in `20.8s`.
+  - Extracted **35,045 unique shaders** (`6,915 vs`, `27,944 ps`, `78 cs`, `2 hs`, `2 ds`, `104 gs`) and **50,287 `vs`/`ps` PSO pairs** into `build/v327680/shaders-nvn2/`.
+- **Ampere `sm86` SPIR-V translation (`tools/vendor/ryujinx/`, `tools/xlate/Program.cs`, `tools/shaders/translate.py`):**
+  - Synced `seedds/nxnative` (MIT) `Ryujinx.Graphics.Shader` (`sm86`) and `dmsh_xlate/Program.cs` (`totk_xlate.exe` via `tools/build_xlate.py`).
+  - Fixed `GenerateCall` (`CodeGen/Spirv/Instructions.cs` + `CodeGenContext.TryGetLocalPointer`) to materialize temporary `Function`-storage-class `OpVariable`s for non-`LocalVariable` call arguments emitted by `AstOptimizer`.
+- **Gate F4 verified:** `python tools/shaders/translate.py` translated **35,045 / 35,045 shaders in 53.6s (654.7 shaders/s, 0 failed)** into `build/v327680/shaders-spv/`.
+- **Next:** Begin Phase F5 — implement Vulkan 1.3 renderer (`runtime/vk_*.c`) and render the first 3D frame.

@@ -31,11 +31,11 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 - [x] Port async `ov_codec.c` (`libvpx` VP9 2560x1440 decoder) + `ov_movie.c`, plus `nn::friends` offline stubs, `nn::oe` display resolution/notification event overrides, and system TTF fallback for missing shared fonts.
 - [x] **Gate F3:** `mtf-stage2.exe --boot` with `MTF_GPU=null` and `TOTK_ASYNC_PREEMPT=0` runs at 60 Hz (`frame rate: limit 60 fps`, `present 1`), opens REV15 `audren` + SDL3 audio (`48000 Hz x240, voices 96`), and initializes `2560x1440` `libvpx` VP9 video decoder cleanly.
 
-## F4 — `CRA.` Extraction & Offline Shader Translation (35,045 Shaders)
+## F4 — `CRA.` Extraction & Offline Shader Translation (35,045 Shaders) [Complete]
 
-- [ ] Port `tools/shaders/cra.py`, `extract.py`, `int_inputs.py`, `translate.py`, and `tools/xlate/` (Ryujinx Ampere front-end).
-- [ ] Handle passthrough geometry shader (`NV_geometry_shader_passthrough` / `8x8x64` atmosphere LUT) and NVN2 compute `c[0]` workgroup indexing.
-- [ ] **Gate F4:** All 35,045 shaders from `rom:/42` and `nro0` extract and translate to SPIR-V without fatal errors.
+- [x] Implement `tools/shaders/cra.py` (+ `cra_fast.c`), `extract.py`, `translate.py`, and `tools/xlate/` (Ryujinx Ampere `sm86` front-end + `GenerateCall` SPIR-V fix).
+- [x] Handle passthrough geometry shader lowering (`SPV_NV_geometry_shader_passthrough` / `8x8x64` atmosphere LUT) and NVN2 compute `c[0]`/`c[1]` workgroup indexing (`shader_facts.tsv`).
+- [x] **Gate F4:** All 35,045 shaders from `rom:/42` and `nro0` extract and translate to SPIR-V without fatal errors (`35045/35045` in `53.6s`, `0 failed`).
 
 ## F5 — Vulkan 1.3 Backend & Playable 60 FPS
 

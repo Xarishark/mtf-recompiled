@@ -17,7 +17,7 @@ Code copied or adapted from other open-source projects is listed below with its 
 
 - `valentderah/totk-pc-recomp` (MIT) — Runtime, Vulkan backend, installer, FSR/DLAA/HDR (`runtime/`, `installer/`)
 - `ly05010419/MacNativeGames` & `jhaizhou-ops/d2r-mobile` (MIT) — Horizon HLE services, audio renderer, NVN front-end
-- `seedds/nxnative` (MIT) — `cra.py`, Ampere shader translation tooling (`tools/xlate/`), Switch 2 HLE behaviors
+- `seedds/nxnative` (MIT) — Ampere (`sm86`) `Ryujinx.Graphics.Shader` updates (`tools/vendor/ryujinx/`), `dmsh_xlate` batch SPIR-V translator (`tools/xlate/Program.cs`), `cra.py` / `shader_split.py` reference (`tools/shaders/cra.py`, `tools/shaders/extract.py`, `tools/shaders/translate.py`), and Switch 2 HLE behaviors
 - `Revivedx/SavageWindRecomp` (MIT) — Performance overlay & two-pane settings menu
 - `dkb-pc-recomp` (MIT) — NVN2 front-end (`nvn_procs.c`, `nvn_api_*.c`, `nvn_ext.c`, `nvn_tex.*`, `tex_deswizzle.c`, `gfx_c0.*`, `nvn_mode_trace.*`), REV15 audio renderer & mixer (`audren.c`, `audio_mixer.c`, `audio_effects.*`, `audio_reverb.*`), input & motion fusion (`input.c`, `input_map.c`, `input_script.*`, `input_win.*`, `motion_fusion.c`), frame pacing & perf (`frame_rate.c`, `perf.c`, `prof.h`), and VP9 codec/movie (`ov_codec.c`, `ov_movie.c`).
 - `GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator` `v3.2.1` (MIT) — `vk_mem_alloc.h` (local build dependency under git-ignored `toolchain/deps-mingw/`).
