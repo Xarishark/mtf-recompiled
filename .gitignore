@@ -1,0 +1,77 @@
+# Reference checkouts of upstream projects (cloned locally, never committed)
+/refs/
+
+# Downloaded toolchain binaries and Python environments
+/toolchain/
+/.venv/
+/.venv-py314/
+__pycache__/
+*.pyc
+
+# Personal paths to game files and optional firmware/keys
+/config.local.toml
+
+# Game inputs, extracted files, and everything derived from them. Never commit these.
+# tools/check_content.py enforces the same rule in CI and the pre-commit hook.
+/game/
+/build/
+/generated/
+/work/
+/profile/
+*.nup
+*.xci
+*.xcz
+*.nsp
+*.nsz
+*.nca
+*.ncz
+*.tik
+*.cert
+*.keys
+*.nso
+*.nro
+*.nrr
+*.npdm
+*.zs
+*.pack
+*.sarc
+*.narc
+*.bfres
+*.fres
+*.bntx
+*.bnsh
+*.fsha
+*.vfxb
+*.webm
+*.spv
+
+# Build outputs
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.o
+*.lib
+*.a
+*.so
+*.so.*
+*.sqlite
+*.db
+
+# .NET build output of the shader translator
+/tools/xlate/bin/
+/tools/xlate/obj/
+
+# Editor settings
+.vs/
+.vscode/
+.idea/
+
+# Patch leftovers, logs and OS files
+*.orig
+*.rej
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store

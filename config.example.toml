@@ -1,0 +1,24 @@
+# Local paths configuration for MTF Recomp.
+# Copy this file to `config.local.toml` (which is git-ignored) and set your local paths.
+# Never commit `config.local.toml` or any path containing keys/dumps.
+
+[game]
+# Path to your legally dumped Mario Tennis Fever + Update 1.1.1 (extracted NUP folder or .nup file).
+# Extracted folder structure expected:
+#   <dump_path>/nup-manifest.json
+#   <dump_path>/base/exefs/...
+#   <dump_path>/updates/327680/exefs/{main, sdk, rtld, main.npdm}
+#   <dump_path>/updates/327680/romfs/{42, .nrr/nrr.nrr}
+dump_path = ""
+title_id = "0400D4201C6EA000"
+update_version = 327680
+
+[optional]
+# Optional: Switch firmware registered folder / system fonts directory (for console button icons).
+# If left empty, the runtime uses built-in unhinted fallback fonts sized for Camelot's 50 KB font engine.
+firmware_dir = ""
+prod_keys = ""
+
+[build]
+# Output directory for all generated C, SPIR-V shaders, captured NRO, and compiled binaries (git-ignored).
+build_dir = "build"
