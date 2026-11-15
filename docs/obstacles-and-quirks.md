@@ -16,11 +16,17 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Solution (F2):** Reserve `mem_alias = 0x500000000` (20 GB) and `mem_reserve = 0x650000000` (25.25 GB) in `runtime/memory.c` (per `profiles/0400D4201C6EA000/profile.json`).
 - **Verification:** Game completes `nninitStartup` and reaches `nnMain`.
 
-## 3. Boot-Stub Thread Stack-Slot Reuse Race
-- **Symptom:** Intermittent crash (~1 in 12 boots) right after `ro::Initialize` / service connection.
-- **Root Cause:** `nxboot` passes thread arguments in stack slots of the starter thread and reuses those slots shortly after connecting to a service, before the spawned thread has read them.
-- **Solution (F2):** Implement thread-settle synchronization in `runtime/kernel.c` (`svcStartThread`) so the starter waits briefly for the child thread to enter its prologue.
-- **Verification:** 20+ consecutive boots pass without stack-argument corruption.
+## 3. Boot-Stub Thread Stack-Slot Reuse & Async Preemption Race
+- **Symptom:** Intermittent `0xc0000005` crash (`addr=0xffffffffffffffff`) inside `main`'s 6-thread `nro0` unpacker (`f_7000001d80`, `exe+0x6dc4`) or `f_7000001400` (`exe+0x54a4`) when `TOTK_ASYNC_PREEMPT=1` is active.
+- **Root Cause:** Asynchronous virtual-core preemption (`kernel.c`) interrupts `main`'s 6 tight MT19937 unpacker threads on Switch 2 cores `0..5` (additionally, `kernel.c` `CreateThread` initially rejected `core > 2` with `0xfa01` until updated to `core >= NCORE`).
+- **Solution (F2):** Update `kernel.c` `CreateThread` (`svc #0x08`) to accept `0 <= core < NCORE` (`NCORE=6`, mask `0x3f`); run Stage-2 boot with `TOTK_ASYNC_PREEMPT=0` while investigating safe preemption points for `main`'s unpacker threads.
+- **Verification:** `MTF_GPU=null TOTK_ASYNC_PREEMPT=0 mtf-stage2.exe --boot` deterministically unpacks `nro0`, runs `nro0 DT_INIT`, and reaches `nvnDeviceGetProcAddress`.
+
+## 3a. `nn::fs::SetAllocator` Calling `fsp-srv` & `nro0` `R_AARCH64_TLSDESC` Relocations
+- **Symptom:** (a) `nn::fs::SetAllocator` aborts on unimplemented `fsp-srv` via `nn::fs::detail::IsEnabledAccessLog`; (b) `loader.c` aborts on `nro0 relocation 0 has type 1031`.
+- **Root Cause:** (a) SDK 20.5.17's `SetAllocator` queries `IsEnabledAccessLog` over `fsp-srv`; (b) `nro0` uses 10 `R_AARCH64_TLSDESC` (`1031`) relocations (`sym=0`, offsets `0x0..0x50`).
+- **Solution (F2):** Override `nn::fs::SetAllocator` / `IsEnabledAccessLog` in `runtime/fs_host.c`, and add `tlsdesc_resolve` (`0x1000 + addend` inside each thread's `0x2000`-byte `TLS_SIZE` block) in `runtime/loader.c`.
+- **Verification:** `nro0` loads cleanly with 82,193 relocations and 0 unresolved strong imports.
 
 ## 4. `nn::fontll` 50 KB Work Buffer Crash (`nro0+0xaef8a8`)
 - **Symptom:** `ScalableFontEngine::LoadFont` returns `201`, `SetFont` returns `301`, and the game crashes on a null pointer at `nro0+0xaef8a8` looking up `"?"`.

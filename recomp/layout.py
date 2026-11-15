@@ -24,14 +24,18 @@ def align_up(v, a=ALIGN):
     return (v + a - 1) & ~(a - 1)
 
 
-def layout(exefs):
-    """[(name, base, size)] for the modules present in the ExeFS directory, in load order."""
+def layout(exefs, nros=None):
+    """[(name, base, size)] for the modules present in the ExeFS directory (and optional NROs), in load order."""
     exefs = Path(exefs)
     out, base = [], FIRST_BASE
     for name in ORDER:
         path = exefs / name
         if not path.exists():
             continue
+        size = Nso(str(path)).size
+        out.append((name, base, size))
+        base = align_up(base + size)
+    for name, path in (nros or ()):
         size = Nso(str(path)).size
         out.append((name, base, size))
         base = align_up(base + size)

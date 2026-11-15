@@ -15,26 +15,39 @@ R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE = 2
 class Nso:
     def __init__(self, path):
         raw = open(path, 'rb').read()
-        assert raw[:4] == b'NSO0', path
-        flags = struct.unpack_from('<I', raw, 0xC)[0]
-        self.build_id = raw[0x40:0x60].rstrip(b'\0').hex()
-        segs = []
-        for i in range(3):
-            file_off, mem_off, dec_size = struct.unpack_from('<III', raw, 0x10 + i * 0x10)
-            comp_size = struct.unpack_from('<I', raw, 0x60 + i * 4)[0]
-            data = raw[file_off:file_off + comp_size]
-            if flags & (1 << i):
-                data = lz4.block.decompress(data, uncompressed_size=dec_size)
-            segs.append((mem_off, data))
-        self.bss_size = struct.unpack_from('<I', raw, 0x3C)[0]
-        self.text = (segs[0][0], len(segs[0][1]))
-        self.rodata = (segs[1][0], len(segs[1][1]))
-        self.data = (segs[2][0], len(segs[2][1]))
-        end = segs[2][0] + len(segs[2][1]) + self.bss_size
-        self.size = (end + 0xFFF) & ~0xFFF
-        img = bytearray(self.size)
-        for off, d in segs:
-            img[off:off + len(d)] = d
+        if raw[:4] == b'NSO0':
+            flags = struct.unpack_from('<I', raw, 0xC)[0]
+            self.build_id = raw[0x40:0x60].rstrip(b'\0').hex()
+            segs = []
+            for i in range(3):
+                file_off, mem_off, dec_size = struct.unpack_from('<III', raw, 0x10 + i * 0x10)
+                comp_size = struct.unpack_from('<I', raw, 0x60 + i * 4)[0]
+                data = raw[file_off:file_off + comp_size]
+                if flags & (1 << i):
+                    data = lz4.block.decompress(data, uncompressed_size=dec_size)
+                segs.append((mem_off, data))
+            self.bss_size = struct.unpack_from('<I', raw, 0x3C)[0]
+            self.text = (segs[0][0], len(segs[0][1]))
+            self.rodata = (segs[1][0], len(segs[1][1]))
+            self.data = (segs[2][0], len(segs[2][1]))
+            end = segs[2][0] + len(segs[2][1]) + self.bss_size
+            self.size = (end + 0xFFF) & ~0xFFF
+            img = bytearray(self.size)
+            for off, d in segs:
+                img[off:off + len(d)] = d
+        elif raw[0x10:0x14] == b'NRO0':
+            nro_size = struct.unpack_from('<I', raw, 0x18)[0]
+            self.text = struct.unpack_from('<II', raw, 0x20)
+            self.rodata = struct.unpack_from('<II', raw, 0x28)
+            self.data = struct.unpack_from('<II', raw, 0x30)
+            self.bss_size = struct.unpack_from('<I', raw, 0x38)[0]
+            self.build_id = raw[0x40:0x60].rstrip(b'\0').hex()
+            end = nro_size + self.bss_size
+            self.size = (end + 0xFFF) & ~0xFFF
+            img = bytearray(self.size)
+            img[:nro_size] = raw[:nro_size]
+        else:
+            raise AssertionError(f'{path}: neither NSO0 nor NRO0')
         self.image = img
         self._parse_mod0()
 

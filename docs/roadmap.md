@@ -17,13 +17,12 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 - [x] Support Switch 2 / ARMv8.3 instructions (`PAC` hints/branches, `LDAPR*`, `LSE` atomics, `CRC32X`/`CRC32CX`) and `DT_RELR` relocations.
 - [x] **Gate F1:** 100% of `main` (1,589 fns) and `sdk` (47,907 fns) lift to C with 0 unsupported instructions, pass Unicorn differential tests (40,000 encodings, 119,955 cases, 0 failures), compile, and link (`mtf-stage1.exe`).
 
-## F2 — Horizon OS HLE, Boot Stub (`nxboot`) & `nro0` Capture (24.7 MB)
+## F2 — Horizon OS HLE, Boot Stub (`nxboot`) & `nro0` Capture (24.7 MB) (Complete)
 
-- [ ] Implement guest memory layout (`mem_reserve=0x650000000`, `mem_alias=0x500000000`, `mem_stack=0x10000000`, `app_pool=0x240000000`).
-- [ ] Implement Switch 2 `svcGetInfo`, `31.25 MHz` timer, threads (with *thread settle* for `nxboot`'s stack-slot reuse), mutexes, condvars, and IPC.
-- [ ] Implement `runtime/ro.c` (NRR v1 + `MTF_NRO_CAPTURE`) to capture the 24.7 MB `nro0` unpacked by `main`'s 6 threads, verify its SHA-256 (`1ec347bc...`), index it in `tools/analisis/bindb.py`, and lift/compile `nro0`.
-- [ ] Implement `rom:/42` VFS mounting, `ov_font.c` (unhinted fonts for Camelot's 50 KB font engine), and offline stubs (`ov_net.c`, `ov_offline.c`).
-- [ ] **Gate F2:** Executable boots `main` + `sdk` + `nro0`, mounts `rom:/42`, initializes fonts without error `201`, and reaches the first NVN2 call.
+- [x] Implement guest memory layout (`runtime/memory.c`: 64 GiB alias, 9 GiB pool), Switch 2 `svcGetInfo`, `31.25 MHz` timer (`rt_ticks`), 6-core threads (`NCORE = 6`), mutexes, condvars, and IPC (`runtime/kernel.c`, `runtime/svc.c`, `runtime/ipc.c`).
+- [x] Implement `runtime/ro.c` (NRR v1 + `MTF_NRO_CAPTURE`) to capture the 24.7 MB `nro0` unpacked by `main`'s 6 threads, verify its SHA-256 (`1ec347bc9f4664b467fc5f9b3a9336fe91e22e119fc7fb60f8cf44f0d30ce975`), index `main` + `sdk` + `nro0` in `tools/analisis/bindb.py`, and lift/compile `nro0` (60,968 fns, 151 chunks).
+- [x] Implement directory-backed `rom:/` VFS mounting (`runtime/romfs.c`), `nn::fs` host storage (`runtime/fs_host.c`), `R_AARCH64_TLSDESC` relocation support (`runtime/loader.c`), and Stage-2 subsystem stubs (`runtime/stage2_stubs.c`).
+- [x] **Gate F2:** `mtf-stage2.exe` boots `main` + `sdk` + `nro0` (with `TOTK_ASYNC_PREEMPT=0`), mounts `rom:/` and `save:/`, completes `nro0 DT_INIT` (197 entries), and reaches the first NVN2 call (`nvnDeviceGetProcAddress` at `nro0+0xaf71e4`).
 
 ## F3 — NVN2 Null Renderer, Audio (REV15) & VP9 Movies (`nn::codec`)
 

@@ -693,6 +693,7 @@ def main():
     ap.add_argument('--exefs', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--modules', default='main,subsdk0,sdk')
+    ap.add_argument('--nro', action='append', default=[], help='extra NRO module as name=path (e.g. nro0=build/nro/x.nro)')
     ap.add_argument('--jobs', type=int, help='emit workers (default: by free memory and CPU count)')
     ap.add_argument('--limit', type=int, default=0, help='emit only the first N functions of each module')
     ap.add_argument('--chunk-fns', type=int, default=3000, help='functions per chunk at most')
@@ -709,7 +710,14 @@ def main():
     opts = {'reg_locals': args.reg_locals, 'callee_saved': not args.no_callee_saved_trust}
 
     t0 = time.perf_counter()
-    mods = layout(args.exefs)
+    nros = []
+    for spec in args.nro:
+        if '=' not in spec:
+            raise SystemExit(f'--nro expects name=path, got {spec!r}')
+        n, p = spec.split('=', 1)
+        nros.append((n, Path(p)))
+    nro_map = dict(nros)
+    mods = layout(args.exefs, nros)
     write_layout(mods, args.out)
     table = patches.load(args.patches, mods) if args.patches else patches.Table()
     write_if_changed(args.out / 'patches.h', patches.header_text(table, GENERATED_MARKER))
@@ -723,7 +731,7 @@ def main():
         if name not in want:
             continue
         t = time.perf_counter()
-        path = args.exefs / name
+        path = nro_map.get(name, args.exefs / name)
         mod = Module(name, path, base, 'c')
         patches.check(table, mod, name)
         starts, dstats = discover(mod)
