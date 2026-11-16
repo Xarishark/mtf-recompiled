@@ -3785,7 +3785,33 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
-    if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) {   // no uint8 index type here: widen (host-readable backing only)
+    uint32_t draw_count = (uint32_t)d->count;
+    if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && d->count >= 4) {
+        if (sp.alloc) {
+            warn_once(W_INDEX, "indexed QUADS in device-local memory: only first triangle of each quad may draw");
+            goto normal_idx;
+        }
+        vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
+        uint32_t q = (uint32_t)d->count / 4;
+        draw_count = 6 * q;
+        vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, (uint64_t)draw_count * sizeof(uint32_t));
+        uint32_t *ix = malloc(sizeof *ix * draw_count);
+        if (!ix) rt_fatal("vk: out of memory");
+        const uint8_t *src = (const uint8_t *)(uintptr_t)d->ibuf;
+        for (uint32_t i = 0; i < q; i++) {
+            uint32_t v[4];
+            for (int k = 0; k < 4; k++) {
+                uint32_t idx = 4 * i + (uint32_t)k;
+                v[k] = d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE    ? src[idx]
+                       : d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? ((const uint16_t *)src)[idx]
+                                                                   : ((const uint32_t *)src)[idx];
+            }
+            const int map[6] = {0, 1, 2, 0, 2, 3};
+            for (int k = 0; k < 6; k++) ix[6 * i + k] = v[map[k]];
+        }
+        bind_index(ex, ix, sizeof *ix * draw_count, VK_INDEX_TYPE_UINT32);
+        free(ix);
+    } else if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) {   // no uint8 index type here: widen (host-readable backing only)
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
         vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
         vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, 2 * bytes);
@@ -3800,6 +3826,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     } else if (sp.offset % isize[d->itype]) {
         return warn_once(W_INDEX, "index buffer %#llx is not aligned to its index size: draw skipped", (unsigned long long)d->ibuf);
     } else {
+    normal_idx:
         VK_MEM_USE(sp);
         dig_index(dc, sp.buffer, sp.offset, NULL, 0);
         vkCmdBindIndexBuffer(ex->cb, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -3807,7 +3834,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         vk_mem_count(sp.cls, VK_MUSE_IB, bytes);
         VK_MEM_BOUND(sp);
     }
-    vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
+    vkCmdDrawIndexed(ex->cb, draw_count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
     ex->recorded++;
     note_work(ex, 0, (uint64_t)d->count * (uint64_t)(d->instances > 0 ? d->instances : 1));
