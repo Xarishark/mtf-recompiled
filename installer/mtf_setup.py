@@ -244,6 +244,10 @@ def launch_gui() -> int:
         threading.Thread(target=worker, daemon=True).start()
 
     def on_launch() -> None:
+        game_proc = state["game_proc"]
+        if (isinstance(game_proc, subprocess.Popen) and game_proc.poll() is None) or is_game_running():
+            messagebox.showinfo("MTF Recomp", "The game is already running.")
+            return
         ver = ver_var.get().strip() or "327680"
         exe = ROOT / f"build/v{ver}_stage2/mtf-stage2.exe"
         if not exe.is_file():

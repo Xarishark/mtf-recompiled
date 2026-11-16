@@ -399,7 +399,7 @@ const CfgMeta *cfg_meta_at(int i) {
     // Bananza's virtual display is 2880x1620; keep its stock resolution when
     // no setting is present, including the menu's default marker and Reset.
     static const CfgMeta dkb_output = {"OUTPUT_RES", "2880x1620", NULL, RESTART};
-    if (!rt_game_version && !strcmp(metas[i].key, "OUTPUT_RES")) return &dkb_output;
+    if (!rt_game_version && strcmp(rt_game_target, "mtf327680") && !strcmp(metas[i].key, "OUTPUT_RES")) return &dkb_output;
     // Bananza timing is experimental; TotK retains its established default.
     static const CfgMeta dkb_realtime = {"REALTIME", "0", "0|1", RESTART};
     if (!rt_game_version && !strcmp(metas[i].key, "REALTIME")) return &dkb_realtime;

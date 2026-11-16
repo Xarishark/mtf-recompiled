@@ -99,3 +99,9 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Root cause:** `nro0` uses `main`'s `movie::VideoDecoder` (`nn::codec::Vp9Decoder`). `ov_vp9_ready_event` and `ov_vp9_acquire` signalled the submission-ready `SystemEvent` before `StartVp9Decoder` ran, while `StartVp9Decoder` was bound to `ov_ok` (no-op). `MovieEventHandler` (`nro0+0xd16460`) woke up early, called `ClearSystemEvent`, and posted an input-ready message to `MovieVideoHandler` (`nro0+0xd19c00`), which dropped it because `Start` had not yet set its active flag — leaving the decoder stalled on `RequestSyncPointEvent(0xc0de0000)`.
 - **Fix:** Bound `_ZN2nn5codec15StartVp9DecoderEPNS0_14Vp9DecoderTypeE` in `runtime/ov_codec.c` to `ov_vp9_start`, which signals the submission-ready `SystemEvent` via `kern_signal_system_event(event_for(c, key))`.
 - **Verification:** `mtf-stage2.exe --boot` decodes 2560x1440 VP9 video (`pass_0004_t0_2560x1440_43_rgba8srgb.png` at frame 120) and outputs non-zero audio (`first nonzero output after 182 frames`, 0 underruns).
+
+### Q14: Crash in `nn::account::LoadProfileImage` (`0xc0000005` at `sdk+0x184f20`)
+- **Symptom:** After advancing past the initial boot/movie or interacting, `mtf-stage2.exe` crashed with `0xc0000005` at offset `0x71b59b` (`f_7000f84f20`, `nn::account::LoadProfileImage`).
+- **Root cause:** `nn::account::LoadProfileImage` was not overridden in `runtime/ov_system.c`, so it executed original `sdk` code calling `f_700159a2b0` (unimplemented `acc:u` IPC) which returned `NULL`, causing a null-vtable dereference.
+- **Fix:** Added `ov_load_profile_image` in `runtime/ov_system.c` returning a valid 64x64 baseline JPEG (`693` bytes) for the local user UID.
+- **Verification:** Rebuilt `mtf-stage2.exe` (`1.7s`), ran `TOTK_TRACE=perf,audio` cleanly at `60.0 fps` with `0` audio underruns/overruns.
