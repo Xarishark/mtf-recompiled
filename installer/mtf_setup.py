@@ -253,7 +253,36 @@ def launch_gui() -> int:
         if not exe.is_file():
             messagebox.showerror("MTF Recomp", f"Executable not found:\n{exe}")
             return
-        state["game_proc"] = subprocess.Popen([str(exe), "--boot"], cwd=str(ROOT), env=build_env())
+        log_dir = ROOT / "work"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "last_launch.log"
+        proc = subprocess.Popen(
+            [str(exe), "--boot"],
+            cwd=str(ROOT),
+            env=build_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        state["game_proc"] = proc
+
+        def pump_game_log() -> None:
+            try:
+                with log_path.open("w", encoding="utf-8", errors="replace") as lf:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        lf.write(line)
+                        lf.flush()
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+            except Exception:
+                pass
+            rc = proc.wait()
+            q.put(f"[launch] mtf-stage2.exe exited with code {rc} (log: {log_path})")
+
+        threading.Thread(target=pump_game_log, daemon=True).start()
 
     build_btn.configure(command=on_build)
     build_btn.pack(side=tk.LEFT)
