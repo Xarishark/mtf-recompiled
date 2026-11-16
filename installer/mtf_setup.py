@@ -256,10 +256,13 @@ def launch_gui() -> int:
         log_dir = ROOT / "work"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "last_launch.log"
+        launch_env = build_env()
+        launch_env.setdefault("TOTK_DUMP", "key")
+        launch_env.setdefault("TOTK_DUMP_DIR", str(log_dir / "f9_dump"))
         proc = subprocess.Popen(
             [str(exe), "--boot"],
             cwd=str(ROOT),
-            env=build_env(),
+            env=launch_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

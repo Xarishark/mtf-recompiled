@@ -105,3 +105,15 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Root cause:** `nn::account::LoadProfileImage` was not overridden in `runtime/ov_system.c`, so it executed original `sdk` code calling `f_700159a2b0` (unimplemented `acc:u` IPC) which returned `NULL`, causing a null-vtable dereference.
 - **Fix:** Added `ov_load_profile_image` in `runtime/ov_system.c` returning a valid 64x64 baseline JPEG (`693` bytes) for the local user UID.
 - **Verification:** Rebuilt `mtf-stage2.exe` (`1.7s`), ran `TOTK_TRACE=perf,audio` cleanly at `60.0 fps` with `0` audio underruns/overruns.
+
+### Q15: `FATAL: nvn: CallCommands with a null handle` on Title/Menu Transition
+- **Symptom:** Pressing `E` (`B_A`) on the title/menu screen crashed with `FATAL: nvn: CallCommands with a null handle`.
+- **Root cause:** `runtime/nvn_api_cmd.c` (`inline_recording`) aborted via `rt_fatal` when the game passed a `0` command handle to `nvnCommandBufferCallCommands`.
+- **Fix:** Updated `inline_recording` in `runtime/nvn_api_cmd.c` to log once (`nvn: CallCommands: ignoring null handle`) and return early when `!handle`.
+- **Verification:** Rebuilt `mtf-stage2.exe` (`0.7s`); confirmed in `work/last_launch.log` that `CallCommands` with a null handle is now logged and survived cleanly.
+
+### Q16: `FATAL: NVN nvnCommandBufferSetViewportSwizzles is not implemented` on Menu Transition
+- **Symptom:** After surviving `CallCommands` with a null handle upon pressing `E` (`B_A`), `mtf-stage2.exe` aborted with `FATAL: NVN nvnCommandBufferSetViewportSwizzles is not implemented`.
+- **Root cause:** `nvn_api_core.c` reported `NVN_DEVICE_INFO_SUPPORTS_VIEWPORT_SWIZZLE = 1` (`devinfo[0x43]`), and `nvnCommandBufferSetViewportSwizzles` was still an unimplemented stub in `nvn_unimpl.inc`.
+- **Fix:** Implemented `NVN_API(nvnCommandBufferSetViewportSwizzles)` in `runtime/nvn_api_cmd.c` (validates identity swizzles `(POSITIVE_X, POSITIVE_Y, POSITIVE_Z, POSITIVE_W)` and logs once if any non-identity swizzle is requested). Also wired `TOTK_DUMP=key` (`TOTK_DUMP_DIR=work/f9_dump`) into `installer/mtf_setup.py` `on_launch()` so `F9` frame dumps work out of the box.
+- **Verification:** Rebuilt `mtf-stage2.exe` (`0.8s`), verified `60.0 fps` (`120 frames in 2.000 s`) and `python tools/check_content.py` (`0 violations`).

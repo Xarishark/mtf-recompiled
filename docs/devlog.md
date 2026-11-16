@@ -97,3 +97,8 @@
 - **Config & menu (`runtime/cfg.c`, `runtime/ui/menu.cpp`):** Excluded `mtf327680` from `dkb_output` (`2880x1620`) so `OUTPUT_RES` defaults to `1920x1080`, and removed the unimplemented `DLSS` choice from the upscaler menu (`FSR` / `Bilinear` only).
 - **Launcher (`installer/mtf_setup.py`):** Guarded `on_launch()` against launching a second instance while `mtf-stage2.exe` is already running.
 - **Verification:** Rebuilt `mtf-stage2.exe` (`1.7s`), `TOTK_TRACE=perf,audio` verified `60.0 fps` (`120 frames in 1.999 s`) and `0` audio underruns/overruns; `python tools/check_content.py` passed (`0 violations`).
+
+## 2026-11-15 — `nvnCommandBufferSetViewportSwizzles` Fix & `F9` Frame Dump Support
+- **NVN command buffer (`runtime/nvn_api_cmd.c`):** Implemented `nvnCommandBufferSetViewportSwizzles` (accepts identity swizzles and logs non-identity swizzles once) after `work/last_launch.log` captured `FATAL: NVN nvnCommandBufferSetViewportSwizzles is not implemented` following the `CallCommands` null-handle fix (`a0893e6`).
+- **Diagnostics (`installer/mtf_setup.py`):** Enabled `TOTK_DUMP=key` and `TOTK_DUMP_DIR=work/f9_dump` by default in `on_launch()` so pressing `F9` in the game window writes a Vulkan frame dump.
+- **Verification:** Rebuilt `mtf-stage2.exe` (`0.8s`), ran `TOTK_TRACE=perf,audio` (`60.0 fps`, `120 frames in 2.000 s`), verified `TOTK_MENU_TEST=210:2` with `mtf.ini` (`upscaler = bilinear`, `smaa = high`, `1920x1080`), and ran `python tools/check_content.py` (`0 violations`).

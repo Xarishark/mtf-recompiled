@@ -670,6 +670,21 @@ NVN_API(nvnCommandBufferSetViewport) {
     float v[4] = {(float)(int)arg_x(c, 1), (float)(int)arg_x(c, 2), (float)(int)arg_x(c, 3), (float)(int)arg_x(c, 4)};
     set_viewports(cmd_of(c), 0, 1, v);
 }
+// void nvnCommandBufferSetViewportSwizzles(NVNcommandBuffer *cmd, int first, int count, const NVNviewportSwizzle *swizzles)
+NVN_API(nvnCommandBufferSetViewportSwizzles) {
+    (void)cmd_of(c);
+    int first = (int)arg_x(c, 1), n = (int)arg_x(c, 2);
+    const uint32_t *sw = arg_p(c, 3);
+    for (int i = 0; i < n; i++) {
+        if (sw[4 * i + 0] != NVN_VIEWPORT_SWIZZLE_POSITIVE_X || sw[4 * i + 1] != NVN_VIEWPORT_SWIZZLE_POSITIVE_Y ||
+            sw[4 * i + 2] != NVN_VIEWPORT_SWIZZLE_POSITIVE_Z || sw[4 * i + 3] != NVN_VIEWPORT_SWIZZLE_POSITIVE_W) {
+            static int once;
+            if (!once++)
+                rt_log("nvn: SetViewportSwizzles non-identity [%d] (%u,%u,%u,%u) ignored", first + i, sw[4 * i + 0],
+                       sw[4 * i + 1], sw[4 * i + 2], sw[4 * i + 3]);
+        }
+    }
+}
 static void set_scissor(cmd_t *o, int x, int y, int w, int h) { *REC(o, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
 // void nvnCommandBufferSetScissor(NVNcommandBuffer *cmd, int x, int y, int w, int h)
 NVN_API(nvnCommandBufferSetScissor) {
