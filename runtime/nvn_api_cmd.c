@@ -524,6 +524,14 @@ NVN_API(nvnCommandBufferGetCommandMemoryFree) { const cmd_t *o = cmd_of(c); ret_
 NVN_API(nvnCommandBufferBeginRecording) {
     cmd_t *o = cmd_of(c);
     if (o->recording) rt_log("nvn: BeginRecording on command buffer %p while it records", (void *)o);
+    // Notify the game before recording if command or control memory is nearly exhausted so its callback
+    // can replenish the buffer before Get{Command,Control}MemoryUsed saturates at game_size/ctl_size.
+    if (!o->game_size || o->hw_used + 1024 > o->game_size)
+        memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,
+                     o->game_size ? 1024 : MIN_COMMAND_SIZE);
+    if (!o->ctl_size || o->ctl_used + CTL_PER_RECORDING > o->ctl_size)
+        memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY,
+                     o->ctl_size ? CTL_PER_RECORDING : MIN_CONTROL_SIZE);
     o->recording = 1;
     if (o->seg && !rec_owned(o)) o->seg = o->cur = o->end = NULL;   // a twin's or handed-over buffer: take a block of our own
     o->cur = o->seg;   // the previous recording was copied or handed over at EndRecording (take_recording)

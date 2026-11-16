@@ -33,3 +33,6 @@ uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n, uint32_t c
 int spirv_uses_subgroup_ops(const uint32_t *w, uint64_t words);
 // NVIDIA's fused-multiply-zero rule for float OpFMul and Fma; vertex_only leaves other stages alone.
 uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint64_t *out_n, unsigned *n_mul, unsigned *n_fma);
+// Rewrites float/vec4 vertex Input variables at Locations in uint_mask/sint_mask to uint/int so VK_FORMAT_*_UINT/*_SINT
+// vertex attributes match the SPIR-V input type, bitcasting loaded values back to float/vec4. Returns NULL if unchanged.
+uint32_t *spirv_rewrite_int_inputs(const uint32_t *w, uint64_t n, uint32_t uint_mask, uint32_t sint_mask, uint64_t *out_n);

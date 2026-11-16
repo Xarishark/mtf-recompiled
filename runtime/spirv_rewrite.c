@@ -486,3 +486,153 @@ uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint64_t *ou
     free(comps), free(f32), free(nullc), free(need);
     return o;
 }
+
+uint32_t *spirv_rewrite_int_inputs(const uint32_t *w, uint64_t n, uint32_t uint_mask, uint32_t sint_mask, uint64_t *out_n) {
+    if (!w || n < 5 || !((uint_mask | sint_mask))) return NULL;
+    uint32_t bound = w[3], fn_at = 0;
+    uint32_t f32 = 0, u32 = 0, s32 = 0;
+    uint32_t fvec[5] = {0}, uvec[5] = {0}, svec[5] = {0};
+    uint32_t fptr[5] = {0}, uptr[5] = {0}, sptr[5] = {0};
+    struct { uint8_t kind; uint8_t comps; } tinfo[256]; // small type table; fallback scan if bound >= 256
+    uint8_t *var_kind = calloc(bound, 1);   // 1 = uint, 2 = sint
+    uint8_t *var_comps = calloc(bound, 1);  // 1..4
+    uint32_t *var_loc = calloc(bound, sizeof(uint32_t));
+    uint8_t *has_loc = calloc(bound, 1);
+    uint8_t *t_is_f = calloc(bound, 1);     // 1..4 for float/vec2/3/4
+    uint32_t *ptr_pointee = calloc(bound, sizeof(uint32_t));
+    uint8_t *ptr_is_in = calloc(bound, 1);
+    if (!var_kind || !var_comps || !var_loc || !has_loc || !t_is_f || !ptr_pointee || !ptr_is_in) {
+        free(var_kind), free(var_comps), free(var_loc), free(has_loc), free(t_is_f), free(ptr_pointee), free(ptr_is_in);
+        return NULL;
+    }
+    (void)tinfo;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_DECORATE && len >= 4 && a[1] == SPV_DEC_LOCATION && a[0] < bound) {
+            has_loc[a[0]] = 1, var_loc[a[0]] = a[2];
+        } else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[1] == 32 && a[0] < bound) {
+            f32 = a[0], fvec[1] = a[0], t_is_f[a[0]] = 1;
+        } else if (op == SPV_OP_TYPE_INT && len >= 4 && a[1] == 32 && a[0] < bound) {
+            if (a[2] == 0) u32 = a[0], uvec[1] = a[0];
+            else if (a[2] == 1) s32 = a[0], svec[1] = a[0];
+        } else if (op == SPV_OP_TYPE_VECTOR && len >= 4 && a[0] < bound && a[2] >= 2 && a[2] <= 4) {
+            if (a[1] == f32 && f32) fvec[a[2]] = a[0], t_is_f[a[0]] = (uint8_t)a[2];
+            else if (a[1] == u32 && u32) uvec[a[2]] = a[0];
+            else if (a[1] == s32 && s32) svec[a[2]] = a[0];
+        } else if (op == SPV_OP_TYPE_POINTER && len >= 4 && a[1] == 1 /* Input */ && a[0] < bound) {
+            ptr_is_in[a[0]] = 1, ptr_pointee[a[0]] = a[2];
+            for (int c = 1; c <= 4; c++) {
+                if (fvec[c] && a[2] == fvec[c]) fptr[c] = a[0];
+                if (uvec[c] && a[2] == uvec[c]) uptr[c] = a[0];
+                if (svec[c] && a[2] == svec[c]) sptr[c] = a[0];
+            }
+        } else if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == 1 /* Input */ && a[1] < bound && a[0] < bound) {
+            uint32_t pt = ptr_is_in[a[0]] ? ptr_pointee[a[0]] : 0;
+            if (has_loc[a[1]] && var_loc[a[1]] < 32 && pt < bound && t_is_f[pt]) {
+                uint32_t loc = var_loc[a[1]];
+                if (uint_mask >> loc & 1) var_kind[a[1]] = 1, var_comps[a[1]] = t_is_f[pt];
+                else if (sint_mask >> loc & 1) var_kind[a[1]] = 2, var_comps[a[1]] = t_is_f[pt];
+            }
+        } else if (op == SPV_OP_FUNCTION) {
+            fn_at = (uint32_t)i;
+            break;
+        }
+        i += len;
+    }
+    int any = 0;
+    uint8_t need_u[5] = {0}, need_s[5] = {0};
+    for (uint32_t v = 1; v < bound; v++) {
+        if (var_kind[v] == 1) any = 1, need_u[var_comps[v]] = 1, need_u[1] = 1;
+        else if (var_kind[v] == 2) any = 1, need_s[var_comps[v]] = 1, need_s[1] = 1;
+    }
+    if (!any || !fn_at) {
+        free(var_kind), free(var_comps), free(var_loc), free(has_loc), free(t_is_f), free(ptr_pointee), free(ptr_is_in);
+        return NULL;
+    }
+    uint32_t nb = bound, extra = 0;
+    uint32_t new_u32 = 0, new_s32 = 0, new_uvec[5] = {0}, new_svec[5] = {0}, new_uptr[5] = {0}, new_sptr[5] = {0};
+    if ((need_u[1] || need_u[2] || need_u[3] || need_u[4]) && !u32) new_u32 = uvec[1] = u32 = nb++, extra += 4;
+    if ((need_s[1] || need_s[2] || need_s[3] || need_s[4]) && !s32) new_s32 = svec[1] = s32 = nb++, extra += 4;
+    for (int c = 2; c <= 4; c++) {
+        if (need_u[c] && !uvec[c]) new_uvec[c] = uvec[c] = nb++, extra += 4;
+        if (need_s[c] && !svec[c]) new_svec[c] = svec[c] = nb++, extra += 4;
+    }
+    for (int c = 1; c <= 4; c++) {
+        if (need_u[c] && !uptr[c]) new_uptr[c] = uptr[c] = nb++, extra += 4;
+        if (need_s[c] && !sptr[c]) new_sptr[c] = sptr[c] = nb++, extra += 4;
+    }
+    // Count OpLoad instructions on rewritten pointers
+    uint8_t *ac_kind = calloc(bound, 1);
+    uint64_t nloads = 0;
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        const uint32_t *a = w + i + 1;
+        if (op == 65 /* OpAccessChain */ && len >= 4 && a[2] < bound && var_kind[a[2]] && a[1] < bound)
+            ac_kind[a[1]] = var_kind[a[2]];
+        else if (op == 61 /* OpLoad */ && len >= 4 && a[2] < bound && (var_kind[a[2]] || ac_kind[a[2]]))
+            nloads++;
+        i += len;
+    }
+    uint32_t *o = malloc((n + extra + nloads * 4 + 8) * 4);
+    if (!o) {
+        free(ac_kind), free(var_kind), free(var_comps), free(var_loc), free(has_loc), free(t_is_f), free(ptr_pointee), free(ptr_is_in);
+        return NULL;
+    }
+    // Copy header up to fn_at skipping rewritten OpVariables; emit new types + rewritten OpVariables right before fn_at
+    uint64_t p = 5;
+    memcpy(o, w, 5 * 4);
+    for (uint64_t i = 5; i < fn_at;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if (!(op == SPV_OP_VARIABLE && len >= 4 && a[1] < bound && var_kind[a[1]]))
+            memcpy(o + p, w + i, len * 4), p += len;
+        i += len;
+    }
+    if (new_u32) o[p++] = 4u << 16 | SPV_OP_TYPE_INT, o[p++] = new_u32, o[p++] = 32, o[p++] = 0;
+    if (new_s32) o[p++] = 4u << 16 | SPV_OP_TYPE_INT, o[p++] = new_s32, o[p++] = 32, o[p++] = 1;
+    for (int c = 2; c <= 4; c++) {
+        if (new_uvec[c]) o[p++] = 4u << 16 | SPV_OP_TYPE_VECTOR, o[p++] = new_uvec[c], o[p++] = u32, o[p++] = (uint32_t)c;
+        if (new_svec[c]) o[p++] = 4u << 16 | SPV_OP_TYPE_VECTOR, o[p++] = new_svec[c], o[p++] = s32, o[p++] = (uint32_t)c;
+    }
+    for (int c = 1; c <= 4; c++) {
+        if (new_uptr[c]) o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = new_uptr[c], o[p++] = 1, o[p++] = uvec[c];
+        if (new_sptr[c]) o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = new_sptr[c], o[p++] = 1, o[p++] = svec[c];
+    }
+    for (uint64_t i = 5; i < fn_at;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_VARIABLE && len >= 4 && a[1] < bound && var_kind[a[1]]) {
+            int c = var_comps[a[1]];
+            memcpy(o + p, w + i, len * 4);
+            o[p + 1] = var_kind[a[1]] == 1 ? uptr[c] : sptr[c];
+            p += len;
+        }
+        i += len;
+    }
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if (op == 65 /* OpAccessChain */ && len >= 4 && a[2] < bound && var_kind[a[2]]) {
+            memcpy(o + p, w + i, len * 4);
+            o[p + 1] = var_kind[a[2]] == 1 ? uptr[1] : sptr[1];
+            p += len;
+        } else if (op == 61 /* OpLoad */ && len >= 4 && a[2] < bound && (var_kind[a[2]] || ac_kind[a[2]])) {
+            uint8_t k = var_kind[a[2]] ? var_kind[a[2]] : ac_kind[a[2]];
+            int c = var_kind[a[2]] ? var_comps[a[2]] : 1;
+            uint32_t it = k == 1 ? uvec[c] : svec[c];
+            uint32_t tmp = nb++;
+            o[p++] = 4u << 16 | 61u, o[p++] = it, o[p++] = tmp, o[p++] = a[2];
+            o[p++] = 4u << 16 | 124u /* OpBitcast */, o[p++] = a[0], o[p++] = a[1], o[p++] = tmp;
+        } else {
+            memcpy(o + p, w + i, len * 4), p += len;
+        }
+        i += len;
+    }
+    o[3] = nb;
+    *out_n = p;
+    free(ac_kind), free(var_kind), free(var_comps), free(var_loc), free(has_loc), free(t_is_f), free(ptr_pointee), free(ptr_is_in);
+    return o;
+}

@@ -1623,12 +1623,34 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+static void vattr_int_masks(const VkPipeState *s, uint32_t *uint_mask, uint32_t *sint_mask) {
+    uint32_t u = 0, si = 0;
+    for (int i = 0; i < 16; i++) {
+        va_st a;
+        memcpy(&a, &s->vattr[i], sizeof a);
+        int type = GFX_TYPE_FLOAT;
+        if (a.fmt) vk_vertex_format((int)a.fmt, &type);
+        if (type == GFX_TYPE_UINT) u |= 1u << i;
+        else if (type == GFX_TYPE_SINT) si |= 1u << i;
+    }
+    *uint_mask = u, *sint_mask = si;
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
     if (s->gs && (l->set1 || !k->geometry_input || k->geometry_input > GFX_GEOMETRY_TRIANGLES_ADJACENCY)) return VK_NULL_HANDLE;
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE, gm = VK_NULL_HANDLE;
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
     uint32_t *vpatched = NULL, *fpatched = NULL;
+    {
+        uint32_t um, sm;
+        vattr_int_masks(s, &um, &sm);
+        if (um | sm) {
+            uint64_t n2 = 0;
+            uint32_t *r = spirv_rewrite_int_inputs(vcode, vw, um, sm, &n2);
+            if (r) vcode = vpatched = r, vw = n2;
+        }
+    }
     if (!s->gs && l->set1) {   // independent layouts: outputs from the vertex shader's union
         GfxShaderIo fin[32];
         uint32_t missing = vs_union_missing(s, fin);
@@ -1808,7 +1830,7 @@ typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t 
 static Lib *libs[LIB_BUCKETS];
 
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
-typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
+typedef struct { uint32_t kind, missing, uint_attr, sint_attr; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
 typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, alpha; const GfxShader *fs; float alpha_ref; uint32_t pad; } FsKey;
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, pad[3]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;
@@ -1883,9 +1905,13 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         uint64_t vw, sw, n2 = 0;
         const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw), *scode = vcode;
         sw = vw;
+        uint32_t *ipat = (pk->uint_attr | pk->sint_attr) ? spirv_rewrite_int_inputs(vcode, vw, pk->uint_attr, pk->sint_attr, &n2) : NULL;
+        if (ipat) vcode = ipat, vw = n2;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
-        if (!(m = make_module(s->vs, vcode, vw))) goto out;
+        m = make_module(s->vs, vcode, vw);
+        free(ipat);
+        if (!m) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
         pin_subgroup32(&st, &rq, scode, sw);
         pi.stageCount = 1, pi.pStages = &st, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
@@ -2077,6 +2103,7 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
     memset(pk, 0, sizeof *pk);
     GfxShaderIo fin[32];
     pk->kind = LIB_PR, pk->vs = s->vs, pk->clamp = k->clamp, pk->poly_mode = k->poly_mode, pk->minus_w = k->minus_w;
+    vattr_int_masks(s, &pk->uint_attr, &pk->sint_attr);
     pk->missing = vs_union_missing(s, fin);
     for (int i = 0; i < 32; i++)
         if (pk->missing >> i & 1) pk->fin[i] = fin[i];
