@@ -559,7 +559,11 @@ NVN_API(nvnCommandBufferIsRecording) { ret_x(c, cmd_of(c)->recording != 0); }
 // records and OP_END (take_recording checked them), so the records go over as one block; usage grows by the same
 // bytes as record by record.
 static void inline_recording(cmd_t *o, uint64_t handle, const char *what) {
-    if (!handle) rt_fatal("nvn: %s with a null handle", what);
+    if (!handle) {
+        static int once;
+        if (!once++) rt_log("nvn: %s: ignoring null handle", what);
+        return;
+    }
     uint64_t bytes = copy_touch(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what);
     if (bytes <= 16) return;
     size_t body = (size_t)bytes - 16;
