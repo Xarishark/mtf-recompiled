@@ -1558,7 +1558,7 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
     if (!strcmp(stage, "cs")) {
         uint32_t l[3] = {1, 1, 1};
         if (a && (a->local[0] | a->local[1] | a->local[2])) l[0] = a->local[0], l[1] = a->local[1], l[2] = a->local[2];
-        else memcpy(l, control + 0x748, 12);
+        else memcpy(l, control + (gfx_shader_is_nvn2(control) ? 0x58 : 0x748), 12);
         o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
         const uint8_t *lay = control + NVN2_C0_LAYOUT;
         if (!memcmp(lay, "DKC1", 4)) {
@@ -3110,9 +3110,10 @@ static void n2_worker(void *arg) {
         GfxShaderAnswers a;
         memset(&a, 0, sizeof a);
         if (st == GFX_STAGE_CS) {
+            uint32_t off = gfx_shader_is_nvn2(nctl) ? 0x58 : 0x748;
             for (int k = 0; k < 3; k++) {
                 uint32_t l;
-                memcpy(&l, nctl + 0x748 + 4 * k, 4);
+                memcpy(&l, nctl + off + 4 * k, 4);
                 a.local[k] = (uint16_t)(l ? l : 1);
             }
         } else {

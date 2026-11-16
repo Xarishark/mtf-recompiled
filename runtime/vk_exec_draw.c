@@ -961,7 +961,7 @@ DRAW_SHARED nvn_hmap views_by_image;     // VkImage -> its first ViewNode
 
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
-static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
+static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage, uint8_t rfmt) {
     (void)ex;
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
@@ -1009,13 +1009,16 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
                     sw[i] = img->chan[sw[i] - NVN_TEXTURE_SWIZZLE_R];
             }
     }
+    VkFormat vfmt = img->format;
+    if (storage && !rfmt && (vfmt == VK_FORMAT_R32_UINT || vfmt == VK_FORMAT_R32_SINT))
+        vfmt = VK_FORMAT_R32_SFLOAT;
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    ViewKey k = {img->image, img->format, vt, aspect, l0, nl, y0, ny, swz};
+    ViewKey k = {img->image, vfmt, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
-                                .format = img->format,
+                                .format = vfmt,
                                 .components = {swz_of(sw[0]), swz_of(sw[1]), swz_of(sw[2]), swz_of(sw[3])},
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
@@ -1218,12 +1221,14 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
     if (st == NVN_STAGE_VS) vk_pipeline_answers(&ex->pipe, a, NULL);
     else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
     else if (st == NVN_STAGE_GS) a->geometry_input = dc->geometry_input;
-    else if (st == NVN_STAGE_CS)
+    else if (st == NVN_STAGE_CS) {
+        uint32_t off = gfx_shader_is_nvn2(ctl) ? 0x58 : 0x748;
         for (int k = 0; k < 3; k++) {
             uint32_t l;
-            memcpy(&l, ctl + 0x748 + 4 * k, 4);
+            memcpy(&l, ctl + off + 4 * k, 4);
             a->local[k] = (uint16_t)(l ? l : 1);
         }
+    }
     typeof(dc->AC[0]) *c = &dc->AC[st];
     if (c->context != dc->descriptor_serial) {
         memset(c, 0, sizeof *c);
@@ -2034,7 +2039,7 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         view_t v;
         int hv;
         const VkTexImage *img = vk_texture_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv);
-        if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
+        if (img) view = get_view(ex, img, &v, hv, r->type, storage, r->format), *image = img->image;
         if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {

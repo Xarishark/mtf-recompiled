@@ -94,6 +94,10 @@ def build_job(
         f_entry = facts.get(key, {})
         if "local" in f_entry:
             job["local"] = f_entry["local"]
+        else:
+            lx, ly, lz = struct.unpack_from("<III", ctl, 0x58)
+            if 1 <= lx <= 1024 and 1 <= ly <= 1024 and 1 <= lz <= 64:
+                job["local"] = [lx, ly, lz]
         if "shared" in f_entry:
             job["shared"] = f_entry["shared"]
     return job
