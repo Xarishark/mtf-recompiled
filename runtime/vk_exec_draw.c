@@ -1614,6 +1614,17 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
             return bi;
         }
         if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, 0, 0, &bi)) return bi;
+    } else if (slot == 25) {   // Ryujinx MetalUniformBounds: u32[16] (four uint4) of bound sizes for c[3]..c[16]
+        uint32_t sizes[16] = {0};
+        for (int i = 0; i < 14; i++) {
+            uint64_t sz = ex->ubo[st][i].size;
+            sizes[i] = (uint32_t)(sz < max ? sz : max);
+        }
+        VkBuffer b;
+        VkDeviceSize o;
+        dc->RS.volatile_ = 1;
+        memcpy(scratch(ex, sizeof sizes, &b, &o), sizes, sizeof sizes);
+        return (VkDescriptorBufferInfo){b, o, sizeof sizes};
     }
     return zero_info(max);
 }
@@ -2550,6 +2561,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                     int slot = r->slot + (int)k;
                     if (slot == 0 && c0_on()) c0 = 1, rs_add(tmp, &n, ex, ex->ssbo[st], sizeof ex->ssbo[st]);
                     else if (slot >= 3 && slot - 3 < 18) rs_add(tmp, &n, ex, &ex->ubo[st][slot - 3], sizeof(p_bind_buf));
+                    else if (slot == 25) rs_add(tmp, &n, ex, &ex->ubo[st][0], 14 * sizeof(p_bind_buf));
                 }   // slot 1: the program (bind_sig); others: the zero buffer
             } else if (b->kind == GFX_RES_SSBO) {   // every descriptor of the binding is the same range
                 int ubo, slot = ssbo_slot(r, st, &ubo);
