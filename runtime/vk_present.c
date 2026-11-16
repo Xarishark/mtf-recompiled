@@ -532,11 +532,18 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                      VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                      VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
-    // Colour adjustment (TOTK_COLOR_*, vk_color.c): an adjusted copy of the crop takes the game image's place below
-    VkImage graded = general && !native_hdr ? vk_color_record(cb, slot, src, fmt, rect) : VK_NULL_HANDLE;
+    // Colour adjustment (TOTK_COLOR_*, vk_color.c): an adjusted copy of the crop takes the game image's place below.
+    // Reinterpret *_SRGB game swapchain textures as *_UNORM so the UNORM host swapchain receives raw sRGB bytes
+    // without Vulkan decoding sRGB->linear on read without re-encoding on write.
+    VkFormat vfmt = fmt;
+    if (!native_hdr) {
+        if (fmt == VK_FORMAT_R8G8B8A8_SRGB) vfmt = VK_FORMAT_R8G8B8A8_UNORM;
+        else if (fmt == VK_FORMAT_B8G8R8A8_SRGB) vfmt = VK_FORMAT_B8G8R8A8_UNORM;
+    }
+    VkImage graded = general && !native_hdr ? vk_color_record(cb, slot, src, vfmt, rect, vfmt != fmt) : VK_NULL_HANDLE;
     const int grect[4] = {0, 0, cw, ch};
     VkImage psrc = graded ? graded : src;
-    VkFormat pfmt = graded ? VK_FORMAT_R16G16B16A16_SFLOAT : fmt;
+    VkFormat pfmt = graded ? VK_FORMAT_R16G16B16A16_SFLOAT : vfmt;
     const int *prect = graded ? grect : rect;
     // FSR (TOTK_UPSCALER) when the picture's rectangle is larger than the crop; else the bilinear blit
     int fsr = general && !native_hdr && vk_fsr_record(cb, slot, psrc, pfmt, graded ? cw : w, graded ? ch : h, prect, tgt, to);
