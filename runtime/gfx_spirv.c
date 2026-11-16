@@ -249,6 +249,16 @@ uint32_t *gfx_spirv_final(const GfxShader *src, const uint32_t *w, uint64_t word
     uint32_t *fixed = geometry_chain ? spirv_fixup_linked(w, words, &fixed_n, 1, clip_cull_limit)
                                      : spirv_fixup(w, words, &fixed_n, clip_cull_limit);
     if (fixed) w = fixed, words = fixed_n;
+    uint32_t *ui2d = NULL;
+    if (src && gfx_shader_stage(src) == GFX_STAGE_VS && gfx_shader_spirv_fnv(src) == 0x67e197ca7ba86adaull) {
+        uint64_t ui2d_n = 0;
+        ui2d = spirv_ui2d_color_fix(w, words, &ui2d_n);
+        if (ui2d) {
+            w = ui2d, words = ui2d_n;
+            rt_log("vk: vs %016llx: ui2d fallback corner color reconstructed",
+                   (unsigned long long)gfx_shader_spirv_fnv(src));
+        }
+    }
     uint32_t *suv = NULL;
     if (screen_uv_stage(src)) {
         uint64_t suv_n = 0;
@@ -304,12 +314,13 @@ uint32_t *gfx_spirv_final(const GfxShader *src, const uint32_t *w, uint64_t word
     uint32_t *ov = spv_override(w, words, &ov_n);
     if (ov) w = ov, words = ov_n;
     // w is the last copy made, or still the caller's module: that copy is the result, the earlier ones go
-    uint32_t *last = ov ? ov : nan ? nan : hs ? hs : fmz ? fmz : suv ? suv : fixed ? fixed : lq;
+    uint32_t *last = ov ? ov : nan ? nan : hs ? hs : fmz ? fmz : suv ? suv : ui2d ? ui2d : fixed ? fixed : lq;
     if (ov != last) free(ov);
     if (nan != last) free(nan);
     if (hs != last) free(hs);
     if (fmz != last) free(fmz);
     if (suv != last) free(suv);
+    if (ui2d != last) free(ui2d);
     if (fixed != last) free(fixed);
     if (lq != last) free(lq);
     *out_words = words;

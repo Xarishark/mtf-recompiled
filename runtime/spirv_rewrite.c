@@ -636,3 +636,148 @@ uint32_t *spirv_rewrite_int_inputs(const uint32_t *w, uint64_t n, uint32_t uint_
     free(ac_kind), free(var_kind), free(var_comps), free(var_loc), free(has_loc), free(t_is_f), free(ptr_pointee), free(ptr_is_in);
     return o;
 }
+
+uint32_t *spirv_ui2d_color_fix(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    if (!w || n < 5) return NULL;
+    uint32_t bound = w[3], fn_at = 0;
+    uint32_t f32 = 0, s32 = 0, uptr_f32 = 0, vp_c3 = 0;
+    uint32_t c_one_f = 0, comp_c[4] = {0};
+    uint32_t *binding = calloc(bound, sizeof(uint32_t));
+    uint8_t *has_bind = calloc(bound, 1);
+    uint32_t *loc = calloc(bound, sizeof(uint32_t));
+    uint8_t *has_loc = calloc(bound, 1);
+    if (!binding || !has_bind || !loc || !has_loc) {
+        free(binding), free(has_bind), free(loc), free(has_loc);
+        return NULL;
+    }
+    uint32_t in_a0 = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_DECORATE && len >= 4 && a[0] < bound) {
+            if (a[1] == 33 /* Binding */) has_bind[a[0]] = 1, binding[a[0]] = a[2];
+            else if (a[1] == SPV_DEC_LOCATION) has_loc[a[0]] = 1, loc[a[0]] = a[2];
+        } else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[1] == 32) {
+            f32 = a[0];
+        } else if (op == SPV_OP_TYPE_INT && len >= 4 && a[1] == 32 && a[2] == 1) {
+            s32 = a[0];
+        } else if (op == SPV_OP_TYPE_POINTER && len >= 4 && a[1] == 2 /* Uniform */ && a[2] == f32 && f32) {
+            uptr_f32 = a[0];
+        } else if (op == SPV_OP_CONSTANT && len >= 4) {
+            if (a[0] == f32 && a[2] == 0x3f800000u) c_one_f = a[1];
+            else if (a[0] == s32 && a[2] < 4u) comp_c[a[2]] = a[1];
+        } else if (op == SPV_OP_VARIABLE && len >= 4 && a[1] < bound) {
+            if (a[2] == 2 /* Uniform */ && has_bind[a[1]] && binding[a[1]] == 2) vp_c3 = a[1];
+            else if (a[2] == 1 /* Input */ && has_loc[a[1]] && loc[a[1]] == 0) in_a0 = a[1];
+        } else if (op == SPV_OP_FUNCTION) {
+            fn_at = (uint32_t)i;
+            break;
+        }
+        i += len;
+    }
+    free(binding), free(has_bind), free(loc), free(has_loc);
+    if (!fn_at || !f32 || !s32 || !uptr_f32 || !vp_c3 || !in_a0 || !c_one_f ||
+        !comp_c[0] || !comp_c[1] || !comp_c[2] || !comp_c[3])
+        return NULL;
+
+    // Locate the Function locals holding a0.x / a0.y and the 4-pair fallback color initialization.
+    uint32_t a0x_var = 0, a0y_var = 0, patch_at = 0, patch_end = 0;
+    uint32_t dst_vars[4] = {0};
+    uint32_t ac0 = 0, ac1 = 0, ld0 = 0, ld1 = 0;
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        const uint32_t *a = w + i + 1;
+        if (op == 65 /* OpAccessChain */ && len >= 5 && a[2] == in_a0) {
+            if (a[3] == comp_c[0]) ac0 = a[1];
+            else if (a[3] == comp_c[1]) ac1 = a[1];
+        } else if (op == 61 /* OpLoad */ && len >= 4) {
+            if (ac0 && a[2] == ac0) ld0 = a[1];
+            else if (ac1 && a[2] == ac1) ld1 = a[1];
+        } else if (op == 62 /* OpStore */ && len >= 3) {
+            if (ld0 && a[1] == ld0 && !a0x_var) a0x_var = a[0];
+            else if (ld1 && a[1] == ld1 && !a0y_var) a0y_var = a[0];
+        }
+        // Match 4 consecutive (OpLoad f32 t_k src_k; OpStore dst_k t_k) followed by OpLoad + OpBranchConditional.
+        if (!patch_at && i + 28 < n) {
+            uint64_t j = i;
+            int ok = 1;
+            for (int k = 0; k < 4; k++) {
+                if (j + 7 > n) { ok = 0; break; }
+                uint32_t op1 = w[j] & 0xffff, len1 = w[j] >> 16;
+                uint32_t op2 = w[j + len1] & 0xffff, len2 = w[j + len1] >> 16;
+                if (op1 != 61 || len1 != 4 || w[j + 1] != f32 || op2 != 62 || len2 != 3 || w[j + len1 + 2] != w[j + 2]) {
+                    ok = 0;
+                    break;
+                }
+                dst_vars[k] = w[j + len1 + 1];
+                j += len1 + len2;
+            }
+            if (ok && j + 4 < n && (w[j] & 0xffff) == 61 && dst_vars[0] != dst_vars[1] && dst_vars[1] != dst_vars[2]) {
+                // Verify the next instructions lead to a conditional branch (the if (%68) check).
+                uint64_t k = j + (w[j] >> 16);
+                if (k + 4 < n && (w[k] & 0xffff) == 247 && (w[k + (w[k] >> 16)] & 0xffff) == 250)
+                    patch_at = (uint32_t)i, patch_end = (uint32_t)j;
+            }
+        }
+        i += len;
+    }
+    if (!a0x_var || !a0y_var || !patch_at) return NULL;
+
+    // Worst-case expansion: 4 OpConstant (16 words) + 18 setup words + 4 * 92 = 402 words (~394 net).
+    uint32_t *o = malloc((n + 512) * 4);
+    if (!o) return NULL;
+    uint32_t nb = bound;
+    uint64_t p = 0;
+    memcpy(o, w, fn_at * 4);
+    p = fn_at;
+    uint32_t row_c[4];
+    for (int r = 0; r < 4; r++) {
+        row_c[r] = nb++;
+        o[p++] = (4u << 16) | 43u, o[p++] = s32, o[p++] = row_c[r], o[p++] = 29u + (uint32_t)r;
+    }
+    memcpy(o + p, w + fn_at, (patch_at - fn_at) * 4);
+    p += patch_at - fn_at;
+
+    // Emit: ux = a0.x, uy = a0.y, ix = 1 - ux, iy = 1 - uy
+    uint32_t ux = nb++, uy = nb++, ix = nb++, iy = nb++;
+    o[p++] = (4u << 16) | 61u, o[p++] = f32, o[p++] = ux, o[p++] = a0x_var;
+    o[p++] = (4u << 16) | 61u, o[p++] = f32, o[p++] = uy, o[p++] = a0y_var;
+    o[p++] = (5u << 16) | 131u, o[p++] = f32, o[p++] = ix, o[p++] = c_one_f, o[p++] = ux;
+    o[p++] = (5u << 16) | 131u, o[p++] = f32, o[p++] = iy, o[p++] = c_one_f, o[p++] = uy;
+
+    // For each component c in 0..3:
+    // top = c3[29][c] * ix + c3[31][c] * ux
+    // bot = c3[30][c] * ix + c3[32][c] * ux
+    // dst_vars[c] = top * iy + bot * uy
+    for (int c = 0; c < 4; c++) {
+        uint32_t vals[4];
+        for (int r = 0; r < 4; r++) {
+            uint32_t ptr = nb++, val = nb++;
+            o[p++] = (7u << 16) | 65u, o[p++] = uptr_f32, o[p++] = ptr, o[p++] = vp_c3;
+            o[p++] = comp_c[0], o[p++] = row_c[r], o[p++] = comp_c[c];
+            o[p++] = (4u << 16) | 61u, o[p++] = f32, o[p++] = val, o[p++] = ptr;
+            vals[r] = val;
+        }
+        uint32_t t0 = nb++, t1 = nb++, top = nb++;
+        uint32_t b0 = nb++, b1 = nb++, bot = nb++;
+        uint32_t r0 = nb++, r1 = nb++, res = nb++;
+        o[p++] = (5u << 16) | 133u, o[p++] = f32, o[p++] = t0, o[p++] = vals[0], o[p++] = ix;
+        o[p++] = (5u << 16) | 133u, o[p++] = f32, o[p++] = t1, o[p++] = vals[2], o[p++] = ux;
+        o[p++] = (5u << 16) | 129u, o[p++] = f32, o[p++] = top, o[p++] = t0, o[p++] = t1;
+        o[p++] = (5u << 16) | 133u, o[p++] = f32, o[p++] = b0, o[p++] = vals[1], o[p++] = ix;
+        o[p++] = (5u << 16) | 133u, o[p++] = f32, o[p++] = b1, o[p++] = vals[3], o[p++] = ux;
+        o[p++] = (5u << 16) | 129u, o[p++] = f32, o[p++] = bot, o[p++] = b0, o[p++] = b1;
+        o[p++] = (5u << 16) | 133u, o[p++] = f32, o[p++] = r0, o[p++] = top, o[p++] = iy;
+        o[p++] = (5u << 16) | 133u, o[p++] = f32, o[p++] = r1, o[p++] = bot, o[p++] = uy;
+        o[p++] = (5u << 16) | 129u, o[p++] = f32, o[p++] = res, o[p++] = r0, o[p++] = r1;
+        o[p++] = (3u << 16) | 62u, o[p++] = dst_vars[c], o[p++] = res;
+    }
+
+    memcpy(o + p, w + patch_end, (n - patch_end) * 4);
+    p += n - patch_end;
+    o[3] = nb;
+    *out_n = p;
+    return o;
+}

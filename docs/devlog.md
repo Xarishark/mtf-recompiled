@@ -131,3 +131,8 @@
 - **Root cause:** `nvnQueuePresentTexture` in MTF presents `VK_FORMAT_R8G8B8A8_SRGB` into a `VK_FORMAT_B8G8R8A8_UNORM` host swapchain (`runtime/vk_present.c`), causing `vkCmdBlitImage` / `vk_fsr_record` / `vk_color_record` to decode sRGB to linear without re-encoding on write.
 - **Fix:** Reinterpret `*_SRGB` presented textures as `*_UNORM` in `runtime/vk_present.c` and force `vk_color_record` (`runtime/vk.h`, `runtime/vk_color.c`) passthrough when `vfmt != fmt` so raw sRGB bytes reach the `UNORM` swapchain unmodified.
 - **Verification:** Rebuilt `mtf-stage2.exe` and captured `work/shots_fix7/f00795.png` via `TOTK_SHOTS=780-810:15`: brightness and gamma match the reference output.
+
+### 2026-11-16 — Bottom Tutorial Hint Banner Center Background Fix (Issue #11)
+- **Root cause:** In `pass 0036` (`pipe 4`, `prog 130`), the center quad of the bottom hint banner uses NVN2 vertex shader `c381fe4e8be846a3` (SPIR-V FNV `0x67e197ca7ba86ada`) with `vp_c3[34].w == 0`. `totk_xlate` dropped the `0x970..0xc30` `(vp_c3[34].w & 2) == 0` `else` block that reads `vp_c3[29..32]`, leaving `alpha = clamp(-250.0 * vp_c3[13].w, 0, 1) = 0.0`.
+- **Fix:** Added `spirv_ui2d_color_fix` (`runtime/spirv_rewrite.h`, `runtime/spirv_rewrite.c`, `runtime/gfx_spirv.c`) to reconstruct the bilinear `vp_c3[29..32]` corner-color interpolation for `0x67e197ca7ba86ada`.
+- **Verification:** Rebuilt `mtf-stage2.exe` and dumped frame `1200` (`work/dump_1200_fix11/pass_0037_t0_2560x1440_43_rgba8srgb.png`): the bottom hint banner now renders seamlessly across the entire width without any center gap.
