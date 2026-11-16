@@ -106,3 +106,8 @@
 ## 2026-11-15 — Indexed `NVN_DRAW_PRIMITIVE_QUADS` Fix (6x4 Black Triangle Grid)
 - **Root cause & fix (`runtime/vk_exec_draw.c`):** Reproduced the post-title 3D scene via `TOTK_INPUT_SCRIPT=work/skip_to_menu.txt` (`TOTK_DUMP=600`). `pass 0010` (`24` deferred-lighting tiles, `prim 7 = NVN_DRAW_PRIMITIVE_QUADS`) used `op_draw_idx` (`DrawElements`), which did not expand 4-vertex quads into 6-index `TRIANGLE_LIST` pairs (`{i0, i1, i2, i0, i2, i3}`), causing Vulkan to drop the second triangle of every quad. Added quad index expansion in `op_draw_idx`.
 - **Verification:** Rebuilt `mtf-stage2.exe` (`1.4s`) and dumped frame `600` (`work/dump_post_fixed/pass_0010_t0_1706x960_122_r11g11b10f_tm.png`): the entire 3D tennis court, shadows, net, racket, ball, and sky render cleanly without black triangles.
+
+### 2026-11-15 — VP9 Intro Movie 20 FPS / Audio Stutter Fix (Issue #3)
+- **Root cause:** `ov_vp9_submit` in `runtime/ov_codec.c` did not signal `GetVp9DecoderSubmissionReadyEvent` when `oldest_wait(d) != NULL`, throttling the 60 FPS (`2560x1440`) VP9 player to 1 frame per ~50 ms (every `Release` + `Acquire` cycle) and starving the audio stream (`53,493 / 239,520` nonzero frames).
+- **Fix:** Updated `ov_vp9_submit` to signal `submission-ready` iff `oldest_wait(d) != NULL` (and `clear_event` otherwise so the demuxer never overflows `QUEUED = 8`), and increased `libvpx` decoder threads to `4` for `w >= 1920`.
+- **Verification:** `python tools/build_stage2.py --jobs 16` (`0.5s`), 8s `TOTK_TRACE=perf,codec,audio` run -> `60.0 fps`, `0` codec errors/drops, `0` audio underruns (`182,982 / 239,520` nonzero frames), PTS `5.07 s`.

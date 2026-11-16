@@ -172,7 +172,7 @@ static void vp9_init(Cpu *c, uint64_t key, unsigned w, unsigned h) {
     queue_drop(d);
     memset(d, 0, sizeof *d);
     d->key = key;
-    vpx_codec_dec_cfg_t cfg = {.threads = 2, .w = w, .h = h};
+    vpx_codec_dec_cfg_t cfg = {.threads = w >= 1920 ? 4 : 2, .w = w, .h = h};
     d->vpx_ok = vpx_codec_dec_init(&d->vpx, vpx_codec_vp9_dx(), &cfg, 0) == VPX_CODEC_OK;
     plat_mutex_unlock(&lock);
     rt_log("codec: VP9 decoder %#llx %ux%u on the host (libvpx%s)", (unsigned long long)key, w, h,
@@ -284,6 +284,9 @@ static void ov_vp9_ready_event(Cpu *c) {
     ret_x(c, 0);
 }
 
+static void clear_event(Cpu *c, uint64_t ev);
+static uint64_t event_for(Cpu *c, uint64_t key);
+
 // Result SubmitVp9DecoderInputBuffer(u64 *id, Vp9DecoderType *, const void *data, size_t size, TimeSpan pts, bool end):
 // decoded at once into the oldest waiting buffer, else queued for the next one reserved; "not ready" once QUEUED
 // packets wait. After the end of a guide movie the player flushes and starts over with the buffers it still holds,
@@ -295,8 +298,9 @@ static void ov_vp9_submit(Cpu *c) {
     size_t size = arg_x(c, 3);
     int64_t pts = (int64_t)arg_x(c, 4);
     int end = (int)(arg_x(c, 5) & 1);
+    uint64_t key = arg_x(c, 1);
     plat_mutex_lock(&lock);
-    Dec *d = dec_of(arg_x(c, 1));
+    Dec *d = dec_of(key);
     Slot *s = d && !d->qn ? oldest_wait(d) : NULL;
     if (!s) {
         int queued = d && d->qn < QUEUED;
@@ -308,7 +312,10 @@ static void ov_vp9_submit(Cpu *c) {
             if (id) *id = d->seq;
         }
         int waiting = d ? d->qn : 0;
+        int can_more = d && oldest_wait(d) != NULL;
         plat_mutex_unlock(&lock);
+        if (can_more) kern_signal_system_event(event_for(c, key));
+        else if (d) clear_event(c, event_for(c, key));
         TRACE("submit %zu bytes pts %lld%s: %s (%d queued)", size, (long long)pts, end ? " end" : "",
               queued ? "queued for the next reserved buffer" : "not ready", waiting);
         ret_x(c, queued ? 0 : R_NOT_READY);
@@ -317,8 +324,11 @@ static void ov_vp9_submit(Cpu *c) {
     uint64_t wake[WAITERS];
     int n = decode_into(d, s, data, size, pts, end, wake);
     if (id) *id = d->seq;
+    int can_more = oldest_wait(d) != NULL;
     plat_mutex_unlock(&lock);
     for (int k = 0; k < n; k++) kern_signal_system_event(wake[k]);
+    if (can_more) kern_signal_system_event(event_for(c, key));
+    else clear_event(c, event_for(c, key));
     ret_x(c, 0);
 }
 
