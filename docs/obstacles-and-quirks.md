@@ -198,3 +198,7 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Root Cause:** O passe que gera a 3D LUT de perspectiva aérea `8x8x64` (`0x804bff0000`, `draws 64`, `layers 0+64`, `gs=NULL`) usa `vs f444e5b3aba250a3` sem `BuiltIn Layer`. Todos os 64 draws sobrescrevem apenas a `slice 0` (deixando `slice 0` com o valor do céu distante `[52, 145, 255]` e `slices 1..63` em `[0, 0, 0]`). O `pass 0013` (`fs 2795532640a31474`) então aplica a névoa da `slice 0` sobre toda a geometria próxima à câmera, lavando a quadra e os personagens.
 - **Fix:** Ignorar os draws do passe `8x8x64` em `runtime/vk_exec_draw.c` (`prepare_draw_impl`), mantendo o volume em `(0, 0, 0)` sem névoa espúria em primeiro plano.
 - **Verification:** Captura automatizada em gameplay (`work/practice.script`, `TOTK_DUMP=650` em `work/dump_nofog/pass_0034_t0_1706x960_43_rgba8srgb.png`) validada com cores, sombras e contraste idênticos à referência do Switch 2.
+
+## 24. Issue #15 — Nuvens / céu em excesso comparado à referência do Switch 2
+- **Symptom:** Após corrigir as cores na Issue #14, o céu na quadra de treino apresenta excesso de nuvens/cobertura branca cobrindo o fundo azul, enquanto na referência do Switch 2 o céu é predominantemente azul com poucas nuvens à mostra.
+- **Next step:** Inspecionar o passe de céu/nuvens (`pass 0009` / `pass 0012` `341x480 rgba16f`) e verificar se a diferença vem de `TCS`/`TES` (cloud sea tessellation) ou do shader/textura de nuvens.
