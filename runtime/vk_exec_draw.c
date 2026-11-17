@@ -34,6 +34,8 @@
 #include "nvn_hmap.h"
 #include "nvn_geometry_control.h"
 #include "nvn_indirect_reset.h"
+#include "nvn_tex.h"
+#include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "vk_exec_draw_helper.h"
@@ -959,6 +961,30 @@ typedef struct ViewNode { struct ViewNode *next; ViewKey k; VkImageView view; } 
 DRAW_SHARED nvn_hmap view_of;            // ViewKey -> VkImageView
 DRAW_SHARED nvn_hmap views_by_image;     // VkImage -> its first ViewNode
 
+// The format a sampled view reads the image in. A texture view in another format of the same texel size reads the same
+// bytes another way, and the game relies on it: its FXAA pass samples the sRGB tonemapped picture through an RGBA8
+// (UNORM) view, so it filters the gamma-encoded values and writes them back as they are. Viewed in the image's sRGB
+// format, the values came back decoded to linear and every 3D scene was shown with one gamma decode too many (dark,
+// saturated). Colour images are created MUTABLE_FORMAT (vk_texture.c); the view keeps the image's format when either
+// format is emulated (ASTC decoded, RGB expanded, a stand-in component order), is depth or stencil, is compressed in a
+// different block size, or cannot be sampled.
+static VkFormat sampled_format(const VkTexImage *img, const view_t *v, int hv) {
+    if (!hv || !v->set_format || v->format == img->nvn_format || img->block_views || img->chan[0] ||
+        (img->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
+        return img->format;
+    TexVkFormat a, b;
+    int bw, bh, vbw, vbh;
+    if (!tex_vk_format(img->nvn_format, &a) || a.vk != a.ideal || a.vk != img->format || a.expand_rgb ||
+        !tex_vk_format(v->format, &b) || b.vk != b.ideal || b.depth || b.stencil || b.expand_rgb || b.chan[0])
+        return img->format;
+    int bpb = nvn_fmt_bpb(img->nvn_format, &bw, &bh), vbpb = nvn_fmt_bpb(v->format, &vbw, &vbh);
+    if (!bpb || bpb != vbpb || bw != vbw || bh != vbh) return img->format;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, b.vk, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return img->format;
+    return b.vk;
+}
+
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
 static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage, uint8_t rfmt) {
@@ -1009,7 +1035,7 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
                     sw[i] = img->chan[sw[i] - NVN_TEXTURE_SWIZZLE_R];
             }
     }
-    VkFormat vfmt = img->format;
+    VkFormat vfmt = storage ? img->format : sampled_format(img, v, hv);
     if (storage && !rfmt && (vfmt == VK_FORMAT_R32_UINT || vfmt == VK_FORMAT_R32_SINT))
         vfmt = VK_FORMAT_R32_SFLOAT;
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
@@ -2398,8 +2424,9 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
 }
 
 static void support_in(const VkExec *ex, float in[3]) {   // what gfx_support_fill reads: viewport size, point size
-    in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] : (float)ex->pass_w;
-    in[1] = ex->in_pass && ex->has_vp ? ex->vp[0][3] : (float)ex->pass_h;
+    float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
+    in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] * k : (float)ex->pass_w;
+    in[1] = ex->in_pass && ex->has_vp ? ex->vp[0][3] * k : (float)ex->pass_h;
     in[2] = ex->point_size > 0 ? ex->point_size : 1.0f;
 }
 
@@ -3116,7 +3143,10 @@ static void record_fixed(VkExec *ex) {
     if (j[0] != dc->B.jit[0] || j[1] != dc->B.jit[1]) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
     if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT) {
         float x = 0, y = 0, w = (float)ex->pass_w, h = (float)ex->pass_h;
-        if (ex->has_vp) x = ex->vp[0][0], y = ex->vp[0][1], w = ex->vp[0][2], h = ex->vp[0][3];
+        if (ex->has_vp) {
+            float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
+            x = ex->vp[0][0] * k, y = ex->vp[0][1] * k, w = ex->vp[0][2] * k, h = ex->vp[0][3] * k;
+        }
         if (w < 1) w = 1;
         if (h < 1) h = 1;
         VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height

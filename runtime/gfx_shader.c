@@ -1903,25 +1903,12 @@ uint64_t gfx_shader_origin(const GfxShader *s) {
     return o;
 }
 
-static const GfxShader *nvn2_offline_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size) {
-    if (!control || !code || !gfx_shader_is_nvn2(control)) return NULL;
+static const GfxShader *nvn2_load_key8(const uint8_t key8[8], int stage) {
     paths();
     if (!nvn2_spv_dir[0]) return NULL;
-
-    uint32_t klen = 0, clen = 0;
-    memcpy(&klen, control + 0x30, 4);
-    memcpy(&clen, control + 0x44, 4);
-    uint32_t ctl_len = (0x48u <= klen && klen <= 0x10000u) ? klen : 0x48u;
-    uint64_t c_len = code_size ? code_size : (uint64_t)clen;
-    if (!c_len || c_len > (16ull << 20)) return NULL;
-
-    uint8_t *tmp = malloc((size_t)ctl_len + (size_t)c_len);
-    if (!tmp) return NULL;
-    memcpy(tmp, control, ctl_len);
-    memcpy(tmp + ctl_len, code, (size_t)c_len);
-    uint8_t key[32];
-    rt_sha256(tmp, (size_t)ctl_len + (size_t)c_len, key);
-    free(tmp);
+    uint8_t key[32] = {0};
+    memcpy(key, key8, 8);
+    memcpy(key + 8, "NVN2 prebuilt", 13);
 
     GfxShader *s = mem_find(key);
     if (s) {
@@ -1930,7 +1917,7 @@ static const GfxShader *nvn2_offline_get(int stage, const uint8_t *control, cons
     }
 
     char hex16[17];
-    for (int i = 0; i < 8; i++) snprintf(hex16 + i * 2, 3, "%02x", key[i]);
+    for (int i = 0; i < 8; i++) snprintf(hex16 + i * 2, 3, "%02x", key8[i]);
 
     char p[PATH_CAP + 80];
     uint64_t res_size = 0, spv_size = 0;
@@ -1938,8 +1925,7 @@ static const GfxShader *nvn2_offline_get(int stage, const uint8_t *control, cons
     uint8_t *res = read_file(p, &res_size);
     if (!res || !reflection_valid((const char *)res, res_size)) {
         free(res);
-        rt_log("gfx_shader: nvn2 offline miss %s.res.json (stage=%d ctl=%u code=%llu)",
-               hex16, stage, ctl_len, (unsigned long long)c_len);
+        rt_log("gfx_shader: nvn2 offline miss %s.res.json (stage=%d)", hex16, stage);
         return NULL;
     }
     snprintf(p, sizeof p, "%s/%s.spv", nvn2_spv_dir, hex16);
@@ -1987,9 +1973,55 @@ static const GfxShader *nvn2_offline_get(int stage, const uint8_t *control, cons
         }
         i += len;
     }
+    static volatile int32_t n_nvn2_loaded;
+    int32_t n = plat_inc32(&n_nvn2_loaded);
+    if (!(n & (n - 1)))
+        rt_log("gfx_shader: nvn2 loaded %s (#%d, stage=%d words=%llu)", hex16, n, stage, (unsigned long long)s->words);
     plat_inc64(&n_hits);
-    rt_log("gfx_shader: nvn2 loaded %s (stage=%d words=%llu)", hex16, stage, (unsigned long long)s->words);
     return mem_insert(s);
+}
+
+static const GfxShader *nvn2_offline_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size) {
+    if (!control || !code || !gfx_shader_is_nvn2(control)) return NULL;
+    paths();
+    if (!nvn2_spv_dir[0]) return NULL;
+
+    // Fast path: check cached 8-byte key inside prog_t's owned_control copy (tagged "NV2C" at +0x100)
+    int has_cache = !memcmp(control + 0x100, "NV2C", 4);
+    uint8_t *state = has_cache ? (uint8_t *)control + 0x104 : NULL;
+    uint8_t key8[8];
+    if (state) {
+        uint8_t st = __atomic_load_n(state, __ATOMIC_ACQUIRE);
+        if (st == 2) return NULL;
+        if (st == 1) {
+            memcpy(key8, state + 1, 8);
+            return nvn2_load_key8(key8, stage);
+        }
+    }
+
+    uint32_t klen = 0, clen = 0;
+    memcpy(&klen, control + 0x30, 4);
+    memcpy(&clen, control + 0x44, 4);
+    uint32_t ctl_len = (0x48u <= klen && klen <= 0x10000u) ? klen : 0x48u;
+    uint64_t c_len = code_size ? code_size : (uint64_t)clen;
+    if (!c_len || c_len > (16ull << 20)) {
+        if (state) __atomic_store_n(state, 2, __ATOMIC_RELEASE);
+        return NULL;
+    }
+
+    uint8_t *tmp = malloc((size_t)ctl_len + (size_t)c_len);
+    if (!tmp) return NULL;
+    memcpy(tmp, control, ctl_len);
+    memcpy(tmp + ctl_len, code, (size_t)c_len);
+    uint8_t full_key[32];
+    rt_sha256(tmp, (size_t)ctl_len + (size_t)c_len, full_key);
+    free(tmp);
+    memcpy(key8, full_key, 8);
+    if (state) {
+        memcpy(state + 1, key8, 8);
+        __atomic_store_n(state, 1, __ATOMIC_RELEASE);
+    }
+    return nvn2_load_key8(key8, stage);
 }
 
 const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
@@ -2475,6 +2507,7 @@ const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate) {
 // cache has it, that entry is returned with *owned 0 and must not be released. NULL when not cached.
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned) {
     *owned = 0;
+    if (!memcmp(iid + 8, "NVN2 prebuilt", 13)) return nvn2_load_key8(iid, 0);
     paths();
     if (!cache_dir[0]) return NULL;
     uint8_t key[32];

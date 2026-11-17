@@ -96,7 +96,9 @@ RT_SOURCES = [
     "ov_gfx.c",
     "ov_input.c",
     "ov_movie.c",
+    "ov_resolution.c",
     "ov_system.c",
+    "amiibo.c",
     "patches.c",
     "perf.c",
     "perfmon.c",
@@ -332,6 +334,13 @@ def main() -> int:
 
     t0 = time.perf_counter()
     subprocess.check_call([str(NINJA), "-f", str(ninja_file), "-j", str(args.jobs)])
+    for dll_dir in (ROOT / "toolchain" / "deps-mingw" / "bin", CLANG.parent):
+        if dll_dir.is_dir():
+            for dll in dll_dir.glob("*.dll"):
+                dst = out_dir / dll.name
+                if not dst.is_file():
+                    import shutil
+                    shutil.copy2(dll, dst)
     dt = time.perf_counter() - t0
     print(f"Built {exe} in {dt:.1f}s")
     return 0

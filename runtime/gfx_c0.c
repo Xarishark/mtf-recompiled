@@ -1,10 +1,13 @@
 // Driver data the translated shaders read (gfx_c0.h): the NVN driver's per-stage constant bank c0 and the translator's
 // support buffer. Moved here from vk_exec_draw.c (vk_c0_fill, support_fill) so that every back end fills them with the
 // same code; the Vulkan replay still decides when a new copy is needed and where it lives.
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "gfx_c0.h"
+#include "host.h"
 #include "nvn.h"
 
 enum { NVN_STAGE_VS = NVN_SHADER_STAGE_VERTEX, NVN_STAGE_FS = NVN_SHADER_STAGE_FRAGMENT,
@@ -45,6 +48,30 @@ int gfx_c0_fill(uint8_t bank[GFX_C0_BYTES], int stage, const p_bind_buf ssbo[16]
     return 1;
 }
 
+static const float *pcss_params(void) {
+    static float p[4] = {-1, 0, 0, 0};
+    if (p[0] < 0) {
+        int pct = cfg_int("TOTK_PCSS");
+        pct = pct < 0 ? 0 : pct > 200 ? 200 : pct;
+        const char *k = cfg_get("TOTK_PCSS_K");
+        float k100 = k && *k ? (float)atof(k) : 0.5f;
+        p[0] = k100 * (float)pct / 100.0f;
+        p[1] = 0.35f / 960.0f, p[2] = 5.0f / 960.0f, p[3] = 4.0f / 960.0f;
+        if (pct) rt_log("vk: soft shadows (PCSS) at %d%% (depth factor %g)", pct, p[0]);
+    }
+    return p;
+}
+
+static const float *shadow_spread_params(void) {
+    static float p[4] = {0, 0, 0, 0};
+    if (p[0] == 0) {
+        int scale = cfg_int("TOTK_SHADOW_SCALE");
+        scale = scale < 1 ? 1 : scale > 4 ? 4 : scale;
+        p[0] = 1.0f / (float)scale;
+    }
+    return p;
+}
+
 void gfx_support_fill(uint8_t *b, float w, float h, float point_size) {
     memset(b, 0, GFX_SUPPORT_BYTES);
     float inv[4] = {w > 0 ? 2.0f / w : 0, h > 0 ? 2.0f / h : 0, 0, 0}, size[4] = {w, h, 0, 0};
@@ -52,5 +79,7 @@ void gfx_support_fill(uint8_t *b, float w, float h, float point_size) {
     memcpy(b + 160, size, 16);
     const float one = 1.0f;
     memcpy(b + 1392, &point_size, 4);   // point_size (translator patch 0008): vertex shaders that write none output it
+    memcpy(b + 1408, pcss_params(), 16);   // pcss (translator patch 0010): soft sun shadows in the cascade compares
+    memcpy(b + 1424, shadow_spread_params(), 16);   // shadow_spread (translator patch 0011): sun shadow filter width
     for (int i = 0; i < 73; i++) memcpy(b + 192 + 16 * i, &one, 4);   // render scale 1: the host renders at guest size
 }

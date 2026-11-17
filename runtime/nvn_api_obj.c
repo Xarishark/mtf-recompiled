@@ -446,13 +446,23 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
             next[i] = (NVNshaderData){(NVNbufferAddress)(uintptr_t)ncode, nctl};
         ctl = next[i].control;
         code = (const uint8_t *)(uintptr_t)next[i].data;
+        if (!ctl || !code) continue;
+        if (gfx_shader_is_nvn2(ctl)) {
+            if (!owned && !(owned = calloc((size_t)n, 0x880))) goto fail;
+            uint32_t klen = 0;
+            memcpy(&klen, ctl + 0x30, 4);
+            uint32_t copy_len = (0x48u <= klen && klen <= 0x100u) ? klen : 0x100u;
+            memcpy(owned + (size_t)i * 0x880, ctl, copy_len);
+            memcpy(owned + (size_t)i * 0x880 + 0x100, "NV2C", 4);
+            next[i].control = owned + (size_t)i * 0x880;
+            continue;
+        }
         // Raw NVN2 controls have a different compact layout. Only the host's
         // explicitly tagged legacy-shaped controls are copied here.
-        if (!ctl || !code || gfx_shader_is_nvn2(ctl) ||
-            memcmp(ctl + NVN_GEOMETRY_CONTROL_OFFSET, "TKGSMETA", 8)) continue;
+        if (memcmp(ctl + NVN_GEOMETRY_CONTROL_OFFSET, "TKGSMETA", 8)) continue;
         uint32_t length = nvn_geometry_control_u32(ctl + 0x704);
         if (nvn_geometry_control_get(ctl, 0x880, code, length, NULL) != 1) goto fail;
-        if (!owned && !(owned = malloc((size_t)n * 0x880))) goto fail;
+        if (!owned && !(owned = calloc((size_t)n, 0x880))) goto fail;
         memcpy(owned + (size_t)i * 0x880, ctl, 0x880);
         next[i].control = owned + (size_t)i * 0x880;
     }

@@ -916,6 +916,14 @@ static const uint8_t *font_data(Cpu *c, const char *fn, int64_t t) {
         uint64_t size = is_raw_ttf ? (got == (size_t)len ? (uint64_t)len : 0)
                                    : (got == (size_t)len ? ov_bfttf_size(p, (uint64_t)len) : 0);
         if (!size) rt_fatal("nn::pl: shared font %s is not a valid font", path);
+        // Decode obfuscated firmware BFTTF to key-0 so ScalableFontEngine::LoadFont reads it directly.
+        if (!is_raw_ttf) {
+            const uint32_t key = be32(p) ^ BFTTF_MAGIC;
+            for (int64_t i = 0; key && i + 4 <= len; i += 4) {
+                uint32_t w = be32(p + i) ^ key;
+                p[i] = (uint8_t)(w >> 24), p[i + 1] = (uint8_t)(w >> 16), p[i + 2] = (uint8_t)(w >> 8), p[i + 3] = (uint8_t)w;
+            }
+        }
         fonts.size[t] = size;
         __atomic_store_n(&fonts.file[t], p, __ATOMIC_RELEASE);
         if (!is_raw_ttf)

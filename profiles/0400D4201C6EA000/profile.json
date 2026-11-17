@@ -5,7 +5,7 @@
   "platform": "Switch 2 (Ounce)",
   "sdk_version": "20.5.17",
   "engine": "Camelot nxe + NintendoWare (G3d, Ui2d, Vfx, Atk)",
-  "graphics_api": "NVN2 (SM86 / Ampere)",
+  "graphics_api": "NVN2",
   "target_update": {
     "version": 327680,
     "display_version": "1.1.1",
@@ -39,5 +39,84 @@
   },
   "input": {
     "pad_layout": "full"
+  },
+  "profile_version": "1.1.1",
+  "source_revision": 327680,
+  "platform_code_name": "Ounce",
+  "guest_address_limit": "0x8000000000",
+  "guest_memory_requirements": {
+    "mem_reserve_bytes": "0x650000000",
+    "mem_alias_bytes": "0x500000000",
+    "mem_stack_bytes": "0x10000000",
+    "app_pool_bytes": "0x240000000",
+    "sys_resource_bytes": "0x2000000",
+    "evidence": "nxnative v1.1.1 profile; app_pool is borrowed from Splatoon Raiders and the Switch 2 9 GB budget is not measured for this title"
+  },
+  "main_thread": {
+    "priority": 44,
+    "ideal_core": 0,
+    "npdm_stack_bytes": "0x100000",
+    "evidence": "update main.npdm META header (priority 0x0E, core 0x0F, stack 0x1C); the runtime allocates mem_stack_bytes, which is larger"
+  },
+  "module_load_order": [
+    "main",
+    "sdk"
+  ],
+  "runtime_loaded_nro": {
+    "sha256": "1ec347bc9f4664b467fc5f9b3a9336fe91e22e119fc7fb60f8cf44f0d30ce975",
+    "guest_base": "0x7001e00000",
+    "maximum_guest_span": "0x8000000",
+    "generated_dir": "build/generated/nro-full"
+  },
+  "modules": {
+    "main": {
+      "sha256": "3557c30e0a18e15aedd62f94be66b64de9e31632ed6da250c2f8c2c0ec271171",
+      "build_id": "104bce6874603701935eb76cb7d8b59e3ef14511",
+      "guest_base": "0x7000000000",
+      "image_size": "0xdc0000",
+      "text_size": "0x98e80",
+      "init_offset": "0x20",
+      "fini_offset": "0x1a0",
+      "init_array_offset": "0xcb000",
+      "init_array_entries": 7,
+      "symbols_of_interest": {
+        "nninitStartup": "0x600",
+        "nnMain": "0x630"
+      },
+      "unresolved_imports": [
+        "ZSTD_trace_decompress_begin",
+        "ZSTD_trace_decompress_end",
+        "_Z6Abort_v"
+      ]
+    },
+    "sdk": {
+      "sha256": "e8a2c5852508f330663d8ad639d4c20609e636c1bc6d5fcf7b01cd4bd3e0428f",
+      "build_id": "32a9ac1480a6f0e9e2e8a813ae9cd73181897bb0",
+      "guest_base": "0x7000e00000",
+      "image_size": "0xff0000",
+      "text_size": "0x7b6510",
+      "init_offset": "0x4a0",
+      "fini_offset": "0x620",
+      "init_array_offset": "0xda6000",
+      "init_array_entries": 91,
+      "symbols_of_interest": {
+        "_ZN2nn4init5StartEmmPFvvES2_S2_": "0x118e30",
+        "_ZN2nn2ro10LoadModuleEPNS0_6ModuleEPKvPvmi": "0x156680",
+        "_ZN2nn2ro18RegisterModuleInfoEPNS0_16RegistrationInfoEPKv": "0x1563b0"
+      },
+      "unresolved_imports": []
+    }
+  },
+  "nrr": {
+    "version": 1,
+    "sha256": "43cf1ebe8602b3ff5c37eac49cf454fd1e15dafe8c6b130b39999b513f3ab32c",
+    "registered_nro_sha256": [
+      "1ec347bc9f4664b467fc5f9b3a9336fe91e22e119fc7fb60f8cf44f0d30ce975"
+    ]
+  },
+  "assumptions": {
+    "guest_modules_below_2_to_39": true,
+    "guest_pointers_have_no_pointer_authentication_bits": true,
+    "pointer_authentication_instructions_lower_to_noops": true
   }
 }

@@ -1,8 +1,8 @@
 # MTF Recomp — Port Status
 
-**Last updated:** 2026-11-15  
+**Last updated:** 2026-11-17  
 **Target game:** *Mario Tennis Fever* (Switch 2 / `Ounce`, Title ID `0400D4201C6EA000`, Update `1.1.1` / `v327680`)  
-**Current phase:** `F8` Complete (Flight Recorder/RenderDoc/Headroom + Tkinter Setup/Launcher + `make_release.py` `2.79 MiB` zero-game-content archive)
+**Current phase:** `F8` Complete + Unified with External MTF Release (`v0.1.0+6caba99`); Issues `#3`, `#4`, `#7`, `#10`, `#11`, `#12`, and `#13` Resolved
 
 ## Module Status
 

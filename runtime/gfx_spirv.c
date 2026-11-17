@@ -259,6 +259,24 @@ uint32_t *gfx_spirv_final(const GfxShader *src, const uint32_t *w, uint64_t word
                    (unsigned long long)gfx_shader_spirv_fnv(src));
         }
     }
+    static int txd_on = -1;
+    static volatile int32_t txd_logged;
+    if (txd_on < 0) {
+        const char *e = cfg_get("TOTK_TXD_TRANSPOSE");
+        if (!e) e = cfg_get("MTF_TXD_TRANSPOSE");
+        txd_on = !(e && *e == '0');
+    }
+    uint32_t *txd = NULL;
+    if (txd_on) {
+        uint64_t txd_n = 0;
+        unsigned txd_found = 0;
+        txd = spirv_txd_transpose(w, words, &txd_n, &txd_found);
+        if (txd) {
+            w = txd, words = txd_n;
+            if (plat_inc32(&txd_logged) <= 4)
+                rt_log("gfx_shader: %u gradient samples now read their derivatives per coordinate", txd_found);
+        }
+    }
     uint32_t *suv = NULL;
     if (screen_uv_stage(src)) {
         uint64_t suv_n = 0;
@@ -314,12 +332,13 @@ uint32_t *gfx_spirv_final(const GfxShader *src, const uint32_t *w, uint64_t word
     uint32_t *ov = spv_override(w, words, &ov_n);
     if (ov) w = ov, words = ov_n;
     // w is the last copy made, or still the caller's module: that copy is the result, the earlier ones go
-    uint32_t *last = ov ? ov : nan ? nan : hs ? hs : fmz ? fmz : suv ? suv : ui2d ? ui2d : fixed ? fixed : lq;
+    uint32_t *last = ov ? ov : nan ? nan : hs ? hs : fmz ? fmz : suv ? suv : txd ? txd : ui2d ? ui2d : fixed ? fixed : lq;
     if (ov != last) free(ov);
     if (nan != last) free(nan);
     if (hs != last) free(hs);
     if (fmz != last) free(fmz);
     if (suv != last) free(suv);
+    if (txd != last) free(txd);
     if (ui2d != last) free(ui2d);
     if (fixed != last) free(fixed);
     if (lq != last) free(lq);

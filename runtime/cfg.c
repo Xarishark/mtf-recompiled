@@ -44,7 +44,7 @@ static const char *const known[] = {
     "NVN2_MODE_TRACE", "NVN2_MODE_TRACE_START_MS", "NVN2_MODE_TRACE_DURATION_MS", "ONE_PER_CORE", "OPERATION_MODE", "OUTPUT_RES", "PAD_DEVICE", "PAD_FULLSCREEN_HOLD", "PAD_LAYOUT", "PAD_PROMPTS", "PAR_DEFER", "PAR_DEFER_DEPTH", "PATCH_OUTPUT", "PATCH_SCENE", "PERF_OVERLAY", "PERF_SLOW_GPU_MS", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT", "POOL_FINI_WAIT", "POOL_LAZY",
     "PRESENT_HOLD", "PREWARM_XLATE", "PROBE_MOVIE", "PROBE_MOVIE_SHOT", "PROFILE", "PROFILE_CHAINS", "PROFILE_DIR", "PROFILE_FRAMES",
     "PROFILE_MAIN", "PROFILE_RENDER", "PROFILE_REPLAY", "PUSH_SKIP", "PUSH_STAGE", "RDOC", "RDOC_DIR", "RDOC_DLL", "REALTIME", "REC_BEGIN", "REC_END", "REC_SUBMIT", "REEXEC",
-    "RENDER_SCALE", "SCENE_RES", "REPLAY_ASYNC", "REPLAY_HELPERS", "REPLAY_PAR", "REPLAY_THREADS",
+    "RENDER_SCALE", "SCENE_RES", "SHADOW_SCALE", "PCSS", "CONTACT_SHADOWS", "ANISO", "REPLAY_ASYNC", "REPLAY_HELPERS", "REPLAY_PAR", "REPLAY_THREADS",
     "REPLAY_CHECK", "RESOLVE_CHECK", "ROMFS", "ROMFS_INDEX", "ROMFS_MMAP", "ROMFS_MODS", "ROMFS_PATCHES",
     "ROMFS_PROOF_DIR", "ROMFS_VERIFY", "RUMBLE", "RUMBLE_CURVE", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS", "SHADER_CACHE",
     "SHADER_MEMO", "SHARED_FONTS", "SHARPNESS", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SKIP_CS", "SKIP_FS", "SKIP_VS", "SMAA", "SPARSE_MIRROR_COPY", "SPEED_PROBE", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_US", "STICK_DEADZONE", "SVC_SLOW", "SWKBD_ANSWER",
@@ -105,6 +105,7 @@ static const CfgMeta metas[] = {
     {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|59|67|75|77|100|125|150|200", RESTART},
+    {"SHADOW_SCALE", "1", "1|2|4", RESTART}, {"PCSS", "0", "0|1|2", LIVE}, {"CONTACT_SHADOWS", "0", "0|1|2", LIVE}, {"ANISO", "auto", "auto|off|2|4|8|16", RESTART},
     {"SCENE_RES", "auto", "auto|full", RESTART},   // Bananza only (dkb_wide.c)
     {"UPSCALER", "fsr", "fsr|bilinear|dlss", LIVE}, {"DLSS_PRESET", "auto", "auto|k|m", LIVE},   // vk_dlss.c preset_for
     {"SHARPNESS", "80", "0..100", LIVE}, {"SMAA", "off", "off|low|medium|high", LIVE},
@@ -191,10 +192,13 @@ static char *trim(char *s) {
     return s;
 }
 
-// The upper-case key without the prefix (TOTK_, or DKB_ as in the environment), in place.
+// The upper-case key without the prefix (TOTK_, DKB_ or MTF_), in place.
 static char *norm_key(char *key) {
     for (char *p = key; *p; p++) *p = (char)toupper((unsigned char)*p);
-    return !strncmp(key, PREFIX, PREFIX_LEN) ? key + PREFIX_LEN : !strncmp(key, "DKB_", 4) ? key + 4 : key;
+    return !strncmp(key, PREFIX, PREFIX_LEN) ? key + PREFIX_LEN
+         : !strncmp(key, "DKB_", 4)          ? key + 4
+         : !strncmp(key, "MTF_", 4)          ? key + 4
+         : key;
 }
 
 static void add(char *key, char *value, int line) {
@@ -289,34 +293,43 @@ static int profile_of(void) {
 
 const char *cfg_device_profile(void) { return profile_of() ? "deck" : "desktop"; }
 
-// DKB_X in the environment stands for TOTK_X and wins over it: the TOTK_ names come from TotK Recomp and stay, so its
-// fixes keep applying without a rename.
-static const char *dkb_alias(const char *name) {
-    char alias[96];
-    if (strncmp(name, PREFIX, PREFIX_LEN) || strlen(name) >= sizeof alias - 1) return NULL;
-    snprintf(alias, sizeof alias, "DKB_%s", name + PREFIX_LEN);
-    return getenv(alias);
-}
-
 static const char *env_of(const char *name) {
-    const char *e = dkb_alias(name);
-    return e ? e : getenv(name);
+    char k[96];
+    snprintf(k, sizeof k, "%s", name);
+    const char *base = norm_key(k);
+    char mtf[96], dkb[96], totk[96];
+    if (strlen(base) < sizeof mtf - 6) {
+        snprintf(mtf, sizeof mtf, "MTF_%s", base);
+        const char *e = getenv(mtf);
+        if (e) return e;
+        snprintf(dkb, sizeof dkb, "DKB_%s", base);
+        if ((e = getenv(dkb))) return e;
+        snprintf(totk, sizeof totk, "TOTK_%s", base);
+        if ((e = getenv(totk))) return e;
+    }
+    return getenv(name);
 }
 
 static const char *raw_get(const char *name) {
     const char *e = env_of(name);
-    if (e || strncmp(name, PREFIX, PREFIX_LEN)) return e;
+    if (e) return e;
+    char k[96];
+    snprintf(k, sizeof k, "%s", name);
+    const char *base = norm_key(k);
     int n = __atomic_load_n(&n_entries, __ATOMIC_ACQUIRE);
     for (int i = 0; i < n; i++)
-        if (!strcasecmp(entries[i].key, name + PREFIX_LEN)) return __atomic_load_n(&entries[i].value, __ATOMIC_ACQUIRE);
+        if (!strcasecmp(entries[i].key, base)) return __atomic_load_n(&entries[i].value, __ATOMIC_ACQUIRE);
     return NULL;
 }
 
 const char *cfg_get(const char *name) {
     const char *v = raw_get(name);
-    if (v || strncmp(name, PREFIX, PREFIX_LEN) || !profile_of()) return v;
+    if (v || !profile_of()) return v;
+    char k[96];
+    snprintf(k, sizeof k, "%s", name);
+    const char *base = norm_key(k);
     for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
-        if (!strcasecmp(DECK[i].key, name + PREFIX_LEN)) return DECK[i].value;
+        if (!strcasecmp(DECK[i].key, base)) return DECK[i].value;
     return NULL;
 }
 
@@ -328,10 +341,11 @@ unsigned cfg_version(void) { return __atomic_load_n(&version, __ATOMIC_ACQUIRE);
 int cfg_from_env(const char *name) { return env_of(name) != NULL; }
 
 void cfg_set(const char *name, const char *value) {
-    if (strncmp(name, PREFIX, PREFIX_LEN) || !value) return;
+    if (!name || !value) return;
     char key[64];
-    snprintf(key, sizeof key, "%s", name + PREFIX_LEN);
-    for (char *p = key; *p; p++) *p = (char)toupper((unsigned char)*p);
+    snprintf(key, sizeof key, "%s", name);
+    const char *base = norm_key(key);
+    memmove(key, base, strlen(base) + 1);
     plat_mutex_lock(&set_lock);
     int i = 0, n = n_entries;
     while (i < n && strcmp(entries[i].key, key)) i++;

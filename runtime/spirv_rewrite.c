@@ -781,3 +781,47 @@ uint32_t *spirv_ui2d_color_fix(const uint32_t *w, uint64_t n, uint64_t *out_n) {
     *out_n = p;
     return o;
 }
+
+uint32_t *spirv_txd_transpose(const uint32_t *w, uint64_t n, uint64_t *out_n, unsigned *out_found) {
+    enum { OP_COMPOSITE_CONSTRUCT = 80, OP_SAMPLE_EXPLICIT = 88, IO_GRAD = 4 };
+    if (!w || n < 5) return NULL;
+    uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
+    uint64_t *cc = calloc(bound, sizeof *cc);
+    if (!cc) return NULL;
+    unsigned found = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) { free(cc); return NULL; }
+        if (op == OP_COMPOSITE_CONSTRUCT && len == 5 && w[i + 2] < bound) cc[w[i + 2]] = i;
+        if (op == OP_SAMPLE_EXPLICIT && len >= 8 && w[i + 5] == IO_GRAD && w[i + 6] < bound && w[i + 7] < bound &&
+            cc[w[i + 6]] && cc[w[i + 7]] && w[cc[w[i + 6]] + 1] == w[cc[w[i + 7]] + 1])
+            found++;
+        i += len;
+    }
+    if (!found) { free(cc); return NULL; }
+    uint32_t *o = malloc((n + (uint64_t)found * 10) * sizeof *o);
+    if (!o) { free(cc); return NULL; }
+    uint64_t k = 0;
+    uint32_t next = w[3];
+    for (uint64_t i = 0; i < 5; i++) o[k++] = w[i];
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == OP_SAMPLE_EXPLICIT && len >= 8 && w[i + 5] == IO_GRAD && w[i + 6] < bound && w[i + 7] < bound &&
+            cc[w[i + 6]] && cc[w[i + 7]] && w[cc[w[i + 6]] + 1] == w[cc[w[i + 7]] + 1]) {
+            const uint32_t *dx = w + cc[w[i + 6]], *dy = w + cc[w[i + 7]];
+            uint32_t ndx = next++, ndy = next++;
+            o[k++] = (5u << 16) | OP_COMPOSITE_CONSTRUCT, o[k++] = dx[1], o[k++] = ndx, o[k++] = dx[3], o[k++] = dy[3];
+            o[k++] = (5u << 16) | OP_COMPOSITE_CONSTRUCT, o[k++] = dx[1], o[k++] = ndy, o[k++] = dx[4], o[k++] = dy[4];
+            for (uint32_t j = 0; j < len; j++) o[k++] = w[i + j];
+            o[k - len + 6] = ndx, o[k - len + 7] = ndy;
+        } else {
+            for (uint32_t j = 0; j < len; j++) o[k++] = w[i + j];
+        }
+        i += len;
+    }
+    o[3] = next;
+    free(cc);
+    if (out_found) *out_found = found;
+    *out_n = k;
+    return o;
+}

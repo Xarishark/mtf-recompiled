@@ -168,6 +168,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--exefs") && i + 1 < argc) g_cfg.exefs = argv[++i];
         else if (!strcmp(argv[i], "--romfs") && i + 1 < argc) g_cfg.romfs = argv[++i];
         else if (!strcmp(argv[i], "--profile") && i + 1 < argc) g_cfg.profile = argv[++i];
+        else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) g_cfg.seconds = strtod(argv[++i], NULL);
         else if (!strcmp(argv[i], "--boot")) g_cfg.boot = 1;
         else if (!strcmp(argv[i], "--version")) {
             printf("mtf-recomp %s (%s %s)\n", rt_port_version, "Mario Tennis Fever", rt_game_display);

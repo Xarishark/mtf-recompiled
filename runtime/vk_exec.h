@@ -38,6 +38,7 @@ typedef struct {
     uint8_t is3d;                        // a 3D image (colour only), viewed through 2D views of its slices
     uint8_t blocks;                      // a BC image viewed as one texel per block (VkTexImage.block_views)
     uint32_t width, height, samples;     // extent of that level; with blocks, in blocks
+    uint32_t scale;                      // shadow map scale of the image
     int32_t nvn_format;                  // NVNformat of the view (VkPipeState.color_fmt / depth_fmt)
     const VkTexImage *img;               // the image (fb_usage, fb_learned)
 } VkExecTarget;
@@ -57,7 +58,7 @@ typedef struct VkExec {
     p_set_rt rt;                         // last OP_SET_RT payload (a change ends the open pass); rt.n 0, no depth: none
     int rt_resolved;                   // color[] and depth hold this command buffer's images for rt
     VkExecTarget color[8], depth;        // resolved targets
-    uint32_t pass_w, pass_h, pass_layers;            // render area and layer count of the open (or next) pass
+    uint32_t pass_w, pass_h, pass_layers, pass_scale; // render area, layer count and scale of the open (or next) pass
     int pass_noatt;                                   // the pass has no attachment: its size follows the draws (vk_exec_noatt_dims)
     VkFormat pass_color[8], pass_depth, pass_stencil; // attachment formats of the pass (VkPipelineRenderingCreateInfo);
                                                       // VK_FORMAT_UNDEFINED: none

@@ -12,3 +12,7 @@ int ov_handheld(void);                     // TOTK_OPERATION_MODE=handheld (defa
 const char *ov_language(void);             // the game's language, a Switch language code ("en-US", "zh-Hans", ...)
 const char *ov_shared_font_dir(char *buf, size_t n);   // TOTK_SHARED_FONTS, else <romfs>/../../firmware/shared-fonts
 uint64_t ov_bfttf_size(const uint8_t *p, uint64_t len); // decoded font size of a BFTTF image, 0 if it is not one
+
+// ---- ov_resolution.c
+void ov_resolution_layer(void);
+void ov_resolution_apply(int *out_w, int *out_h);

@@ -535,6 +535,7 @@ static void resolve_target(const tex_t *t, const view_t *v, int has_v, int depth
     o->width = level_extent(img->width, level), o->height = level_extent(img->height, level);
     if (blocks) o->width = (o->width + 3) / 4, o->height = (o->height + 3) / 4;   // the view's extent: 4x4 blocks
     o->samples = img->samples ? img->samples : 1;
+    o->scale = img->scale ? img->scale : 1;
     o->nvn_format = nvn_fmt;
     if (!o->aspect) o->image = VK_NULL_HANDLE;
 }
@@ -560,7 +561,7 @@ static void resolve_rt(VkExec *ex) {
     ex->rt_resolved = 1;
     const p_set_rt *r = &ex->rt;
     int n = r->n < 0 ? 0 : r->n > 8 ? 8 : r->n;
-    uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX, samples = 0;
+    uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX, samples = 0, scale = 1;
     for (int i = 0; i < 8; i++) {
         VkExecTarget *t = &ex->color[i];
         resolve_target(i < n ? r->color[i] : NULL, &r->cview[i], i < n && r->has_cview[i], 0, t);
@@ -571,6 +572,7 @@ static void resolve_rt(VkExec *ex) {
         if (t->height < h) h = t->height;
         if (t->layers < layers) layers = t->layers;
         if (!samples) samples = t->samples;
+        if (t->scale > scale) scale = t->scale;
     }
     VkExecTarget *d = &ex->depth;
     resolve_target(r->depth, &r->dview, r->has_dview, 1, d);
@@ -582,6 +584,7 @@ static void resolve_rt(VkExec *ex) {
         if (d->height < h) h = d->height;
         if (d->layers < layers) layers = d->layers;
         if (!samples) samples = d->samples;
+        if (d->scale > scale) scale = d->scale;
     }
     ex->pass_noatt = w == UINT32_MAX;
     if (ex->pass_noatt) {
@@ -593,6 +596,7 @@ static void resolve_rt(VkExec *ex) {
                              ex->vp[0][1], ex->vp[0][2], ex->vp[0][3]);
     }
     ex->pass_w = w, ex->pass_h = h, ex->pass_layers = layers;
+    ex->pass_scale = ex->pass_noatt ? 1 : scale;
     ex->pass_ncolor = (uint32_t)n;
     ex->pass_samples = samples ? samples : 1;
     ex->pipe.samples = (uint8_t)ex->pass_samples;
@@ -903,8 +907,9 @@ VkBuffer vk_exec_inline_buffer(VkDeviceSize size) {
 VkRect2D vk_exec_scissor(const VkExec *ex) {
     int64_t w = ex->pass_w, h = ex->pass_h;
     if (!ex->has_scissor) return (VkRect2D){{0, 0}, {(uint32_t)w, (uint32_t)h}};
-    int64_t x0 = ex->scissor.x, y0 = ex->scissor.y;
-    int64_t x1 = x0 + ex->scissor.w, y1 = y0 + ex->scissor.h;
+    int64_t k = ex->pass_scale > 1 ? ex->pass_scale : 1;
+    int64_t x0 = ex->scissor.x * k, y0 = ex->scissor.y * k;
+    int64_t x1 = x0 + (int64_t)ex->scissor.w * k, y1 = y0 + (int64_t)ex->scissor.h * k;
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > w) x1 = w;

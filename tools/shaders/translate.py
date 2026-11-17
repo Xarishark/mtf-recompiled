@@ -12,6 +12,7 @@ import argparse
 import concurrent.futures as cf
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -23,6 +24,8 @@ from pathlib import Path
 PACK_MAGIC = b"MTFN2SD1"
 NVN2_STAGE_BANK = 25
 NVN2_STAGE_INDEX = {"vs": 0, "hs": 1, "ms": 1, "ds": 2, "gs": 3, "ps": 4}
+SBUF_ALIGN = 16
+TESS_MODE_DEFAULT = 0x202
 
 
 def load_facts(facts_path: Path) -> dict[str, dict]:
@@ -37,6 +40,16 @@ def load_facts(facts_path: Path) -> dict[str, dict]:
             k, v = line.split("\t", 1)
             facts[k] = json.loads(v)
     return facts
+
+
+def load_answers(path: Path) -> dict[str, dict]:
+    answers: dict[str, dict] = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\t")
+            if len(parts) == 4 and not line.startswith("#") and parts[1] in ("attr", "fout"):
+                answers.setdefault(parts[0], {"attr": {}, "fout": {}})[parts[1]][parts[2]] = parts[3]
+    return answers
 
 
 def iter_pack(pack_path: Path):
@@ -60,6 +73,8 @@ def build_job(
     code_path: str,
     code_len: int,
     facts: dict[str, dict],
+    sbuf_align: int = SBUF_ALIGN,
+    mvprev: bool = False,
 ) -> dict:
     a, e = struct.unpack_from("<II", ctl, 0x40)
     # Read c1 from the code slice on disk only if present
@@ -69,17 +84,34 @@ def build_job(
             cf_f.seek(a)
             c1_hex = cf_f.read(e - a).hex()
 
+    code_end = struct.unpack_from("<I", ctl, 0x38)[0] if len(ctl) >= 0x3C else 0
+    if 0 < code_end < code_len:
+        with open(code_path, "r+b") as cf_f:
+            cf_f.truncate(code_end)
+
     job: dict = {
         "key": key,
         "stage": stage,
         "arch": "sm86",
         "code": code_path,
+        "tex": {},
+        "img": {},
+        "attr": {},
+        "fout": {},
         "debug": False,
+        "reduced": True,
     }
     if c1_hex:
         job["c1"] = c1_hex
+    if sbuf_align:
+        job["sbuf_align"] = sbuf_align
+    if mvprev:
+        job["mvprev"] = True
     if stage in NVN2_STAGE_INDEX:
         job["stage_bank"] = NVN2_STAGE_BANK + NVN2_STAGE_INDEX[stage]
+    if stage in ("hs", "ds") and len(ctl) >= 0x60:
+        mode = struct.unpack_from("<I", ctl, 0x5C)[0]
+        job["tess_mode"] = mode if mode and not (mode & ~0x333) else TESS_MODE_DEFAULT
     if stage == "cs" and len(ctl) >= 0xBC:
         job["nvn2_cs"] = [
             ctl[0xB1],
@@ -100,6 +132,13 @@ def build_job(
                 job["local"] = [lx, ly, lz]
         if "shared" in f_entry:
             job["shared"] = f_entry["shared"]
+    fact = dict(facts.get(key, {}))
+    for kind in ("attr", "fout"):
+        if kind in fact:
+            job[kind].update(fact.pop(kind))
+    for k, v in fact.items():
+        if k not in ("local", "shared"):
+            job[k] = v
     return job
 
 
@@ -109,6 +148,8 @@ def worker_run(
     chunk: list[tuple[str, str, bytes, bytes, str]],
     facts: dict[str, dict],
     progress_cb,
+    sbuf_align: int = SBUF_ALIGN,
+    mvprev: bool = False,
 ) -> tuple[int, list[tuple[str, str, str]]]:
     ok = 0
     fails: list[tuple[str, str, str]] = []
@@ -122,7 +163,7 @@ def worker_run(
                 cpath = os.path.join(td, f"s_{idx}.bin")
                 with open(cpath, "wb") as cf_f:
                     cf_f.write(code)
-                jobs.append(build_job(key, stage, ctl, cpath, len(code), facts))
+                jobs.append(build_job(key, stage, ctl, cpath, len(code), facts, sbuf_align, mvprev))
                 meta.append((key, stage, src))
             jpath = os.path.join(td, "jobs.json")
             with open(jpath, "w", encoding="utf-8") as jf:
@@ -141,6 +182,11 @@ def worker_run(
             for key, stage, src in meta:
                 spv_path = os.path.join(spv_dir, f"{key}.spv")
                 if os.path.isfile(spv_path):
+                    if mvprev:
+                        res_path = os.path.join(spv_dir, f"{key}.res.json")
+                        shutil.move(spv_path, os.path.join(spv_dir, f"{key}.mvprev.spv"))
+                        if os.path.isfile(res_path):
+                            shutil.move(res_path, os.path.join(spv_dir, f"{key}.mvprev.res.json"))
                     ok += 1
                 else:
                     msg = err_lines.get(key, res.stderr.strip() or res.stdout.strip() or f"rc={res.returncode}")
@@ -153,8 +199,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Translate extracted NVN2 shaders to SPIR-V")
     ap.add_argument("--pack", default="build/v327680/shaders-nvn2/shaders.bin", help="Path to shaders.bin")
     ap.add_argument("--facts", default="profiles/0400D4201C6EA000/shader_facts.tsv", help="Path to shader_facts.tsv")
+    ap.add_argument("--answers", default="profiles/0400D4201C6EA000/shader_answers.tsv", help="Path to shader_answers.tsv")
     ap.add_argument("--xlate", default="build/xlate/totk_xlate.exe", help="Path to totk_xlate.exe")
     ap.add_argument("--out", default="build/v327680/shaders-nvn2/spv", help="Output SPIR-V directory")
+    ap.add_argument("--sbuf-align", type=int, default=SBUF_ALIGN, help="Storage buffer base address alignment")
+    ap.add_argument("--mvprev", action="store_true", help="Emit <key>.mvprev.spv vertex shader variants for DLAA")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 4, help="Parallel translator workers")
     ap.add_argument("--limit", type=int, default=0, help="Translate only first N shaders (for smoke testing)")
     ap.add_argument("--skip-existing", action="store_true", help="Skip keys that already have .spv")
@@ -163,12 +212,21 @@ def main() -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     facts = load_facts(Path(args.facts))
+    answers = load_answers(Path(args.answers))
+    for key, ans in answers.items():
+        fact = facts.setdefault(key, {})
+        for kind in ("attr", "fout"):
+            if ans[kind]:
+                fact[kind] = {**fact.get(kind, {}), **ans[kind]}
 
     items = list(iter_pack(Path(args.pack)))
+    if args.mvprev:
+        items = [it for it in items if it[1] == "vs"]
     if args.limit > 0:
         items = items[: args.limit]
     if args.skip_existing:
-        items = [it for it in items if not (out_dir / f"{it[0]}.spv").is_file()]
+        suf = ".mvprev.spv" if args.mvprev else ".spv"
+        items = [it for it in items if not (out_dir / f"{it[0]}{suf}").is_file()]
 
     total = len(items)
     if total == 0:
@@ -195,7 +253,7 @@ def main() -> int:
     all_fails: list[tuple[str, str, str]] = []
     with cf.ThreadPoolExecutor(max_workers=n_workers) as pool:
         futs = [
-            pool.submit(worker_run, args.xlate, str(out_dir), ch, facts, tick)
+            pool.submit(worker_run, args.xlate, str(out_dir), ch, facts, tick, args.sbuf_align, args.mvprev)
             for ch in chunks
             if ch
         ]

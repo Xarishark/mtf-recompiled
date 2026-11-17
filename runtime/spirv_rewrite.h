@@ -38,3 +38,5 @@ uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint64_t *ou
 uint32_t *spirv_rewrite_int_inputs(const uint32_t *w, uint64_t n, uint32_t uint_mask, uint32_t sint_mask, uint64_t *out_n);
 // Reconstructs the missing (vp_c3[34].w & 2) == 0 bilinear corner-color path in ui2d vertex shader c381fe4e8be846a3.
 uint32_t *spirv_ui2d_color_fix(const uint32_t *w, uint64_t n, uint64_t *out_n);
+// Transposes 2D gradient pairs (du/dx, du/dy), (dv/dx, dv/dy) -> (du/dx, dv/dx), (du/dy, dv/dy) on OpImageSampleExplicitLod Grad.
+uint32_t *spirv_txd_transpose(const uint32_t *w, uint64_t n, uint64_t *out_n, unsigned *out_found);

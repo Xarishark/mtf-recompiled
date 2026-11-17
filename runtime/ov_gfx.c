@@ -88,7 +88,14 @@ static void ov_open_display(Cpu *c) {
 static void ov_create_layer(Cpu *c) {
     void **out = arg_p(c, 0);
     if (!out || !vi_up() || arg_p(c, 1) != display) { ret_x(c, VI_R_INVALID); return; }
+    ov_resolution_layer();
     *out = layer;
+    ret_x(c, 0);
+}
+
+static void ov_query_max_res(Cpu *c) {
+    int32_t *w = arg_p(c, 0), *h = arg_p(c, 1);
+    ov_resolution_apply(w, h);
     ret_x(c, 0);
 }
 
@@ -253,6 +260,7 @@ HOST_OVERRIDE("_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_
 HOST_OVERRIDE("_ZN2nn2vi10InitializeEv", ov_vi_initialize);
 HOST_OVERRIDE("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", ov_open_display);
 HOST_OVERRIDE("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", ov_create_layer);
+HOST_OVERRIDE("_ZN2nn2vi31QueryDisplayBufferMaxResolutionEPiS1_PKNS0_5LayerE", ov_query_max_res);
 HOST_OVERRIDE("_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", ov_native_window);
 HOST_OVERRIDE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", ov_vsync_event);
 HOST_OVERRIDE("nvnBootstrapLoader", ov_nvn_bootstrap);

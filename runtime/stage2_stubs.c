@@ -14,11 +14,6 @@ void res_note_upscaler(unsigned in_w, unsigned in_h, unsigned out_w, unsigned ou
     (void)in_w; (void)in_h; (void)out_w; (void)out_h;
 }
 void res_fov_live(void) {}
-int res_sizes(unsigned out[2], unsigned scene[2]) {
-    if (out) out[0] = 2560, out[1] = 1440;
-    if (scene) scene[0] = 2048, scene[1] = 1152;
-    return 0;
-}
 int probe_census_dir(char *dir, size_t n) { (void)dir; (void)n; return 0; }
 int nvn2_lower(const uint8_t *ctl, const uint8_t *code, const uint8_t **nc, const uint8_t **nd) {
     (void)ctl; (void)code; (void)nc; (void)nd;

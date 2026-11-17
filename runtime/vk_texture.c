@@ -404,6 +404,28 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
     }
 }
 
+static int shadow_scale(void) {
+    static int scale = -1;
+    if (scale < 0) {
+        int s = cfg_int("TOTK_SHADOW_SCALE");
+        s = s < 1 ? 1 : s > 4 ? 4 : s;
+        rt_log("vk: shadow map scale %d", s);
+        scale = s;
+    }
+    return scale;
+}
+
+static int shadow_scale_of(const nvn_texdesc *d, const TexVkFormat *f, uint32_t samples, int mirrored) {
+    int scale = shadow_scale();
+    if (scale == 1 || mirrored || samples > 1 || (d->format != NVN_FORMAT_DEPTH16 && d->format != NVN_FORMAT_DEPTH24) || !f->depth)
+        return 1;
+    if (d->target != NVN_TEXTURE_TARGET_2D_ARRAY || d->width != d->height || d->width < 256 || d->depth < 2 || d->depth > 4)
+        return 1;
+    if (d->format == NVN_FORMAT_DEPTH24) return 1;
+    uint32_t most = vk_ctx()->props.limits.maxImageDimension2D;
+    return d->width * (uint32_t)scale <= most ? scale : 1;
+}
+
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound, n_thick;
@@ -431,6 +453,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     case NVN_TEXTURE_TARGET_CUBEMAP: case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: layers = L.layers; break;
     default: break;
     }
+    int scale = shadow_scale_of(d, &f, d->samples > 1 ? (uint32_t)d->samples : 1, tex_mirrored(t));
+    w *= (uint32_t)scale, h *= (uint32_t)scale;
     uint32_t levels = umax(d->levels, 1), most = 1;
     for (uint32_t s = umax(umax(w, h), depth); s > 1; s >>= 1) most++;
     if (levels > most) levels = most;
@@ -447,12 +471,11 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     // clear colour. Vulkan cannot add the usage later.
     if (!ds && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && samples == 1) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageCreateFlags flags = ds ? 0 : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;   // format-reinterpreting views
-    // Cube compatible only for cube targets: the replay makes cube views of nothing else (vk_exec_draw.c get_view checks
-    // the image's own view type). The flag on every square array of 6+ layers changed how AMD's Windows driver lays such
-    // an image out, and terrain material arrays sampled through it came out in rainbow blocks that moved with the mip
-    // level (Savage Wind Recomp issue #59, BotW on an RX 580 and a 7800 XT).
+    // Cube compatible for cube targets and for the game's reflection probes: colour render targets it creates as 2D arrays
+    // of whole cubes and samples through a cube view (vk_exec_draw.c get_view checks the flag).
+    int probe = d->target == NVN_TEXTURE_TARGET_2D_ARRAY && layers % 6 == 0 && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && w == h && samples == 1 &&
-        (d->target == NVN_TEXTURE_TARGET_CUBEMAP || d->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY))
+        (d->target == NVN_TEXTURE_TARGET_CUBEMAP || d->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY || probe))
         flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     // NVN renders into a 3D texture slice by slice (a view's min layer is the depth plane, nvn_mtl.m), e.g. the
     // grading LUT of the menu background blur. Vulkan needs a 2D view of the slice for that.
@@ -503,7 +526,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->f = f;
     e->pub.addr = k->addr;
     VkImage img = VK_NULL_HANDLE;
-    if (nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
+    if (scale == 1 && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img, L.size)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
@@ -524,6 +547,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     VkTexImage *p = &e->pub;
     p->image = img;
     p->format = f.vk;
+    p->nvn_format = d->format;
     p->type = type;
     p->usage = usage;
     p->aspect = aspect_of(&f);
@@ -545,6 +569,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     p->bound = e->bound_to != NULL;
     p->block_views = (uint8_t)block_views;
     p->fb_usage = (uint8_t)fb_usage;
+    p->scale = (uint8_t)scale;
 
     if (!defer_init) {
         init_image(e, vk_upload_begin());

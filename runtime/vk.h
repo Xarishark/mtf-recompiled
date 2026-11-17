@@ -408,6 +408,7 @@ void vk_mem_shutdown(void);                        // before vk_shutdown: waits 
 typedef struct {
     VkImage image;
     VkFormat format;               // after the fallbacks of tex_vk_format (ASTC -> RGBA8, RGB -> RGBA)
+    int32_t nvn_format;            // NVNformat the texture was created with (sampled_format view reinterpretation)
     VkImageType type;
     VkImageViewType view_type;     // view of the whole image
     VkImageAspectFlags aspect;
@@ -425,6 +426,7 @@ typedef struct {
     uint8_t fb_learned;            // a draw sampled it while it was a written attachment of the open pass: its passes
                                    // attach it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (vk_exec.c vk_exec_pass_begin).
                                    // Read and set through vk_tex_fb_learned and vk_tex_fb_learn
+    uint8_t scale;                 // shadow map scale (MTF_SHADOW_SCALE / TOTK_SHADOW_SCALE)
 } VkTexImage;
 // fb_learned is set by the replay thread (vk_exec_draw.c feedback_prepare) while the helper threads (vk_spec.h) read
 // it for the draws they translate and the passes they begin, so it is loaded and stored atomically. A helper part that

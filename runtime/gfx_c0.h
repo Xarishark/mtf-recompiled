@@ -18,6 +18,6 @@ int gfx_c0_fill(uint8_t bank[GFX_C0_BYTES], int stage, const p_bind_buf ssbo[16]
                 const uint32_t (*roots)[NVN2_ROOT_WORDS]);
 
 // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
-#define GFX_SUPPORT_BYTES 1408u
+#define GFX_SUPPORT_BYTES 1440u
 // The support buffer for a w x h viewport (or pass) and an NVN point size, into b[GFX_SUPPORT_BYTES].
 void gfx_support_fill(uint8_t *b, float w, float h, float point_size);
