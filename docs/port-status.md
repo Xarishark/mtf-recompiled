@@ -20,6 +20,6 @@
 | ARM64 Lifter (`recomp/`) | **Ready** | 0 unsupported on `main`+`sdk`, 1 `ldst` on `nro0`; 119,955 Unicorn diff cases passed |
 | Binary Index (`tools/analisis/bindb.py`) | **Ready** | `build/bindb.sqlite` indexes 98,560 fns, 29,422 syms, 573,750 calls, 54,969 strings |
 | Horizon Kernel & `ro::LoadModule` | **Booting** | `mtf-stage2.exe` boots `main` + `sdk` + `nro0` to 60 Hz null-GPU loop (`TOTK_ASYNC_PREEMPT=0`) |
-| NVN2 Front-End & Vulkan Backend | **F5 Vulkan 1.3 Active** | Vulkan 1.3 renderer (`vk_*.c`, `gfx_window*.c`, `tex_astc*.c`, `spirv_*.c`) boots to 60 FPS swapchain presentation (`1920x1061` mailbox) + VP9 1440p movie (`600+` frames); `MTF_GPU=null` also preserved |
+| NVN2 Front-End & Vulkan Backend | **F5+F7 Active** | Vulkan 1.3 renderer (`vk_*.c`, `gfx_window*.c`, `tex_astc*.c`, `spirv_*.c`, `TCS`/`TES` tessellation, multi-viewport `ViewportMaskNV` shadow cascades, `OP_DRAW_IND_MULTI`, `c0+0x4` compute dispatch) boots to 60 FPS swapchain presentation (`1920x1061` mailbox) + VP9 1440p movie; `MTF_GPU=null` also preserved |
 | Shader Pipeline (`CRA.` $\rightarrow$ SPIR-V) | **Ready (F4+F5)** | `cra.py` + `extract.py` + `translate.py` (`sm86` `totk_xlate.exe`): **35,045 / 35,045** shaders translated to SPIR-V (0 failed); `nvn2_offline_get` loads offline `.spv` + `.res.json` in `gfx_shader.c` |
 | Audio (`audren` REV15) & Video (`ov_codec`) | **Ready (F3)** | REV15 `audren` + SDL3 (`48000 Hz x240`, 96 voices) & `libvpx` VP9 (`2560x1440`, `ov_vp9_start` event fix) active |

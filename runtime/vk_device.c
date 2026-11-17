@@ -325,6 +325,12 @@ static int create_device(void) {
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
+    // MTF's layer-picking geometry shaders are NV passthrough ones (GeometryShaderPassthroughNV)
+    if (has_ext(ep, ne, VK_NV_GEOMETRY_SHADER_PASSTHROUGH_EXTENSION_NAME)) ext[n_ext++] = VK_NV_GEOMETRY_SHADER_PASSTHROUGH_EXTENSION_NAME;
+    else rt_log("vk: no VK_NV_geometry_shader_passthrough: passthrough geometry shaders will not build");
+    // the shadow casters' broadcast to the cascades, one viewport and layer each (ViewportMaskNV)
+    if (has_ext(ep, ne, "VK_NV_viewport_array2")) g_vk.has_viewport_array2 = 1, ext[n_ext++] = "VK_NV_viewport_array2";
+    else rt_log("vk: no VK_NV_viewport_array2: shadow cascades past the first stay empty");
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
     if (vk_hdr_wanted() && has_ext(ep, ne, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {   // the display's peak (vk_hdr_metadata)
         g_vk.has_hdr_metadata = 1;

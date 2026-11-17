@@ -147,3 +147,13 @@
 - **Phase 3 & 4 (Resolution/Render Scale, BFTTF De-obfuscation, `MTF_*` Config Prefix, DLAA/Amiibo/Installer/CMake):**
   - Added `runtime/ov_resolution.c` hooked into `nn::vi::CreateLayer` and `nn::vi::QueryDisplayBufferMaxResolution` (`runtime/ov_gfx.c`), BFTTF XOR key de-obfuscation (`runtime/ov_system.c`), `MTF_*` prefix support in `runtime/cfg.c`, and imported `runtime/amiibo.{c,h}`, `runtime/nfp.{c,h}`, `runtime/diag_watch.{c,h}`, `runtime/ov_audioout.c`, `runtime/vk_dlaa.{c,h}`, `recomp/{glue,lift,module_scan,nro_capture,nro_lift}.py`, `CMakeLists.txt`, and `installer/`.
 - **Verification:** Rebuilt `mtf-stage2.exe`, verified frame `1200` (`work/dump_1200_fix12_13/pass_0037_t0_2560x1440_43_rgba8srgb.png`) and 6s boot/shader run (`work/test_merge_run.log`), and ran `python tools/check_content.py` (`0 violations`).
+
+### 2026-11-17 — Tessellation (`TCS`/`TES`), Multi-Viewport Shadow Cascades (`ViewportMaskNV`), `OP_DRAW_IND_MULTI`, and Compute `c0+0x4`
+- **Changes:**
+  - Added compute dispatch dimensions at `c0 + 0x4` in `runtime/gfx_c0.c` (`gfx_c0_fill`) so SDF glyph compute shaders read their final workgroup bounds without leaving stray edge lines.
+  - Added `OP_COPY_IMAGE_STRIDE`, `OP_PATCH_SIZE`, and `OP_DRAW_IND_MULTI` (`DrawArraysIndirect`, `MultiDraw{Arrays,Elements}IndirectCount`) in `runtime/nvn_obj.h`, `runtime/nvn_api.h`, `runtime/nvn_api_cmd.c`, `runtime/vk_exec.{h,c}`, `runtime/vk_exec_xfer.c` (`copy_image_stride`), and `runtime/vk_exec_draw.c`.
+  - Added per-viewport scissor tracking (`p_scissor.index`, `vp_n`, `scissor_n[16]`, `scissor_mask`, `vk_exec_scissor_at`, `pass_viewports`, `viewport_at`) and `VK_NV_geometry_shader_passthrough` / `VK_NV_viewport_array2` + `viewport_relative_layer` SPIR-V injection (`runtime/vk_device.c`, `runtime/vk_pipeline.c`).
+  - Added `TCS`/`TES` tessellation pipeline support (`VkPipeState.{tcs,tes,patch_size}`, `GKey.{tcs,tes,patch}`, `mid_stages`, `VkPipelineTessellationStateCreateInfo`) and `TESS` / `GEOMETRY` config knobs (`runtime/cfg.c`, `runtime/vk_exec_draw.c`, `runtime/vk_pipeline.c`).
+- **Verification:**
+  - Smoke-tested `tools/shaders/translate.py --xlate ".../dmsh_xlate.exe" --limit 20` (`20/20` translated, `0 failed`).
+  - Built `mtf-stage2.exe` cleanly (`0` errors), ran `mtf-stage2.exe --seconds 8` with `TOTK_XLATE=.../dmsh_xlate.exe` (`exit 0`, 60 FPS on RTX 5070 Ti), and verified `python tools/check_content.py` (`0 violations`).

@@ -38,6 +38,7 @@ int gfx_c0_fill(uint8_t bank[GFX_C0_BYTES], int stage, const p_bind_buf ssbo[16]
     if (base < 0) return 1;
     c0_table(bank + base, ssbo);
     if (stage == NVN_STAGE_CS) {
+        memcpy(bank + 0x4, dispatch, 12);
         memcpy(bank + 0x200, dispatch, 12);
         c0_table(bank + 0x210, ubo);
         return 1;

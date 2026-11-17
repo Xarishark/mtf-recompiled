@@ -67,15 +67,20 @@ typedef struct VkExec {
     // ---- fixed-function state (vk_exec.c keeps it; vk_exec_draw.c records it before draws)
     float vp[16][6];                     // OP_VIEWPORTS: x, y, w, h, near, far
     int has_vp;                          // a viewport was set; else the render area
+    uint32_t vp_n;                       // highest viewport index set + 1
     p_scissor scissor;                   // OP_SCISSOR (scissor 0)
     int has_scissor;                     // a scissor was set; else unbounded
+    p_scissor scissor_n[16];             // OP_SCISSOR, the scissors of viewports 1 and up
+    uint32_t scissor_mask;               // which of scissor_n were set
     float depth_range[2];                // OP_DEPTH_RANGE: overrides the viewports' near and far
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];   // OP_STENCIL per face (0 front, 1 back): compare mask, write mask, ref
     float point_size;                    // OP_BIND_STATE kind 6: NVN point size for the support buffer; 0 = never set = 1
     p_poly_offset poly_offset;           // OP_POLY_OFFSET: depth bias factor, units, clamp
     p_prim_restart prim_restart;         // OP_PRIM_RESTART: applied to indexed strip and fan draws (op_draw_idx)
+    int32_t patch_size;                  // OP_PATCH_SIZE: control points of a patch draw (NVN default 3)
     float blend_color[4];                // OP_BLEND_COLOR
     int64_t copy_stride;                 // OP_COPY_STRIDE: row stride of buffer <-> texture copies (vk_exec_xfer.c)
+    int64_t copy_image_stride;           // OP_COPY_IMAGE_STRIDE (NVN2): layer / slice stride of those copies; 0 packed
     dpool_ref tex_pool, samp_pool;       // OP_SET_TEX_POOL, OP_SET_SAMP_POOL, captured by value
     // Pipeline inputs. vk_exec.c writes depth_clamp (OP_DEPTH_CLAMP), raster_discard (OP_RASTER_DISCARD) and, at pass
     // begin, color_fmt, depth_fmt and samples; vk_exec_draw.c owns every other field (shaders, prim, y_flip, state
@@ -168,6 +173,7 @@ VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 void vk_exec_bc_gone(VkImage image);
 // Scissor 0 clipped to the render area of the open pass; extent 0: nothing to draw.
 VkRect2D vk_exec_scissor(const VkExec *ex);
+VkRect2D vk_exec_scissor_at(const VkExec *ex, uint32_t i);   // the same for viewport i
 void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h);   // pass size when no attachment is set
 // 1: every target of the current pass (any 1: at least one) was rendered in the previous presented frame (per-frame
 // targets); 0 otherwise, or when the pass has none.

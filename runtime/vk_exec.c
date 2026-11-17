@@ -904,18 +904,25 @@ VkBuffer vk_exec_inline_buffer(VkDeviceSize size) {
     return t->b;
 }
 
-VkRect2D vk_exec_scissor(const VkExec *ex) {
+static VkRect2D scissor_rect(const VkExec *ex, const p_scissor *s) {
     int64_t w = ex->pass_w, h = ex->pass_h;
-    if (!ex->has_scissor) return (VkRect2D){{0, 0}, {(uint32_t)w, (uint32_t)h}};
+    if (!s) return (VkRect2D){{0, 0}, {(uint32_t)w, (uint32_t)h}};
     int64_t k = ex->pass_scale > 1 ? ex->pass_scale : 1;
-    int64_t x0 = ex->scissor.x * k, y0 = ex->scissor.y * k;
-    int64_t x1 = x0 + (int64_t)ex->scissor.w * k, y1 = y0 + (int64_t)ex->scissor.h * k;
+    int64_t x0 = s->x * k, y0 = s->y * k;
+    int64_t x1 = x0 + (int64_t)s->w * k, y1 = y0 + (int64_t)s->h * k;
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > w) x1 = w;
     if (y1 > h) y1 = h;
     if (x1 <= x0 || y1 <= y0) return (VkRect2D){{0, 0}, {0, 0}};
     return (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+}
+
+VkRect2D vk_exec_scissor(const VkExec *ex) { return scissor_rect(ex, ex->has_scissor ? &ex->scissor : NULL); }
+
+VkRect2D vk_exec_scissor_at(const VkExec *ex, uint32_t i) {
+    if (!i) return vk_exec_scissor(ex);
+    return scissor_rect(ex, i < 16 && ex->scissor_mask >> i & 1 ? &ex->scissor_n[i] : NULL);
 }
 
 // ---- clears
@@ -1138,16 +1145,21 @@ static int state_op(VkExec *ex, uint32_t op, const void *a) {
     case OP_VIEWPORTS: {
         const p_viewports *v = a;
         for (int i = 0; i < v->n && v->first + i < 16; i++)
-            if (v->first + i >= 0) memcpy(ex->vp[v->first + i], v->v[i], sizeof ex->vp[0]);
+            if (v->first + i >= 0) {
+                memcpy(ex->vp[v->first + i], v->v[i], sizeof ex->vp[0]);
+                if ((uint32_t)(v->first + i) >= ex->vp_n) ex->vp_n = (uint32_t)(v->first + i) + 1;
+            }
         ex->has_vp = 1;
         ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
         break;
     }
-    case OP_SCISSOR:
-        ex->scissor = *(const p_scissor *)a;
-        ex->has_scissor = 1;
+    case OP_SCISSOR: {
+        const p_scissor *s = a;
+        if (!s->index) ex->scissor = *s, ex->has_scissor = 1;
+        else if (s->index > 0 && s->index < 16) ex->scissor_n[s->index] = *s, ex->scissor_mask |= 1u << s->index;
         ex->dirty |= VK_EXEC_DIRTY_SCISSOR;
         break;
+    }
     case OP_DEPTH_RANGE: {
         const p_depth_range *r = a;
         ex->depth_range[0] = r->n, ex->depth_range[1] = r->f;
@@ -1176,7 +1188,9 @@ static int state_op(VkExec *ex, uint32_t op, const void *a) {
     case OP_DEPTH_CLAMP: ex->pipe.depth_clamp = ((const p_flag *)a)->value != 0; break;
     case OP_RASTER_DISCARD: ex->pipe.raster_discard = ((const p_flag *)a)->value != 0; break;
     case OP_PRIM_RESTART: ex->prim_restart = *(const p_prim_restart *)a; break;
+    case OP_PATCH_SIZE: ex->patch_size = ((const p_patch_size *)a)->size; break;
     case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; break;
+    case OP_COPY_IMAGE_STRIDE: ex->copy_image_stride = ((const p_copy_stride *)a)->stride; break;
     case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
     case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
     default: return 0;
@@ -2561,7 +2575,8 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_BARRIER: vk_exec_barrier(ex); break;
         case OP_WAIT_SYNC: break;   // submit preparation waited before any replay/snapshot; source may be gone
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
-            if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) {
+        case OP_DRAW_IND_MULTI:
+            if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || h->op == OP_DRAW_IND_MULTI) {
                 vk_exec_frame.draws_seen++, split_draws++;
                 if (P.slot) par_watch();
                 if (par_no_split) vk_exec_draw_digest_draw(ex);

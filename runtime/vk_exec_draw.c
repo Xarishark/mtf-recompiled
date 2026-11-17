@@ -121,6 +121,8 @@
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
 #define NVN_STAGE_GS 2
+#define NVN_STAGE_TCS 3
+#define NVN_STAGE_TES 4
 #define NVN_STAGE_CS 5
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
@@ -303,7 +305,7 @@ typedef struct DrawCtx {
     struct { uint64_t context, tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32]; } AC[6];
     struct { uint64_t serial; int st; uint32_t m; } slotm[SLOTM_N];
     struct { uint64_t context, h, tok; uint32_t gen; SubRange r; } FM[FM_N];
-    struct { int on, valid, has_fs, has_gs; MemoKey k; const GfxShader *vs, *fs, *gs; } SM;
+    struct { int on, valid, has_fs, has_gs, has_tcs, has_tes; MemoKey k; const GfxShader *vs, *fs, *gs, *tcs, *tes; } SM;
     // The pipeline memo (draw_impl): the last draw's state and pipeline, and the recent ones by shader pair (PM_SETS
     // sets of PM_WAYS, replaced in turn).
     struct {
@@ -1375,7 +1377,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
         }
     }
     int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS :
-             st == NVN_STAGE_GS ? GFX_STAGE_GS : st == NVN_STAGE_CS ? GFX_STAGE_CS : -1;
+             st == NVN_STAGE_GS ? GFX_STAGE_GS : st == NVN_STAGE_TCS ? GFX_STAGE_TCS :
+             st == NVN_STAGE_TES ? GFX_STAGE_TES : st == NVN_STAGE_CS ? GFX_STAGE_CS : -1;
     if (gs < 0) return NULL;
     const GfxShader *s = await ? gfx_shader_await(gs, ctl, code, len, &a)
                        : pending && vk_pipeline_async_on() ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
@@ -1395,7 +1398,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
 
 static int nvn_stage_of(int gfx_stage) {
     return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS :
-           gfx_stage == GFX_STAGE_GS ? NVN_STAGE_GS : gfx_stage == GFX_STAGE_CS ? NVN_STAGE_CS : -1;
+           gfx_stage == GFX_STAGE_GS ? NVN_STAGE_GS : gfx_stage == GFX_STAGE_TCS ? NVN_STAGE_TCS :
+           gfx_stage == GFX_STAGE_TES ? NVN_STAGE_TES : gfx_stage == GFX_STAGE_CS ? NVN_STAGE_CS : -1;
 }
 
 static VkDescriptorBufferInfo zero_info(uint64_t max) {
@@ -3133,6 +3137,28 @@ static void bind_pipeline(VkExec *ex, VkPipelineBindPoint bp, VkPipeline p) {
     if (!k) dc->B.st_valid = 0;
 }
 
+static VkViewport viewport_at(const VkExec *ex, uint32_t i) {
+    float x = 0, y = 0, w = (float)ex->pass_w, h = (float)ex->pass_h;
+    if (ex->has_vp) {
+        float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
+        x = ex->vp[i][0] * k, y = ex->vp[i][1] * k, w = ex->vp[i][2] * k, h = ex->vp[i][3] * k;
+    }
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    return (VkViewport){x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
+}
+
+// Viewports the draws of this pass get. A layered target takes one per layer the game has set: the shadow cascades are
+// the layers of one array, each with its own viewport and scissor, and a geometry shader broadcasts every caster to
+// the cascades it falls in (ViewportMaskNV). Any other shader only ever uses viewport 0.
+static uint32_t pass_viewports(const VkExec *ex) {
+    const VkCtx *c = vk_ctx();
+    uint32_t n = ex->vp_n < ex->pass_layers ? ex->vp_n : ex->pass_layers, most = c->props.limits.maxViewports;
+    if (most > 16) most = 16;
+    if (n > most) n = most;
+    return c->has_viewport_array2 && n > 1 ? n : 1;
+}
+
 static void record_fixed(VkExec *ex) {
     DrawCtx *const dc = DC_OF(ex);
     VkCommandBuffer cb = ex->cb;
@@ -3141,24 +3167,20 @@ static void record_fixed(VkExec *ex) {
     float j[2] = {0, 0};
     if (ex->depth.image && vk_dlss_wanted()) vk_dlss_jitter(ex->depth.image, j);
     if (j[0] != dc->B.jit[0] || j[1] != dc->B.jit[1]) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
-    if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT) {
-        float x = 0, y = 0, w = (float)ex->pass_w, h = (float)ex->pass_h;
-        if (ex->has_vp) {
-            float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
-            x = ex->vp[0][0] * k, y = ex->vp[0][1] * k, w = ex->vp[0][2] * k, h = ex->vp[0][3] * k;
-        }
-        if (w < 1) w = 1;
-        if (h < 1) h = 1;
-        VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
-        if (j[0] != 0 || j[1] != 0) v.x += j[0], v.y += j[1];
+    if (ex->dirty & (VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR)) {   // together: their counts have to agree
+        uint32_t n = pass_viewports(ex);
+        VkViewport v[16] = {viewport_at(ex, 0)};
+        VkRect2D r[16] = {vk_exec_scissor(ex)};
+        if (j[0] != 0 || j[1] != 0) v[0].x += j[0], v[0].y += j[1];
         dc->B.jit[0] = j[0], dc->B.jit[1] = j[1];
-        vkCmdSetViewportWithCount(cb, 1, &v);
-        ex->recorded++;
-    }
-    if (ex->dirty & VK_EXEC_DIRTY_SCISSOR) {
-        VkRect2D r = vk_exec_scissor(ex);
-        vkCmdSetScissorWithCount(cb, 1, &r);
-        ex->recorded++;
+        for (uint32_t i = 1; i < n; i++) v[i] = viewport_at(ex, i), r[i] = vk_exec_scissor_at(ex, i);
+        vkCmdSetViewportWithCount(cb, n, v);
+        vkCmdSetScissorWithCount(cb, n, r);
+        ex->recorded += 2;
+        static int logged;
+        if (n > 1 && !logged++)
+            rt_log("vk_exec: %u viewports on a layered pass: 0 is %gx%g at %g,%g, 1 is %gx%g at %g,%g", n, ex->vp[0][2],
+                   ex->vp[0][3], ex->vp[0][0], ex->vp[0][1], ex->vp[1][2], ex->vp[1][3], ex->vp[1][0], ex->vp[1][1]);
     }
     if (ex->dirty & VK_EXEC_DIRTY_DEPTH_BIAS) {
         vkCmdSetDepthBias(cb, ex->poly_offset.units, ex->poly_offset.clamp, ex->poly_offset.factor);
@@ -3416,6 +3438,12 @@ static int pipe_memo_on(DrawCtx *dc) {
     return dc->PM.on;
 }
 
+static int tess_on(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("TESS");
+    return on;
+}
+
 static int experimental_geometry_on(void) {
     static int on = -1;
     if (on < 0) on = cfg_bool("TOTK_EXPERIMENTAL_GEOMETRY");
@@ -3523,10 +3551,11 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
     DP_MARK(DP_PASS);
     if (!sc.extent.width || !sc.extent.height) return 0;
     if (!ex->prog) return warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
-    int has_vs, has_fs, has_gs = 0, vs_wait = 0, fs_wait = 0, gs_wait = 0, memo = shader_memo_on(dc);
-    const GfxShader *vs, *fs, *gs = NULL;
+    int has_vs, has_fs, has_gs = 0, has_tcs = 0, has_tes = 0, vs_wait = 0, fs_wait = 0, gs_wait = 0, tcs_wait = 0, tes_wait = 0, memo = shader_memo_on(dc);
+    const GfxShader *vs, *fs, *gs = NULL, *tcs = NULL, *tes = NULL;
+    int want_tess = prim == NVN_DRAW_PRIMITIVE_PATCHES && tess_on();
     uint32_t gen = memo ? vk_texture_slots_gen() : 0;   // before shader_for, whose lookups may bump it
-    if (memo && dc->SM.valid && memo_match(ex, gen, &dc->SM.k)) {
+    if (memo && dc->SM.valid && !want_tess && !dc->SM.has_tcs && memo_match(ex, gen, &dc->SM.k)) {
         vs = dc->SM.vs, fs = dc->SM.fs, gs = dc->SM.gs, has_vs = 1, has_fs = dc->SM.has_fs, has_gs = dc->SM.has_gs;
         if (memo == 2) {
             int hv, hf, hg = 0, wv, wf, wg = 0;
@@ -3541,8 +3570,12 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
         fs = shader_for(ex, NVN_STAGE_FS, &has_fs, &fs_wait, 0);
         dc->native_gs_vs = vs, dc->native_gs_fs = fs;
         if (want_gs) gs = shader_for(ex, NVN_STAGE_GS, &has_gs, &gs_wait, 0);
-        if (memo && vs && !vs_wait && !fs_wait && !gs_wait && (!has_fs || fs) && (!want_gs || (has_gs && gs)))
-            memo_key(ex, gen, &dc->SM.k), dc->SM.vs = vs, dc->SM.fs = fs, dc->SM.gs = gs, dc->SM.has_fs = has_fs, dc->SM.has_gs = has_gs, dc->SM.valid = 1;
+        if (want_tess) {
+            tcs = shader_for(ex, NVN_STAGE_TCS, &has_tcs, &tcs_wait, 0);
+            tes = shader_for(ex, NVN_STAGE_TES, &has_tes, &tes_wait, 0);
+        }
+        if (memo && !want_tess && vs && !vs_wait && !fs_wait && !gs_wait && (!has_fs || fs) && (!want_gs || (has_gs && gs)))
+            memo_key(ex, gen, &dc->SM.k), dc->SM.vs = vs, dc->SM.fs = fs, dc->SM.gs = gs, dc->SM.has_fs = has_fs, dc->SM.has_gs = has_gs, dc->SM.has_tcs = 0, dc->SM.valid = 1;
     }
     if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
     static int bis_lo = -1, bis_hi = 255;   // DKB_DRAW_BISECT=lo-hi (hex): only draws whose program byte is in range
@@ -3576,7 +3609,7 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
     // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
-    if (vs_wait || fs_wait || gs_wait) {
+    if (vs_wait || fs_wait || gs_wait || tcs_wait || tes_wait) {
         if (IS_HELPER(dc) && vk_spec_fail(VK_SPEC_PENDING)) return 0;   // whether to wait or skip is decided on the replay thread
         if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
         perf_count(PERF_CNT_ONESHOT_WAIT);
@@ -3584,15 +3617,28 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
         dc->native_gs_vs = vs, dc->native_gs_fs = fs;
         if (gs_wait) gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
+        if (tcs_wait) tcs = shader_for(ex, NVN_STAGE_TCS, &has_tcs, NULL, 1);
+        if (tes_wait) tes = shader_for(ex, NVN_STAGE_TES, &has_tes, NULL, 1);
     }
     if (light_quad_fault_skip(ex, vs, fs) || skip_vs_listed(ex) || skip_fs_listed(ex)) return 0;
     DP_MARK(DP_SHADER);
     if (!vs || (has_fs && !fs) || (want_gs && (!has_gs || !gs))) return 0;
+    if (prim == NVN_DRAW_PRIMITIVE_PATCHES && !(want_tess && has_tcs && has_tes && tcs && tes)) {
+        static volatile int32_t n;
+        if (plat_inc32(&n) <= 4)
+            rt_log("[RED] vk_exec: a patch draw without both tessellation stages skipped (program %llu: hull %d/%d, "
+                   "domain %d/%d, TESS %d)", (unsigned long long)ex->prog->serial, has_tcs, !!tcs, has_tes, !!tes,
+                   tess_on());
+        return 0;
+    }
     if (!geometry_feedback_safe(ex, vs, gs)) return 0;
     uint32_t fbl = feedback_prepare(ex, fs);
     twin_prepare(ex, vs, fs);   // after feedback_prepare: its restart keeps the twins fresh (pass_restart)
     VkPipeState s = ex->pipe;
     s.vs = vs, s.fs = fs, s.gs = gs;
+    s.tcs = want_tess ? tcs : NULL;
+    s.tes = want_tess ? tes : NULL;
+    s.patch_size = s.tcs ? (uint8_t)(ex->patch_size > 0 && ex->patch_size <= 32 ? ex->patch_size : 3) : 0;
     s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
     s.prim = (uint8_t)prim;
     s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
@@ -3914,6 +3960,57 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndexedIndirectCommand));
     VK_MEM_BOUND(ip);
     VK_MEM_BOUND(ib);
+}
+
+// DrawArraysIndirect and MultiDraw{Arrays,Elements}IndirectCount: vkCmdDraw(Indexed)Indirect(Count) from the pool
+// buffers, as op_draw_idx_ind. Quads and line loops would need their indices rebuilt on the GPU: skipped, with a line.
+static void op_draw_ind_multi(VkExec *ex, const p_draw_ind_multi *d) {
+    DrawCtx *const dc = DC_OF(ex);
+    dc->c0_binst = 0;
+    int indexed = d->indexed;
+    uint32_t one = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+    uint32_t stride = d->stride > 0 ? (uint32_t)d->stride : one;
+    if (d->max_draws <= 0) return;
+    if (d->prim == NVN_DRAW_PRIMITIVE_QUADS || d->prim == NVN_DRAW_PRIMITIVE_LINE_LOOP)
+        return warn_once(W_INDIRECT, "indirect draw of primitive %d (quads or a line loop): skipped", d->prim);
+    if (indexed && d->itype != NVN_INDEX_TYPE_UNSIGNED_SHORT && d->itype != NVN_INDEX_TYPE_UNSIGNED_INT)
+        return warn_once(W_INDEX, "indirect draw with index type %d: skipped", d->itype);
+    VkMemSpan ip, cp = {0}, ib = {0};
+    if (!vk_mem_resolve(d->ind, (uint64_t)stride * (uint64_t)(d->max_draws - 1) + one, &ip) || ip.offset % 4)
+        return warn_once(W_INDIRECT, "indirect draw arguments at %#llx are not backed or not aligned: draws skipped",
+                         (unsigned long long)d->ind);
+    if (d->count && (!vk_mem_resolve(d->count, 4, &cp) || cp.offset % 4))
+        return warn_once(W_INDIRECT, "indirect draw count at %#llx is not backed or not aligned: draws skipped",
+                         (unsigned long long)d->count);
+    if (indexed && (!vk_mem_resolve(d->ibuf, 1, &ib) || ib.offset % (d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4)))
+        return warn_once(W_INDEX, "index buffer %#llx is not backed or not aligned: indirect draws skipped",
+                         (unsigned long long)d->ibuf);
+    if (!prepare_draw(ex, d->prim, 0x7fffffff, indexed ? restart_for(ex, d->prim, d->itype) : 0)) return;
+    dc->frame->draws++;
+    VK_MEM_USE(ip);
+    if (d->count) VK_MEM_USE(cp);
+    if (indexed) {
+        VK_MEM_USE(ib);
+        vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset,
+                             d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        if (d->count) vkCmdDrawIndexedIndirectCount(ex->cb, ip.buffer, ip.offset, cp.buffer, cp.offset, (uint32_t)d->max_draws, stride);
+        else vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, (uint32_t)d->max_draws, stride);
+    } else if (d->count) {
+        vkCmdDrawIndirectCount(ex->cb, ip.buffer, ip.offset, cp.buffer, cp.offset, (uint32_t)d->max_draws, stride);
+    } else {
+        vkCmdDrawIndirect(ex->cb, ip.buffer, ip.offset, (uint32_t)d->max_draws, stride);
+    }
+    ex->recorded += 2;
+    note_work(ex, 1, 0);
+    if (!ip.alloc && vk_sync_noting()) vk_sync_note_args(d->ind);
+    vk_mem_count(ip.cls, VK_MUSE_IND, (uint64_t)stride * (uint64_t)d->max_draws);
+    VK_MEM_BOUND(ip);
+    if (d->count) VK_MEM_BOUND(cp);
+    if (indexed) VK_MEM_BOUND(ib);
+    static int noted;
+    if (!noted++)
+        rt_log("vk: first %s indirect draw%s (max %d, stride %u)", indexed ? "indexed" : "non-indexed",
+               d->count ? " with a GPU count" : "", d->max_draws, stride);
 }
 
 // ---- dispatch and uniform buffer updates
@@ -4381,6 +4478,7 @@ static void op_draw_impl(VkExec *ex, uint32_t op, const void *payload) {
     case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
     case OP_DISPATCH: op_dispatch(ex, payload); break;
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
+    case OP_DRAW_IND_MULTI: op_draw_ind_multi(ex, payload); break;
     case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }

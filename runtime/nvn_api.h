@@ -90,6 +90,9 @@ typedef struct { uint64_t target; } p_jump;                // OP_JUMP / OP_CALL:
 // OP_DRAW_IDX_IND: DrawElementsIndirect; ind = GPU address of {count, instances, first index, base vertex, base
 // instance} (VkDrawIndexedIndirectCommand's layout), read by the GPU when the draw runs
 typedef struct { int32_t prim, itype; uint64_t ibuf, ind; } p_draw_idx_ind;
+// OP_DRAW_IND_MULTI: DrawArraysIndirect (indexed 0, count 0, max_draws 1) and MultiDraw{Arrays,Elements}IndirectCount
+// (count = GPU address of the 32-bit draw count, clamped to max_draws; stride 0 = sizeof the indirect struct).
+typedef struct { int32_t prim, indexed, itype, max_draws; int64_t stride; uint64_t ibuf, ind, count; } p_draw_ind_multi;
 typedef struct { uint64_t ind, caller; } p_dispatch_ind;   // OP_DISPATCH_IND: ind = GPU address of the 3 group counts
 // OP_CLEAR_BUF: size bytes at addr filled with the 32-bit value in GPU order (ClearBuffer; ReportValue is a 4-byte one)
 typedef struct { uint64_t addr, size; uint32_t value, pad; } p_clear_buf;

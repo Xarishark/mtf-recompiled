@@ -41,7 +41,8 @@ typedef struct VkCtx {
         debug_utils,                       // VK_EXT_debug_utils enabled on the instance (validation or the checkpoints)
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
         has_hdr_metadata,                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
-        has_swapchain_colorspace;           // VK_EXT_swapchain_colorspace enabled on the instance (HDR10 formats)
+        has_swapchain_colorspace,           // VK_EXT_swapchain_colorspace enabled on the instance (HDR10 formats)
+        has_viewport_array2;                // VK_NV_viewport_array2 enabled (ViewportMaskNV)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -603,6 +604,8 @@ typedef struct VkPipeState {
     vs_st vstream[16];                     // OP_BIND_VSTREAM
     // Keep the legacy fields above byte-for-byte stable for pipeline-key records.
     const GfxShader *gs;                   // experimental ordinary GS; NULL keeps the existing VS/FS paths
+    const GfxShader *tcs, *tes;            // its tessellation stages, both or neither
+    uint8_t patch_size;                    // control points of a patch draw (with tcs), else 0
     float alpha_ref;                       // OP_BIND_STATE kind 7: reference of color.alpha_func's test. After gs, so not in
                                            // the pipeline-key records: a prebuilt alpha-test pipeline has reference 0 and
                                            // goes unused, and the draw builds its own

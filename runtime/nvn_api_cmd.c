@@ -693,23 +693,20 @@ NVN_API(nvnCommandBufferSetViewportSwizzles) {
         }
     }
 }
-static void set_scissor(cmd_t *o, int x, int y, int w, int h) { *REC(o, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
+static void set_scissor(cmd_t *o, int index, int x, int y, int w, int h) {
+    *REC(o, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h, index, 0};
+}
 // void nvnCommandBufferSetScissor(NVNcommandBuffer *cmd, int x, int y, int w, int h)
 NVN_API(nvnCommandBufferSetScissor) {
-    set_scissor(cmd_of(c), (int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), (int)arg_x(c, 4));
+    set_scissor(cmd_of(c), 0, (int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), (int)arg_x(c, 4));
 }
-// void nvnCommandBufferSetScissors(NVNcommandBuffer *cmd, int first, int n, const int *xywh): the replay keeps one
-// scissor (index 0); other indices matter only to shaders that select a viewport index, so differing ones are reported
+// void nvnCommandBufferSetScissors(NVNcommandBuffer *cmd, int first, int n, const int *xywh)
 NVN_API(nvnCommandBufferSetScissors) {
     int first = (int)arg_x(c, 1), n = (int)arg_x(c, 2);
     const int *r = arg_p(c, 3);
     if (first < 0 || n < 0 || first + n > 16) rt_fatal("nvn: SetScissors first %d n %d", first, n);
-    for (int i = 1; i < n; i++)
-        if (memcmp(r + 4 * i, r, 16)) {
-            static int once;
-            if (!once++) rt_log("nvn: SetScissors: differing scissor %d ignored (single-scissor replay)", first + i);
-        }
-    if (first == 0 && n > 0) set_scissor(cmd_of(c), r[0], r[1], r[2], r[3]);
+    cmd_t *o = cmd_of(c);
+    for (int i = 0; i < n; i++) set_scissor(o, first + i, r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
 }
 static void set_depth_range(cmd_t *o, float n, float f) { *REC(o, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 // void nvnCommandBufferSetDepthRange(NVNcommandBuffer *cmd, float near, float far)
@@ -974,6 +971,24 @@ NVN_API(nvnCommandBufferDrawElementsInstanced) {
 NVN_API(nvnCommandBufferDrawElementsIndirect) {
     *REC(cmd_of(c), OP_DRAW_IDX_IND, p_draw_idx_ind) = (p_draw_idx_ind){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
 }
+// void nvnCommandBufferDrawArraysIndirect(NVNcommandBuffer *cmd, NVNdrawPrimitive prim, NVNbufferAddress indirect)
+NVN_API(nvnCommandBufferDrawArraysIndirect) {
+    *REC(cmd_of(c), OP_DRAW_IND_MULTI, p_draw_ind_multi) =
+        (p_draw_ind_multi){.prim = (int)arg_x(c, 1), .ind = arg_x(c, 2), .max_draws = 1};
+}
+// void nvnCommandBufferMultiDrawArraysIndirectCount(cmd, prim, indirect, parameter, maxDraws, stride)
+NVN_API(nvnCommandBufferMultiDrawArraysIndirectCount) {
+    *REC(cmd_of(c), OP_DRAW_IND_MULTI, p_draw_ind_multi) =
+        (p_draw_ind_multi){.prim = (int)arg_x(c, 1), .ind = arg_x(c, 2), .count = arg_x(c, 3),
+                           .max_draws = (int)arg_x(c, 4), .stride = (int64_t)arg_x(c, 5)};
+}
+// void nvnCommandBufferMultiDrawElementsIndirectCount(cmd, prim, type, indices, indirect, parameter, maxDraws, stride)
+NVN_API(nvnCommandBufferMultiDrawElementsIndirectCount) {
+    *REC(cmd_of(c), OP_DRAW_IND_MULTI, p_draw_ind_multi) =
+        (p_draw_ind_multi){.prim = (int)arg_x(c, 1), .indexed = 1, .itype = (int)arg_x(c, 2), .ibuf = arg_x(c, 3),
+                           .ind = arg_x(c, 4), .count = arg_x(c, 5), .max_draws = (int)arg_x(c, 6),
+                           .stride = (int64_t)arg_x(c, 7)};
+}
 // void nvnCommandBufferDispatchCompute(NVNcommandBuffer *cmd, int x, int y, int z): caller = the game's return address
 NVN_API(nvnCommandBufferDispatchCompute) {
     *REC(cmd_of(c), OP_DISPATCH, p_dispatch) = (p_dispatch){(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), c->x[30]};
@@ -1071,15 +1086,7 @@ NVN_API(nvnCommandBufferDownsample) {
 // void nvnCommandBufferSetCopyRowStride(NVNcommandBuffer *cmd, ptrdiff_t stride)
 NVN_API(nvnCommandBufferSetCopyRowStride) { REC(cmd_of(c), OP_COPY_STRIDE, p_copy_stride)->stride = (int64_t)arg_x(c, 1); }
 // void nvnCommandBufferSetCopyImageStride(NVNcommandBuffer *cmd, ptrdiff_t stride)
-NVN_API(nvnCommandBufferSetCopyImageStride) {
-    (void)cmd_of(c);
-    int64_t stride = (int64_t)arg_x(c, 1);
-    if (stride) {
-        static volatile int32_t logged;
-        if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
-            rt_log("nvn: SetCopyImageStride(%lld) (no-op in null/recording)", (long long)stride);
-    }
-}
+NVN_API(nvnCommandBufferSetCopyImageStride) { REC(cmd_of(c), OP_COPY_IMAGE_STRIDE, p_copy_stride)->stride = (int64_t)arg_x(c, 1); }
 // ptrdiff_t nvnCommandBufferGetCopyImageStride(const NVNcommandBuffer *cmd)
 NVN_API(nvnCommandBufferGetCopyImageStride) { (void)c; ret_x(c, 0); }
 // void nvnCommandBufferSetBlendColor(NVNcommandBuffer *cmd, const float *rgba)
@@ -1093,13 +1100,13 @@ NVN_API(nvnCommandBufferWaitSync) {
     hw_fix(o, 0);   // the SDK records a CPU control entry here; GPU wait commands are emitted at submit
 }
 // Commands without an effect on this replay (hle_nvn.c g_nops). WaitEvent still relies on in-order replay; shader
-// scratch memory and the tessellation patch size have no host counterpart the replay needs.
+// scratch memory has no host counterpart the replay needs.
 // void nvnCommandBufferWaitEvent(cmd, const NVNevent *event,
 // NVNeventWaitMode mode, uint32_t value), SetShaderScratchMemory(cmd, const NVNmemoryPool *pool, ptrdiff_t offset,
 // size_t size), SetPatchSize(cmd, int size)
 NVN_API(nvnCommandBufferWaitEvent) { (void)c; }
 NVN_API(nvnCommandBufferSetShaderScratchMemory) { (void)c; }
-NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
+NVN_API(nvnCommandBufferSetPatchSize) { REC(cmd_of(c), OP_PATCH_SIZE, p_patch_size)->size = (int)arg_x(c, 1); }
 
 // ---------- submit
 // What the console reads at the submit call is read here, on the game thread: every handle must be a live recording,
@@ -1275,6 +1282,7 @@ const char *nvn_op_name(uint32_t op) {
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
         "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CONST", "WAIT_SYNC",
+        "COPY_IMAGE_STRIDE", "PATCH_SIZE", "DRAW_IND_MULTI",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

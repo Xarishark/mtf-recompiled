@@ -187,3 +187,8 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
   2. Added `spirv_txd_transpose` (`runtime/spirv_rewrite.h`, `runtime/spirv_rewrite.c`, `runtime/gfx_spirv.c`) to transpose `OpImageSampleExplicitLod` `Grad` vectors.
   3. Imported `profiles/0400D4201C6EA000/shader_answers.tsv` (`2,520` entries) and `tools/shaders/int_inputs.py`, and updated `tools/shaders/translate.py` (`load_answers`, `sbuf_align=16`, `tess_mode=0x202`, `code[:ctl[0x38]]`, `--mvprev`).
 - **Verification:** Rebuilt `mtf-stage2.exe` and verified with a 6-second run (`work/test_merge_run.log`): `nvn2 loaded` logs only on powers of 2 (`#1, #2, #4, #8, #16`) and cached NVN2 stage lookups hit in O(1) without heap allocation or SHA-256 recomputation.
+
+## 22. `TOTK_SECONDS` vs `--seconds` CLI Flag
+- **Symptom:** Running `mtf-stage2.exe` with `TOTK_SECONDS=10` in the environment kept running past 10 seconds at 60 FPS.
+- **Root Cause:** `runtime/main.c` parses `--seconds <N>` on the command line rather than `TOTK_SECONDS` / `MTF_SECONDS`.
+- **Fix / Usage:** Pass `--seconds <N>` directly on the CLI (`.\build\v327680_stage2\mtf-stage2.exe --seconds 8`), which exits cleanly with status `0` after `N` seconds.
