@@ -605,7 +605,7 @@ static int reflection_valid(const char *res, uint64_t size) {
     if (!st) return 0;
     st = strchr(st + 7, '"');
     return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4) ||
-                  !strncmp(st, "\"gs\"", 4));
+                  !strncmp(st, "\"gs\"", 4) || !strncmp(st, "\"hs\"", 4) || !strncmp(st, "\"ds\"", 4));
 }
 
 // Every instruction after the header has a word count and the last one ends at the module's end: a module with
@@ -618,6 +618,30 @@ static int spirv_complete(const uint32_t *w, uint64_t n) {
         i += len;
     }
     return i == n;
+}
+
+const char *gfx_shader_reflection(const GfxShader *s) { return s ? s->reflection : NULL; }
+
+const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const char *res_json) {
+    if (!res_json || words < 5 || spirv[0] != 0x07230203 || !spirv_complete(spirv, words) ||
+        !reflection_valid(res_json, strlen(res_json)))
+        return NULL;
+    GfxShader *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    size_t rn = strlen(res_json);
+    uint8_t *buf = malloc(words * 4 + rn);
+    s->spirv = malloc(words * 4), s->reflection = malloc(rn + 1);
+    if (!buf || !s->spirv || !s->reflection) rt_fatal("gfx_shader: out of memory");
+    memcpy(buf, spirv, words * 4), memcpy(buf + words * 4, res_json, rn);
+    rt_sha256(buf, words * 4 + rn, s->key);
+    free(buf);
+    memcpy(s->spirv, spirv, words * 4), memcpy(s->reflection, res_json, rn + 1);
+    s->words = words, s->reflection_size = rn;
+    if (!reflect(s, 0)) {
+        free(s->spirv), free(s->reflection), free(s);
+        return NULL;
+    }
+    return s;
 }
 
 // Reads <key>.spv and <key>.res.json from the pack (packed 1) or the loose files; NULL if either is missing or
@@ -1122,7 +1146,8 @@ static int reflect(GfxShader *s, int flags) {
     const char *whole = json_token_end(js, end, 0), *stage = json_member(js, end, "stage");
     if (!whole || json_space(whole, end) != end) return 0;
     s->stage = json_string_is(stage, end, "vs") ? GFX_STAGE_VS : json_string_is(stage, end, "ps") ? GFX_STAGE_FS :
-               json_string_is(stage, end, "cs") ? GFX_STAGE_CS : json_string_is(stage, end, "gs") ? GFX_STAGE_GS : -1;
+               json_string_is(stage, end, "cs") ? GFX_STAGE_CS : json_string_is(stage, end, "gs") ? GFX_STAGE_GS :
+               json_string_is(stage, end, "hs") ? GFX_STAGE_TCS : json_string_is(stage, end, "ds") ? GFX_STAGE_TES : -1;
     if (s->stage < 0) return 0;
     if (s->stage == GFX_STAGE_GS) {
         if (!host_gs_sg || !geometry_json(js, end, &s->geometry, s->geometry_skip, &s->geometry_source_passthrough)) return 0;

@@ -37,6 +37,7 @@
 #include "nvn_tex.h"
 #include "tex.h"
 #include "vk.h"
+#include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "vk_exec_draw_helper.h"
 #include "vk_spec.h"
@@ -3172,6 +3173,7 @@ static void record_fixed(VkExec *ex) {
         VkViewport v[16] = {viewport_at(ex, 0)};
         VkRect2D r[16] = {vk_exec_scissor(ex)};
         if (j[0] != 0 || j[1] != 0) v[0].x += j[0], v[0].y += j[1];
+        vk_dlaa_viewport(ex, &v[0]);
         dc->B.jit[0] = j[0], dc->B.jit[1] = j[1];
         for (uint32_t i = 1; i < n; i++) v[i] = viewport_at(ex, i), r[i] = vk_exec_scissor_at(ex, i);
         vkCmdSetViewportWithCount(cb, n, v);
@@ -3623,6 +3625,8 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
     if (light_quad_fault_skip(ex, vs, fs) || skip_vs_listed(ex) || skip_fs_listed(ex)) return 0;
     DP_MARK(DP_SHADER);
     if (!vs || (has_fs && !fs) || (want_gs && (!has_gs || !gs))) return 0;
+    if (vk_dlaa_skip_draw(ex, fs)) return 0;
+    fs = vk_dlaa_fs_swap(fs);
     if (prim == NVN_DRAW_PRIMITIVE_PATCHES && !(want_tess && has_tcs && has_tes && tcs && tes)) {
         static volatile int32_t n;
         if (plat_inc32(&n) <= 4)
@@ -3720,6 +3724,7 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
     }
     // Before the jitter in record_fixed. A slice's draws were noted when the pass was collected (vk_exec.c par_take).
     if (ex->depth.image && !IN_SLICE(dc) && vk_dlss_wanted()) vk_dlss_scene_draw(ex);
+    if (!IN_SLICE(dc)) vk_dlaa_draw(ex);
     record_fixed(ex);
     repeat_stats(ex, info);
     DP_MARK(DP_STATE);

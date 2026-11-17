@@ -33,6 +33,11 @@ void vk_dlss_jitter(VkImage depth, float j[2]) { (void)depth; j[0] = 0.0f; j[1] 
 void vk_dlss_part_begin(int k) { (void)k; }
 void vk_dlss_part_taken(int k) { (void)k; }
 void vk_dlss_image_gone(VkImage image) { (void)image; }
+__attribute__((weak)) int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth,
+                                           VkFormat depth_fmt, uint32_t w, uint32_t h) {
+    (void)ex, (void)cam, (void)mv, (void)depth, (void)depth_fmt, (void)w, (void)h;
+    return 0;
+}
 
 int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4]) {
     (void)src; (void)fmt; (void)w; (void)h; (void)crop; return 0;

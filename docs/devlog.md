@@ -157,3 +157,11 @@
 - **Verification:**
   - Smoke-tested `tools/shaders/translate.py --xlate ".../dmsh_xlate.exe" --limit 20` (`20/20` translated, `0 failed`).
   - Built `mtf-stage2.exe` cleanly (`0` errors), ran `mtf-stage2.exe --seconds 8` with `TOTK_XLATE=.../dmsh_xlate.exe` (`exit 0`, 60 FPS on RTX 5070 Ti), and verified `python tools/check_content.py` (`0 violations`).
+
+### 2026-11-17 — `vk_dlaa.c` (DLAA / DLSS / FXAA-Off) Integration
+- **Changes:**
+  - Wired `runtime/vk_dlaa.c` into `tools/build_stage2.py`, `runtime/vk_device.c` (`vk_dlaa_instance_exts`, `vk_dlaa_device_exts`, `vk_dlaa_init`), `runtime/vk_exec.c` (`vk_dlaa_pass`, `vk_dlaa_submission_end`), `runtime/vk_exec_draw.c` (`vk_dlaa_viewport`, `vk_dlaa_skip_draw`, `vk_dlaa_fs_swap`, `vk_dlaa_draw`), `runtime/vk_present.c` (`vk_dlaa_frame`), `runtime/vk_texture.c` (`vk_sampler_dlss_bias`), and `runtime/ov_resolution.c` (`ov_resolution_sizes`, `res_sizes`).
+  - Added `gfx_shader_reflection` and `gfx_shader_own` in `runtime/gfx.h` / `runtime/gfx_shader.c`, `"hs"`/`"ds"` tessellation stage recognition in `reflection_valid` / `reflect`, `DLAA`/`DLAA_OBJMV`/`DLSS`/`FXAA` knobs in `runtime/cfg.c`, and weak `vk_mvobj_execute` in `runtime/stage2_stubs.c`.
+- **Verification:**
+  - Built `mtf-stage2.exe` (`0` errors) and ran with `MTF_DLAA=1 --seconds 8` (`work/test_dlaa_err.log`): NVIDIA NGX core loaded (`dlaa: NGX up`) and exited cleanly (`0`).
+  - Verified `python tools/check_content.py` (`0 violations`).

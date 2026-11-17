@@ -2281,11 +2281,21 @@ void vk_sampler_register(const dpool_ref *pool, int id, const samp_par *s) {
     unlock();
 }
 
+static float dlss_bias;
+
+void vk_sampler_dlss_bias(float b) {
+    lock();
+    dlss_bias = b;
+    unlock();
+}
+
 // Caller holds the lock.
 static VkSampler sampler_for(VkCtx *c, const samp_par *s) {
     samp_par k;
     memset(&k, 0, sizeof k);
     k = *s;
+    if (dlss_bias != 0 && (k.magf != NVN_MAG_FILTER_NEAREST || k.minf != NVN_MIN_FILTER_NEAREST))
+        k.lod_bias += dlss_bias;
     VkSampler v = (VkSampler)nvn_hm_get(&samplers, &k);
     if (!v) {
         v = make_sampler(c, &k);

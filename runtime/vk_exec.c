@@ -26,6 +26,7 @@
 #include "platform/platform.h"
 #include "tex.h"
 #include "vk.h"
+#include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "vk_spec.h"
 
@@ -782,6 +783,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
     if (par_slice) { vk_exec_par_hazard(); return; }   // a slice cannot open a pass (parallel passes)
     resolve_rt(ex);
+    vk_dlaa_pass(ex);
     // Learned targets (VkTexImage.fb_learned) are attached in the feedback layout
     VkImage want[9];
     VkImageAspectFlags wasp[9];
@@ -2656,6 +2658,7 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     par_no_defer = 0;
     if (par_unmerged) vk_exec_draw_slices_end(par_nworkers + 1), par_unmerged = 0;   // no slice is recorded now
     vk_exec_pass_end(ex);
+    if (!work && n) vk_dlaa_submission_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
     if (memory) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory

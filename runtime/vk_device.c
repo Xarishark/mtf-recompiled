@@ -10,6 +10,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "vk.h"
+#include "vk_dlaa.h"
 #include "platform/platform.h"
 
 static VkCtx g_vk;
@@ -109,6 +110,7 @@ static int create_instance(void) {
         for (int i = 0; i < nd && n_ext < 26; i++)
             if (!listed(ext, n_ext, dx[i]) && instance_ext_present(dx[i])) ext[n_ext++] = dx[i];
     }
+    vk_dlaa_instance_exts(ext, &n_ext, 26);
     // MoltenVK is a portability implementation: the loader only lists it for an instance that asks for the portability
     // enumeration extension, and the logical device then enables VK_KHR_portability_subset (create_device). Only on
     // macOS: the Khronos loader offers the extension on Windows and Linux too, and asking there would let a portability
@@ -387,6 +389,7 @@ static int create_device(void) {
                 !(c->f12.bufferDeviceAddress && !strcmp(dx[i], VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)))
                 ext[n_ext++] = dx[i];
     }
+    if (g_vk.props.vendorID == 0x10de) vk_dlaa_device_exts(ep, ne, ext, &n_ext, 48);
     free(ep);
     const VkPhysicalDeviceFeatures *h = &c->f2.features;
     const char *miss = NULL;
@@ -499,7 +502,7 @@ int vk_init(void) {
     plat_mutex_lock(&g_lock);
     if (!g_ready) {
         memset(&g_vk, 0, sizeof g_vk);
-        if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start();
+        if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start(), vk_dlaa_init();
         else destroy_all();
     }
     int ok = g_ready;

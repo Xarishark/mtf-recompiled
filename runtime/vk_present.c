@@ -20,6 +20,7 @@
 #include "nvn_api.h"
 #include "ui/menu.h"
 #include "vk.h"
+#include "vk_dlaa.h"
 #include "platform/platform.h"
 
 #define FRAMES 2
@@ -660,6 +661,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         if (menu_shot) save_capture(menu_shot);
     }
 out:
+    vk_dlaa_frame();
     plat_rmutex_unlock(&g_pl);
 }
 

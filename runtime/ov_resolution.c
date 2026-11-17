@@ -49,7 +49,11 @@ static void get_output_res(int *w, int *h) {
     }
 }
 
+int vk_dlaa_scene_share(void);
+
 static float get_render_scale(void) {
+    int k = vk_dlaa_scene_share();
+    if (k > 0) return (float)k / 1000.0f;
     const char *s = cfg_value("TOTK_RENDER_SCALE");
     if (!s || !*s || !strcmp(s, "game")) return 0.0f;
     char *end = NULL;
@@ -92,7 +96,7 @@ void ov_resolution_apply(int *out_w, int *out_h) {
     }
 }
 
-int res_sizes(unsigned out[2], unsigned scene[2]) {
+int ov_resolution_sizes(unsigned out[2], unsigned scene[2]) {
     int w, h;
     get_output_res(&w, &h);
     float sc = get_render_scale();
@@ -101,3 +105,5 @@ int res_sizes(unsigned out[2], unsigned scene[2]) {
     if (scene) scene[0] = (unsigned)(w * eff + 0.5f), scene[1] = (unsigned)(h * eff + 0.5f);
     return sc > 0.0f || cfg_is_set("TOTK_OUTPUT_RES");
 }
+
+int res_sizes(unsigned out[2], unsigned scene[2]) { return ov_resolution_sizes(out, scene); }

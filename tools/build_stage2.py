@@ -134,6 +134,7 @@ RT_SOURCES = [
     "vk_color.c",
     "vk_crumbs.c",
     "vk_device.c",
+    "vk_dlaa.c",
     "vk_dump.c",
     "vk_exec.c",
     "vk_exec_draw.c",
