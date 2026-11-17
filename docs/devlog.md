@@ -165,3 +165,11 @@
 - **Verification:**
   - Built `mtf-stage2.exe` (`0` errors) and ran with `MTF_DLAA=1 --seconds 8` (`work/test_dlaa_err.log`): NVIDIA NGX core loaded (`dlaa: NGX up`) and exited cleanly (`0`).
   - Verified `python tools/check_content.py` (`0 violations`).
+
+### 2026-11-17 — ACES HDR10 Inverse-Tonemap Compose (`vk_hdr_draw` + `hdr_compose.comp`)
+- **Changes:**
+  - Integrated MTF's ACES tonemap input tracker (`vk_hdr_track`, `vk_hdr_draw`, `vk_hdr_image_gone`, `has_aces` / `is_tonemap` constant matcher) and `hdr_compose_spv.h` (`hdr_compose.comp` compute shader) into `runtime/vk_hdr.c`, `runtime/vk.h`, `runtime/vk_texture.c`, and `runtime/vk_exec_draw.c`.
+  - `vk_hdr_record` now uses `H.comp` (`hdr_compose.comp` $\rightarrow$ `R16G16B16A16_SFLOAT` PQ Rec. 2020) whenever the game's ACES tonemap draw (`light` + `bloom` + `exposure`) is active, falling back to `hdr_encode_spv` for menus/movies.
+- **Verification:**
+  - Built `mtf-stage2.exe` cleanly (`0` errors) and ran with `TOTK_HDR=1 --seconds 8` (`work/test_hdr_err.log`): HDR10 swapchain (`format 64`), display metadata (`peak 1000 nits, paper white 203`), and clean exit (`0`).
+  - Verified `python tools/check_content.py` (`0 violations`).

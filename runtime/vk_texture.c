@@ -649,6 +649,7 @@ static void destroy_tex(Tex *e) {
     }
     if (e->released) nreleased--, rel_unlink(e);
     vk_exec_image_gone(e->pub.image);
+    vk_hdr_image_gone(e->pub.image);
     vk_defer_image(e->pub.image, e->alloc);
     free(e->snap);
     free(e);

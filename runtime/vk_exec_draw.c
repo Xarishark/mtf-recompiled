@@ -3725,6 +3725,7 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
     // Before the jitter in record_fixed. A slice's draws were noted when the pass was collected (vk_exec.c par_take).
     if (ex->depth.image && !IN_SLICE(dc) && vk_dlss_wanted()) vk_dlss_scene_draw(ex);
     if (!IN_SLICE(dc)) vk_dlaa_draw(ex);
+    if (vk_hdr_track && !IN_SLICE(dc)) vk_hdr_draw(ex, info, s.fs);
     record_fixed(ex);
     repeat_stats(ex, info);
     DP_MARK(DP_STATE);
