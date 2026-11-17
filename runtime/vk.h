@@ -647,6 +647,9 @@ typedef struct {
 } VkPipeInfo;
 typedef struct VkExec VkExec;
 void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info, const GfxShader *fs);
+void vk_fps_draw(VkDevice dev, VkPhysicalDevice phys, VkCommandBuffer cb, VkImage dst,
+                 VkImageLayout *dst_layout, VkPipelineStageFlags2 *last_stage,
+                 VkAccessFlags2 *last_write, uint32_t sc_w, uint32_t sc_h);
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
 typedef union { VkDescriptorImageInfo image; VkDescriptorBufferInfo buffer; VkBufferView view; uint64_t w[3]; } VkDescSlot;

@@ -607,6 +607,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         last_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         last_write = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     }
+    vk_fps_draw(c->device, c->phys, cb, dst, &last, &last_stage, &last_write, g_sc_ext.width, g_sc_ext.height);
     if (cap) {
         sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, last_stage, last_write,
                      VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);

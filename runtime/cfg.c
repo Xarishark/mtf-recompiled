@@ -103,7 +103,7 @@ static const CfgMeta metas[] = {
     {"FULLSCREEN", "0", "0|1", LIVE}, {"CONSOLE", "1", "0|1", RESTART}, {"WINDOW_MODE", "windowed", "windowed|borderless|fullscreen", LIVE},
     {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
     {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
-    {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
+    {"PERF_OVERLAY", "fps", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|59|67|75|77|100|125|150|200", RESTART},
     {"SHADOW_SCALE", "1", "1|2|4", RESTART}, {"PCSS", "0", "0|1|2", LIVE}, {"CONTACT_SHADOWS", "0", "0|1|2", LIVE}, {"ANISO", "auto", "auto|off|2|4|8|16", RESTART},
     {"SCENE_RES", "auto", "auto|full", RESTART},   // Bananza only (dkb_wide.c)
