@@ -192,3 +192,9 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Symptom:** Running `mtf-stage2.exe` with `TOTK_SECONDS=10` in the environment kept running past 10 seconds at 60 FPS.
 - **Root Cause:** `runtime/main.c` parses `--seconds <N>` on the command line rather than `TOTK_SECONDS` / `MTF_SECONDS`.
 - **Fix / Usage:** Pass `--seconds <N>` directly on the CLI (`.\build\v327680_stage2\mtf-stage2.exe --seconds 8`), which exits cleanly with status `0` after `N` seconds.
+
+## 23. Issue #14 — Cena 3D lavada / esbranquiçada em SDR
+- **Symptom:** Na quadra de treino em SDR (`TOTK_HDR=0`), a cena 3D (grama, Mario, tendas, céu) aparece lavada/esbranquiçada, enquanto a UI 2D e o estádio ao fundo à direita têm contraste normal.
+- **Root Cause:** O passe que gera a 3D LUT de perspectiva aérea `8x8x64` (`0x804bff0000`, `draws 64`, `layers 0+64`, `gs=NULL`) usa `vs f444e5b3aba250a3` sem `BuiltIn Layer`. Todos os 64 draws sobrescrevem apenas a `slice 0` (deixando `slice 0` com o valor do céu distante `[52, 145, 255]` e `slices 1..63` em `[0, 0, 0]`). O `pass 0013` (`fs 2795532640a31474`) então aplica a névoa da `slice 0` sobre toda a geometria próxima à câmera, lavando a quadra e os personagens.
+- **Fix:** Ignorar os draws do passe `8x8x64` em `runtime/vk_exec_draw.c` (`prepare_draw_impl`), mantendo o volume em `(0, 0, 0)` sem névoa espúria em primeiro plano.
+- **Verification:** Captura automatizada em gameplay (`work/practice.script`, `TOTK_DUMP=650` em `work/dump_nofog/pass_0034_t0_1706x960_43_rgba8srgb.png`) validada com cores, sombras e contraste idênticos à referência do Switch 2.

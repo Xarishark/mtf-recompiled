@@ -3726,6 +3726,10 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
     if (ex->depth.image && !IN_SLICE(dc) && vk_dlss_wanted()) vk_dlss_scene_draw(ex);
     if (!IN_SLICE(dc)) vk_dlaa_draw(ex);
     if (vk_hdr_track && !IN_SLICE(dc)) vk_hdr_draw(ex, info, s.fs);
+    // Issue #14: the 8x8x64 aerial-perspective 3D LUT pass (draws=64, gs=NULL) uses a fullscreen VS without
+    // BuiltIn Layer, causing all 64 draws to overwrite slice 0 with the far-sky value while slices 1..63 stay 0.
+    // Leaving the 8x8x64 volume at 0 eliminates the milky near-camera haze in gameplay.
+    if (ex->pass_w == 8 && ex->pass_h == 8 && ex->pass_layers == 64) return 0;
     record_fixed(ex);
     repeat_stats(ex, info);
     DP_MARK(DP_STATE);
