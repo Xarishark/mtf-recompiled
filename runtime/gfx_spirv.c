@@ -250,7 +250,7 @@ uint32_t *gfx_spirv_final(const GfxShader *src, const uint32_t *w, uint64_t word
                                      : spirv_fixup(w, words, &fixed_n, clip_cull_limit);
     if (fixed) w = fixed, words = fixed_n;
     uint32_t *ui2d = NULL;
-    if (src && gfx_shader_stage(src) == GFX_STAGE_VS && gfx_shader_spirv_fnv(src) == 0x67e197ca7ba86adaull) {
+    if (src && gfx_shader_stage(src) == GFX_STAGE_VS) {
         uint64_t ui2d_n = 0;
         ui2d = spirv_ui2d_color_fix(w, words, &ui2d_n);
         if (ui2d) {

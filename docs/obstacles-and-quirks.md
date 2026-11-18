@@ -202,3 +202,7 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 ## 24. Issue #15 — Nuvens / céu em excesso comparado à referência do Switch 2
 - **Symptom:** Após corrigir as cores na Issue #14, o céu na quadra de treino apresenta excesso de nuvens/cobertura branca cobrindo o fundo azul, enquanto na referência do Switch 2 o céu é predominantemente azul com poucas nuvens à mostra.
 - **Next step:** Inspecionar o passe de céu/nuvens (`pass 0009` / `pass 0012` `341x480 rgba16f`) e verificar se a diferença vem de `TCS`/`TES` (cloud sea tessellation) ou do shader/textura de nuvens.
+
+## 25. Issue #16 — Black box stuttering around characters when playing
+- **Symptom:** Caixas pretas intermitentes (black box stuttering) ao redor dos personagens durante o gameplay — facilmente reproduzível no tutorial após fazer um saque e andar pela quadra.
+- **Next step:** Reproduzir via `INPUT_SCRIPT` (saque + movimentação na quadra) ou adicionar hotkey de captura de logs/passes sob demanda durante o momento do bug.
