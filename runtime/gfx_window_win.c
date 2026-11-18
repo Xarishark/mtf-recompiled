@@ -235,6 +235,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
     case WM_KEYDOWN:
+        if (w == VK_F7 && !(l & (1 << 30))) gfx_backend()->capture_log_toggle();
         if (w == VK_F9 && !(l & (1 << 30))) gfx_backend()->dump_request();   // TOTK_DUMP=key; F10 is the system menu key
         if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
             toggle_window_mode(h);

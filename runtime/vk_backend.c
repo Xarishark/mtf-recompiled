@@ -136,6 +136,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     vk_exec_frame_log(t, frame);
     vk_mem_census(frame);
     if (vk_dump_armed) vk_dump_present(frame);
+    if (vk_capture_log_active()) vk_capture_log_frame(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
     if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
@@ -674,6 +675,7 @@ const GfxBackend gfx_vulkan_backend = {
     .exec_frame = vk_be_exec_frame,
     .device_text = vk_be_device_text,
     .dump_request = vk_dump_request,
+    .capture_log_toggle = vk_capture_log_toggle,
 };
 
 void vk_backend_shutdown(void) {

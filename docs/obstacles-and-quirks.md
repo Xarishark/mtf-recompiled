@@ -204,5 +204,6 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Next step:** Inspecionar o passe de céu/nuvens (`pass 0009` / `pass 0012` `341x480 rgba16f`) e verificar se a diferença vem de `TCS`/`TES` (cloud sea tessellation) ou do shader/textura de nuvens.
 
 ## 25. Issue #16 — Black box stuttering around characters when playing
-- **Symptom:** Caixas pretas intermitentes (black box stuttering) ao redor dos personagens durante o gameplay — facilmente reproduzível no tutorial após fazer um saque e andar pela quadra.
-- **Next step:** Reproduzir via `INPUT_SCRIPT` (saque + movimentação na quadra) ou adicionar hotkey de captura de logs/passes sob demanda durante o momento do bug.
+- **Symptom:** Caixas pretas intermitentes (black box stuttering) ao redor dos personagens durante o gameplay (facilmente reproduzível no tutorial após fazer um saque e andar pela quadra), além da sombra do Mario dando stuttering no tutorial.
+- **Diagnostics:** Adicionada a hotkey `F7` ([runtime/gfx_window_win.c](file:///c:/Users/rafae/Documents/Coding/Vibecoding/Decompilation/MTF-Recomp/runtime/gfx_window_win.c), [runtime/vk_dump.c](file:///c:/Users/rafae/Documents/Coding/Vibecoding/Decompilation/MTF-Recomp/runtime/vk_dump.c)) para ligar/desligar captura contínua de logs (`[host]` + resumo de passes e frames em `logs/capture_<n>.log`) sem readback de PNG.
+- **Next step:** Capturar logs com `F7` durante o stuttering da sombra e das caixas pretas ao redor dos personagens e também testar `X` (Toss) + movimentação em `INPUT_SCRIPT`.

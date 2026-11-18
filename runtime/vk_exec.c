@@ -867,6 +867,7 @@ void vk_exec_pass_end(VkExec *ex) {
         if (ex->color[i].image && ex->color[i].img && ex->color[i].img->image != ex->color[i].image)
             bc_copy_back(ex, &ex->color[i]);
     if (vk_dump_armed && !vk_spec_helper()) vk_dump_pass_end(ex);
+    if (vk_capture_log_active() && !vk_spec_helper()) vk_capture_log_pass(ex, pass_draws);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     for (int i = 0; i < 8; i++)
         if (ex->color[i].image) target_written(&ex->color[i], stamp);

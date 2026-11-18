@@ -194,4 +194,5 @@ const GfxBackend gfx_null_backend = {
     .exec_frame = null_exec_frame,
     .device_text = null_device_text,
     .dump_request = null_nothing,
+    .capture_log_toggle = null_nothing,
 };

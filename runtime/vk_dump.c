@@ -1004,3 +1004,69 @@ void vk_dump_present(uint64_t frame) {
     rt_log("vk_dump: frame %llu: %d passes and dispatches, about %llu MB of PNGs in %s", (unsigned long long)frame, seq,
            (unsigned long long)(png_bytes >> 20), dir);
 }
+
+// ---- F7 continuous log capture (no PNG readback; logs host messages + per-pass & per-frame summaries)
+static int cap_log_on;
+static FILE *cap_log_file;
+static uint32_t cap_log_seq, cap_pass_seq;
+static uint64_t cap_log_frames, cap_last_ns;
+static char cap_log_path[256];
+static PlatMutex cap_toggle_lock = PLAT_MUTEX_INIT;
+
+int vk_capture_log_active(void) {
+    return __atomic_load_n(&cap_log_on, __ATOMIC_ACQUIRE);
+}
+
+void vk_capture_log_toggle(void) {
+    plat_mutex_lock(&cap_toggle_lock);
+    if (!cap_log_on) {
+        plat_file_mkdir_p("logs");
+        snprintf(cap_log_path, sizeof cap_log_path, "logs/capture_%u.log", ++cap_log_seq);
+        FILE *f = fopen(cap_log_path, "w");
+        if (!f) {
+            rt_log("capture: cannot open %s", cap_log_path);
+            plat_mutex_unlock(&cap_toggle_lock);
+            return;
+        }
+        cap_log_file = f;
+        cap_pass_seq = 0;
+        cap_log_frames = 0;
+        cap_last_ns = plat_now_ns();
+        rt_log_set_capture_file(f);
+        __atomic_store_n(&cap_log_on, 1, __ATOMIC_RELEASE);
+        rt_log("capture: F7 started -> %s (press F7 again to stop)", cap_log_path);
+    } else {
+        __atomic_store_n(&cap_log_on, 0, __ATOMIC_RELEASE);
+        rt_log("capture: F7 stopped (%llu frames) -> %s", (unsigned long long)cap_log_frames, cap_log_path);
+        rt_log_set_capture_file(NULL);
+        if (cap_log_file) {
+            fclose(cap_log_file);
+            cap_log_file = NULL;
+        }
+    }
+    plat_mutex_unlock(&cap_toggle_lock);
+}
+
+void vk_capture_log_pass(const VkExec *ex, uint32_t draws) {
+    if (!vk_capture_log_active() || !ex) return;
+    uint64_t td_addr = ex->depth.img ? ex->depth.img->addr : 0;
+    uint64_t t0_addr = ex->color[0].img ? ex->color[0].img->addr : 0;
+    rt_log_capture_printf("  pass %02u: %ux%u L=%u draws=%u nc=%d td=0x%llx(%d) t0=0x%llx(%d)\n",
+                          cap_pass_seq++, ex->pass_w, ex->pass_h, ex->pass_layers, draws, ex->pass_ncolor,
+                          (unsigned long long)td_addr, (int)ex->depth.format,
+                          (unsigned long long)t0_addr, (int)ex->color[0].format);
+}
+
+void vk_capture_log_frame(uint64_t frame) {
+    if (!vk_capture_log_active()) return;
+    uint64_t now = plat_now_ns();
+    double dt_ms = cap_last_ns ? (double)(now - cap_last_ns) / 1e6 : 0.0;
+    cap_last_ns = now;
+    cap_log_frames++;
+    cap_pass_seq = 0;
+    GfxStats st = gfx_stats();
+    rt_log_capture_printf("=== frame %llu (%.2f ms) nvn=%llu skipped=%llu val_err=%llu shader_fail=%llu ===\n",
+                          (unsigned long long)frame, dt_ms, (unsigned long long)st.nvn_calls,
+                          (unsigned long long)st.draws_skipped, (unsigned long long)st.validation_errors,
+                          (unsigned long long)st.shader_failures);
+}

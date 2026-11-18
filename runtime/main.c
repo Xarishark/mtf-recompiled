@@ -21,8 +21,37 @@ const RtConfig *rt_config(void) { return &g_cfg; }
 const char *rt_log_path(void) { return NULL; }
 void rt_sha256(const void *p, size_t n, uint8_t out[32]) { sha256(p, n, out); }
 
+static FILE *g_cap_log;
+static PlatMutex g_cap_log_lock = PLAT_MUTEX_INIT;
+
+void rt_log_set_capture_file(void *f) {
+    plat_mutex_lock(&g_cap_log_lock);
+    g_cap_log = (FILE *)f;
+    plat_mutex_unlock(&g_cap_log_lock);
+}
+
+void rt_log_capture_printf(const char *fmt, ...) {
+    if (!__atomic_load_n(&g_cap_log, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&g_cap_log_lock);
+    if (g_cap_log) {
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(g_cap_log, fmt, ap);
+        va_end(ap);
+    }
+    plat_mutex_unlock(&g_cap_log_lock);
+}
+
 void rt_log_raw(const char *p, size_t n) {
     fwrite(p, 1, n, stderr);
+    if (__atomic_load_n(&g_cap_log, __ATOMIC_ACQUIRE)) {
+        plat_mutex_lock(&g_cap_log_lock);
+        if (g_cap_log) {
+            fwrite(p, 1, n, g_cap_log);
+            fflush(g_cap_log);
+        }
+        plat_mutex_unlock(&g_cap_log_lock);
+    }
 }
 
 void rt_vlogf(const char *fmt, va_list ap) {

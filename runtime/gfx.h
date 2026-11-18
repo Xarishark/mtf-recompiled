@@ -204,6 +204,7 @@ typedef struct {
     const GfxExecFrame *(*exec_frame)(void);   // the replay counters; they grow until the back end's frame log resets them
     int  (*device_text)(char *buf, size_t n);  // the system info's GPU and driver lines; 0 while there is no device
     void (*dump_request)(void);     // F9 in the game window: the frame dump of TOTK_DUMP=key
+    void (*capture_log_toggle)(void);   // F7 in the game window: toggle continuous pass/host log capture
 } GfxBackend;
 extern const GfxBackend gfx_null_backend, gfx_vulkan_backend;
 const GfxBackend *gfx_backend(void);                       // TOTK_GPU=null|vulkan (default vulkan)
