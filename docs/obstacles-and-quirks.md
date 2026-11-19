@@ -205,7 +205,7 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 
 ## 25. Issue #16 — Black box stuttering around characters when playing
 - **Symptom:** Caixas pretas intermitentes (black box stuttering) ao redor dos personagens durante o gameplay (facilmente reproduzível no tutorial após fazer um saque e andar pela quadra), além da sombra do Mario dando stuttering no tutorial.
-- **Diagnostics:** Adicionada a hotkey `F7` ([runtime/gfx_window_win.c](file:///c:/Users/rafae/Documents/Coding/Vibecoding/Decompilation/MTF-Recomp/runtime/gfx_window_win.c), [runtime/vk_dump.c](file:///c:/Users/rafae/Documents/Coding/Vibecoding/Decompilation/MTF-Recomp/runtime/vk_dump.c)) para ligar/desligar captura contínua de logs (`[host]` + resumo de passes e frames em `logs/capture_<n>.log`) sem readback de PNG.
+- **Diagnostics:** Adicionada a hotkey `F7` (`runtime/gfx_window_win.c`, `runtime/vk_dump.c`) para ligar/desligar captura contínua de logs (`[host]` + resumo de passes e frames em `logs/capture_<n>.log`) sem readback de PNG.
 - **Next step:** Capturar logs com `F7` durante o stuttering da sombra e das caixas pretas ao redor dos personagens e também testar `X` (Toss) + movimentação em `INPUT_SCRIPT`.
 
 ## 26. `MTF_FPS_LIMIT > 60` acelera a simulação do jogo (Fork 1:1)
