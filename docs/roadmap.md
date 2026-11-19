@@ -70,8 +70,8 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
    - [x] **FPS > 60 em velocidade real `1x` funciona via Frame Generation (`MTF_FRAMEGEN`):** portado de `mkw-recomp` / `SkyboundTotk` (MIT, `vk_framegen.c` + `fg_*_spv.h`, modos `off|120|monitor|unlimited` com swapchain de 5 imagens em `gfx_present.c` para até `4x` = `240 FPS`). Validado em jogo pelo usuário (`60 FPS` base + `2x` = `120 FPS` fluidos a `1x`).
    - [ ] *(Opcional / futuro)* Desacoplar simulação nativa do `60 Hz` (`frame_rate.c` + delta-time patches): teste em partida com `MTF_FPS_LIMIT=144` sem Frame Gen confirmou aceleração (~2.4x), pois o jogo usa passo fixo de `1/60s`.
 2. **Resolução de Renderização, Upscaling & Câmera/Ultrawide**
-   - [ ] **Fluxo claro de Resolução de Renderização + Upscaling no menu (prioritário):** hoje `OUTPUT_RES=auto` força `1440p` mesmo em janela `1080p` (fazendo downscaling em vez de upscaling). Reorganizar no menu: (1) resolução de renderização interna, (2) ligar/selecionar resolução alvo de upscaling (`1080p`, `1440p`, `4K`) e (3) seletor unificado de tecnologia de upscaling (`FSR 1`, `Bilinear`, `DLSS/DLAA`, e avaliar `FSR 3.1`/`NIS` do RAG).
-   - [ ] Remover limite de `2160` linhas / `100%` em `runtime/ov_resolution.c` (suportar `125|150|200%` e resoluções livres).
+   - [x] **Fluxo claro de Resolução de Renderização + Upscaling + >4K/Supersampling:** `OUTPUT_RES=auto` agora acompanha a janela/tela (`1080p` em janela `1080p`, sem downscale forçado de `1440p`), `ov_resolution.c` suporta até `5K (2880p)` / `8K (4320p)` e `RENDER_SCALE` vai de `50%` até `200%` (supersampling); menu (`F1`) reorganizado na ordem Escala de renderização -> Resolução de saída -> Upscaler (`FSR 1`/`Bilinear`) -> `DLAA/DLSS`.
+   - [ ] *(Opcional / futuro)* Avaliar `FSR 3.1` / `NIS` do RAG (`xc2-ns2-recomp`, `Recompia`) e implementar `ULTRAWIDE` (`21:9`/`32:9`), `HUD_POSITION` e `FOV`.
    - [ ] Implementar `ULTRAWIDE`, `HUD_POSITION` (`edges|centered`) e `ASPECT_PATCH`.
    - [ ] Implementar `FOV` (`res_fov_live()`), `WINDOW_MODE` (`windowed|borderless|fullscreen`) e `DEVICE_PROFILE`.
 3. **Anti-Aliasing, Upscaling & HDR Nativo**

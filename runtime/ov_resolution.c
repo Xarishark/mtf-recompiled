@@ -14,6 +14,7 @@
 #include <windows.h>
 #endif
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -46,7 +47,8 @@ static int display_lines(void) {
 #endif
 }
 
-// The output's lines: MTF_OUTPUT_RES, or with auto 2160 on a display that tall and the game's own 1440 otherwise.
+// The output's lines: MTF_OUTPUT_RES, or with auto the window/display height (matching 720..4320) instead of forcing
+// 1440p on a 1080p window.
 int ov_resolution_lines(void) {
     static int lines;
     if (lines) return lines;
@@ -54,10 +56,14 @@ int ov_resolution_lines(void) {
     int r = atoi(v);
     if (!strcmp(v, "auto") || r <= 0) {
         int d = display_lines();
-        lines = d >= 2160 ? 2160 : 1440;
-        rt_log("resolution: output %d lines (auto: the display has %d)", lines, d);
+        if (!cfg_bool("MTF_FULLSCREEN")) {
+            int wx = 0, wy = 0;
+            if (sscanf(cfg_value("MTF_WINDOW_SIZE"), "%dx%d", &wx, &wy) == 2 && wy >= 360 && (!d || wy < d)) d = wy;
+        }
+        lines = d >= 4320 ? 4320 : d >= 2880 ? 2880 : d >= 2160 ? 2160 : d >= 1440 ? 1440 : d >= 1080 ? 1080 : 720;
+        rt_log("resolution: output %d lines (auto: target %d)", lines, d);
     } else {
-        lines = r >= 2160 ? 2160 : r >= 1440 ? 1440 : r >= 1080 ? 1080 : 720;
+        lines = r < 480 ? 480 : r > 4320 ? 4320 : (r & ~1);
     }
     return lines;
 }
@@ -65,9 +71,14 @@ int ov_resolution_lines(void) {
 // The output size when it is not the game's own 2560x1440.
 static int output_size(int *w, int *h) {
     int r = ov_resolution_lines();
-    *w = r == 2160 ? 3840 : r == 1080 ? 1920 : r == 720 ? 1280 : 0;
-    *h = r == 2160 ? 2160 : r == 1080 ? 1080 : r == 720 ? 720 : 0;
-    return *w != 0;
+    if (r == 1440) {
+        *w = *h = 0;
+        return 0;
+    }
+    *h = r;
+    *w = r == 4320 ? 7680 : r == 2880 ? 5120 : r == 2160 ? 3840 : r == 1080 ? 1920 : r == 720 ? 1280
+         : ((r * 16 + 8) / 9 + 1) & ~1;
+    return 1;
 }
 
 static void write_through(uint64_t pointer, int32_t value) {
@@ -99,7 +110,7 @@ static int scene_share(void) {
     const char *v = cfg_value("MTF_RENDER_SCALE");
     if (!strcmp(v, "game")) return 0;
     int pct = atoi(v);
-    return pct <= 0 ? 0 : pct > 100 ? 1000 : pct * 10;
+    return pct <= 0 ? 0 : pct > 200 ? 2000 : pct * 10;
 }
 
 // From nn::vi::QueryDisplayBufferMaxResolution (ov_net.c): right after this call the game caps the mode size in x20 at
@@ -121,8 +132,8 @@ void ov_resolution_apply(Cpu *c) {
     uint32_t *mode = (uint32_t *)(uintptr_t)ptr;
     int ow = size[0], oh = size[1];
     int sw = (ow * k / 1000 + 1) & ~1, sh = (oh * k / 1000 + 1) & ~1;   // even sizes, as the game's own modes give
-    if (sw > ow) sw = ow;
-    if (sh > oh) sh = oh;
+    if (sw > 7680) sw = 7680;
+    if (sh > 4320) sh = 4320;
     size[0] = (uint16_t)sw, size[1] = (uint16_t)sh;
     static int logged;
     if (!logged++) rt_log("resolution: scene %dx%d of the output %dx%d (the game asked for mode %u)", sw, sh, ow, oh, *mode);

@@ -408,16 +408,18 @@ static void row_gpu(void) {
 
 // The game's output (ov_resolution.c): the four sizes the console's display modes have, or the display's.
 static void row_output_res(void) {
-    static const char *const vals[] = {"auto", "720", "1080", "1440", "2160"};
+    static const char *const vals[] = {"auto", "720", "1080", "1440", "2160", "2880", "4320"};
     const char *names[] = {menu_text(UI_MENU_OUTPUT_RES_AUTO), "1280 \xc3\x97 720", "1920 \xc3\x97 1080",
-                           "2560 \xc3\x97 1440", "3840 \xc3\x97 2160"};
-    opt_choice_list("MTF_OUTPUT_RES", UI_MENU_OUTPUT_RES, vals, names, 5, UI_MENU_OUTPUT_RES_DESC);
+                           "2560 \xc3\x97 1440", "3840 \xc3\x97 2160 (4K)", "5120 \xc3\x97 2880 (5K)",
+                           "7680 \xc3\x97 4320 (8K)"};
+    opt_choice_list("MTF_OUTPUT_RES", UI_MENU_OUTPUT_RES, vals, names, 7, UI_MENU_OUTPUT_RES_DESC);
 }
 
 static void row_render_scale(void) {
-    static const char *const vals[] = {"game", "50", "67", "75", "100"};
-    const char *names[] = {menu_text(UI_MENU_RENDER_SCALE_GAME), "50 %", "67 %", "75 %", "100 %"};
-    opt_choice_list("MTF_RENDER_SCALE", UI_MENU_RENDER_SCALE, vals, names, 5, UI_MENU_RENDER_SCALE_DESC);
+    static const char *const vals[] = {"game", "50", "67", "75", "100", "125", "150", "200"};
+    const char *names[] = {menu_text(UI_MENU_RENDER_SCALE_GAME), "50 %", "67 %", "75 %", "100 %",
+                           "125 %", "150 %", "200 %"};
+    opt_choice_list("MTF_RENDER_SCALE", UI_MENU_RENDER_SCALE, vals, names, 8, UI_MENU_RENDER_SCALE_DESC);
 }
 
 // The game language (ov_system.c): the languages the game ships, by their own names.
@@ -493,23 +495,23 @@ static void tab_screen(float scale) {
     opt_choice_list("MTF_BACKGROUND_FPS", UI_MENU_BACKGROUND_FPS, background, background_names, 5,
                     UI_MENU_BACKGROUND_FPS_DESC);
     opt_group(UI_MENU_GRAPHICS);
-    row_output_res();
     row_render_scale();
+    row_output_res();
     static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
     opt_choice("MTF_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
     opt_slider("MTF_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
-    static const UiTextId aspect[] = {UI_MENU_ASPECT_FIT, UI_MENU_ASPECT_STRETCH};
-    opt_choice("MTF_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
-    static const char *const aniso[] = {"game", "2", "4", "8", "16"};
-    const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
-    opt_choice_list("MTF_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
-    opt_toggle("MTF_TESS", UI_MENU_TESS, UI_MENU_TESS_DESC);
     opt_toggle("MTF_DLAA", UI_MENU_DLAA, UI_MENU_DLAA_DESC);
     static const UiTextId dlss[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
                                     UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
     opt_choice("MTF_DLSS", UI_MENU_DLSS, dlss, 5, UI_MENU_DLSS_DESC);
     static const UiTextId preset[] = {UI_MENU_DLSS_PRESET_DEFAULT, UI_MENU_DLSS_PRESET_K, UI_MENU_DLSS_PRESET_J};
     opt_choice("MTF_DLSS_PRESET", UI_MENU_DLSS_PRESET, preset, 3, UI_MENU_DLSS_PRESET_DESC);
+    static const UiTextId aspect[] = {UI_MENU_ASPECT_FIT, UI_MENU_ASPECT_STRETCH};
+    opt_choice("MTF_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
+    static const char *const aniso[] = {"game", "2", "4", "8", "16"};
+    const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
+    opt_choice_list("MTF_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
+    opt_toggle("MTF_TESS", UI_MENU_TESS, UI_MENU_TESS_DESC);
     opt_toggle("MTF_FXAA", UI_MENU_FXAA, UI_MENU_FXAA_DESC);
     rows_color();
     opt_group(UI_MENU_HDR_GROUP);
