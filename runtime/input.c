@@ -418,15 +418,29 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
     memcpy(a, pad_axes, sizeof a);
     int dt = pad_dev_type;
     plat_mutex_unlock(&lock);
-    int pad_moved = b != 0;
-    for (int i = 0; i < 4; i++) pad_moved |= a[i] > STICK_ACTIVE || a[i] < -STICK_ACTIVE;
+    static uint64_t prev_b, prev_kb;
+    static int32_t prev_a[4];
+    uint64_t new_pad = b & ~prev_b;
+    prev_b = b;
+    int pad_moved = new_pad != 0;
+    for (int i = 0; i < 4; i++) {
+        int32_t d = a[i] - prev_a[i];
+        if ((d > 4000 || d < -4000) && (a[i] > STICK_ACTIVE || a[i] < -STICK_ACTIVE)) {
+            pad_moved = 1;
+            prev_a[i] = a[i];
+        } else if (a[i] <= STICK_ACTIVE && a[i] >= -STICK_ACTIVE) {
+            prev_a[i] = a[i];
+        }
+    }
     uint64_t kb = 0;
     int32_t ka[4] = {0};
     keyboard_read(&kb, ka);
-    int kb_moved = kb != 0;
+    uint64_t new_kb = kb & ~prev_kb;
+    prev_kb = kb;
+    int kb_moved = new_kb != 0;
     for (int i = 0; i < 4; i++) kb_moved |= ka[i] > STICK_ACTIVE || ka[i] < -STICK_ACTIVE;
-    if (pad_moved) __atomic_store_n(&last_dev, dt, __ATOMIC_RELAXED);
-    else if (kb_moved) __atomic_store_n(&last_dev, INPUT_DEV_KEYBOARD, __ATOMIC_RELAXED);
+    if (kb_moved) __atomic_store_n(&last_dev, INPUT_DEV_KEYBOARD, __ATOMIC_RELAXED);
+    else if (pad_moved) __atomic_store_n(&last_dev, dt, __ATOMIC_RELAXED);
     extern void ov_font_tick(void);
     ov_font_tick();
     b |= kb;

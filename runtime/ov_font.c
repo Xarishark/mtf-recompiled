@@ -320,10 +320,10 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
-    h[6] = 0;                        // loX (tight left edge, no excess padding)
-    h[7] = (int16_t)(px * 84 / 100); // hiY (aligned with cap-height / '+' center)
-    h[8] = (int16_t)(px + 2);        // dx
-    h[11] = (int16_t)(px + 2);       // advance
+    h[6] = 2;                        // loX (2px left margin for outline clearance)
+    h[7] = (int16_t)(px * 92 / 100); // hiY (aligned with '+' / capital letters)
+    h[8] = (int16_t)(px + 6);        // dx (6px total margin so outlines don't overlap)
+    h[11] = (int16_t)(px + 6);       // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
     h[16] = (int16_t)px;             // bpl (bytes per line)
