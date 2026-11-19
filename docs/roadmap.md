@@ -68,7 +68,7 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
 1. **FPS Alto (> 60 FPS) & Frame Generation**
    - [x] Expor `MTF_FPS_LIMIT` (`30|40|45|60|90|120|144|240|display|unlimited`) no `cfg.c`, menu in-game (`F1`) e pacer de `nro0` (`0x70035611b8`): medido **144 FPS** (`display`) e **~1925 FPS** (`unlimited` na abertura).
    - [ ] **Desacoplar simulação do 60 Hz (`frame_rate.c` + delta-time patches):** teste em partida com `VK_PRESENT=immediate` e `FPS_LIMIT=144` confirmou que **o jogo acelera** (personagens se movem mais rápido), indicando passo fixo de `1/60s`. Usar `MTF_SCAN_DT` + análise de `nro0` para patch de `REALTIME` delta-time.
-   - [ ] Portar `FRAME_GEN` (`vk_framegen.c`, `fg_pace.h`, `fg_*_spv.h` de `dkb-pc-recomp` + modo `Auto` inspirado em `Inhale`) para 120/144/240 Hz sem alterar simulação 60 Hz.
+   - [x] Portar `FRAMEGEN` (`vk_framegen.c`, `fg_*_spv.h` MIT de `mkw-recomp` / `SkyboundTotk`, modos `off|auto|2|3|4|120` com swapchain queue em `gfx_present.c`): gera quadros intermediários a 120+ FPS mantendo a simulação em `60 Hz` (`1x`).
 2. **Resoluções Maiores (> 4K / Supersampling), Ultrawide & Câmera/FOV**
    - [ ] Remover limite de `2160` linhas / `100%` em `runtime/ov_resolution.c` (suportar `125|150|200%` e resoluções livres).
    - [ ] Implementar `ULTRAWIDE`, `HUD_POSITION` (`edges|centered`) e `ASPECT_PATCH`.

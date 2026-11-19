@@ -25,7 +25,7 @@
 #include "ui/menu.h"
 #include "vk.h"
 
-#define FRAMES 2
+#define FRAMES 4
 #define MAX_IMAGES 16
 #define VSYNC_NS 1000000000ull
 #define VSYNC_HZ gfx_vsync_hz()
@@ -161,8 +161,8 @@ static VmaAllocation g_cap_alloc;
 static uint8_t *g_cap_ptr;
 static VkDeviceSize g_cap_size;
 static int g_cap_w, g_cap_h;
-static int g_flip_on;            // vk_present_blit submitted the blit of swapchain image g_flip_idx; vk_present_flip presents it
-static uint32_t g_flip_idx;
+static uint32_t g_flip_q[FRAMES];   // queued swapchain images submitted by vk_present_blit[_ahead]
+static int g_flip_head, g_flip_n;
 
 // ---- MTF_FLIGHT thumbnails (flight.c; g_pl): each present also blits the swapchain image down into slot frame % g_th_n
 // of a host-visible ring. A slot's tag names the frame it holds complete; recording a new frame clears the tag first,
@@ -289,12 +289,14 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
 // first; the device release drops it.
 static void flip_locked(void) {
-    if (!g_flip_on) return;
-    g_flip_on = 0;
+    if (!g_flip_n) return;
+    uint32_t idx = g_flip_q[g_flip_head];
+    g_flip_head = (g_flip_head + 1) % FRAMES;
+    g_flip_n--;
     if (!g_sc) return;
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
-                           .pWaitSemaphores = &g_render_done[g_flip_idx], .swapchainCount = 1, .pSwapchains = &g_sc,
-                           .pImageIndices = &g_flip_idx};
+                           .pWaitSemaphores = &g_render_done[idx], .swapchainCount = 1, .pSwapchains = &g_sc,
+                           .pImageIndices = &idx};
     vk_queue_lock();
     VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
@@ -311,7 +313,7 @@ static void free_capture(void) {
 }
 
 static int build_swapchain(void) {
-    flip_locked();   // the acquired image goes out before its swapchain is replaced
+    while (g_flip_n) flip_locked();   // the acquired images go out before the swapchain is replaced
     VkCtx *c = vk_ctx();
     VkSurfaceCapabilitiesKHR caps;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(c->phys, g_surface, &caps) != VK_SUCCESS) return 0;
@@ -589,7 +591,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     gfx_window_start();
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
-    flip_locked();
+    if (defer != 2) while (g_flip_n) flip_locked();
     if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
         if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
     }
@@ -775,8 +777,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
     vk_queue_unlock();
     if (r == VK_SUCCESS) {
-        g_flip_on = 1;
-        g_flip_idx = idx;
+        if (g_flip_n < FRAMES) {
+            g_flip_q[(g_flip_head + g_flip_n) % FRAMES] = idx;
+            g_flip_n++;
+        }
         if (!defer) flip_locked();
     } else {
         vk_device_fault_report(r);
@@ -798,6 +802,21 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
     present_image(src, layout, fmt, w, h, crop, 1);
 }
 
+void vk_present_blit_ahead(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]) {
+    present_image(src, layout, fmt, w, h, crop, 2);
+}
+
+int vk_present_ahead_max(void) {
+    uint32_t n = __atomic_load_n(&g_sc_n, __ATOMIC_ACQUIRE);
+    int room = n > 1 ? (int)(n - 1) : 2;
+    return room > FRAMES ? FRAMES : room;
+}
+
+double vk_present_refresh_hz(void) {
+    int32_t mhz = __atomic_load_n(&g_rate_mhz, __ATOMIC_ACQUIRE);
+    return mhz > 0 ? mhz / 1000.0 : 0.0;
+}
+
 void vk_present_flip(void) {
     plat_rmutex_lock(&g_pl);
     flip_locked();
@@ -812,7 +831,8 @@ void gfx_window_release_vk(void) {
         vk_queue_lock();
         vkDeviceWaitIdle(c->device);
         vk_queue_unlock();
-        g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
+        g_flip_head = g_flip_n = 0;   // its blits are done (device idle); the swapchain goes away unpresented
+        vk_fg_release();
         menu_vk_release();
         vk_fsr_release();
         vk_color_release();

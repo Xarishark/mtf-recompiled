@@ -136,6 +136,9 @@ void vk_pass_marks_report(void);    // vk_device_fault_report: the AMD words and
 // vk_present_image split in two: vk_present_blit submits the blit and leaves the present waiting, vk_present_flip
 // queues it. The next blit or a swapchain rebuild queues a waiting present first.
 void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
+void vk_present_blit_ahead(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
+int vk_present_ahead_max(void);
+double vk_present_refresh_hz(void);
 // FSR 1 on the present (vk_fsr.c): records EASU (+ RCAS) of src's crop rectangle {x, y, w, h} into the rectangle out
 // {x, y, w, h} of dst, a swapchain image in TRANSFER_DST; src is in GENERAL and fmt its format. 0 = nothing recorded
 // (the setting says bilinear, no upscale is needed, or FSR is not available): the caller blits.
@@ -168,6 +171,13 @@ void vk_hdr_support(float out[4]);
 int vk_contact_strength(void);   // percent, 0 = off
 void vk_contact_release(void);   // before the device goes away
 void vk_present_flip(void);
+
+// Frame generation (vk_framegen.c, MTF_FRAMEGEN=off|auto|2|3|4|120)
+#define VK_FG_MAX 4
+int vk_fg_wanted(void);
+int vk_fg_frame(VkImage src, int sw, int sh, const int crop[4], uint64_t at, VkImage out[VK_FG_MAX], int *w, int *h,
+                uint64_t *step);
+void vk_fg_release(void);
 // Every submission to ctx->gfx_queue (and xfer_queue when shared) takes this lock; vk_present_image and the swapchain
 // rebuild do. Recursive.
 void vk_queue_lock(void);

@@ -38,6 +38,7 @@ thread and the depth twins of `vk_exec_draw.c`.
 | Vulkan Memory Allocator 3.4.0 (header-only) | MSYS2 UCRT64 | MIT | `runtime/vk_vma.cpp` |
 | libc++ and libunwind | llvm-mingw 20261104 | Apache-2.0 with LLVM exception | the C++ runtime beside `mtf-recomp.exe` |
 | NVIDIA DLSS (`nvngx_dlss.dll`) | not distributed: the setup downloads it from https://github.com/NVIDIA/DLSS when the player ticks the box, or the player supplies it | NVIDIA RTX SDK licence | DLAA and DLSS on RTX GPUs (`runtime/vk_dlaa.c` loads it at run time) |
+| Optical-flow frame generation (`vk_framegen.c`, `fg_*_spv.h`) | Adapted from [mkw-recomp](https://github.com/adriadam10/mkw-recomp) (`runtime/gfx/vk/device/vk_framegen.c`), after [SkyboundTotk](https://github.com/NotRexed/SkyboundTotk) @ `a4495f9` | MIT | `runtime/vk_framegen.c`, `runtime/fg_{luma,flow,median,synth}_spv.h` |
 
 ## Bundled in the release package (not in this repository)
 
