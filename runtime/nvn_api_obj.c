@@ -1,58 +1,100 @@
 // NVN front end, second slice: descriptor pools, textures, samplers, programs,
-// windows with present pacing, and the state objects. Ported from MacNativeGames
-// games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou; origin d2r-mobile),
-// lines 254-535, 1775-1829, 2070-2215 and 2579-2727, and nvn_pace.h; Metal, mach, the translation thread, frame
-// interpolation and Apple diagnostics dropped. Calls that reached Metal go to gfx_backend() (gfx.h).
+// windows with present pacing, and the state objects. Calls that reach the GPU go to gfx_backend() (gfx.h).
 //
 // Objects are stored in place in the NVN object memory the game provides (nvn_obj.h); every argument is read from the
 // AAPCS64 registers (host.h arg_x / arg_s / arg_p) and every result returned with ret_x. Command-buffer procs are in
-// nvn_api_cmd.c, the TOTK extension procs in nvn_ext.c.
+// nvn_api_cmd.c, the extension procs in nvn_ext.c and nvn2_ext.c.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "nvn2_ctl.h"
 #include "nvn_hmap.h"
-#include "nvn_geometry_control.h"
 #include "nvn_tex.h"
+#include "sha256.h"
+#include <stdio.h>
+#include "platform/platform.h"
 #include "platform/platform.h"
 
 // ---------- Descriptor pools
+// Texture and sampler ids are per pool, and a game may keep several pools (MTF's movie player and its
+// interface each register texture 257 in their own pool; with one id space the interface's text sampled the movie's
+// chroma texture). Each pool gets a range of the back end's one id space, in initialisation order, the first at 0:
+// registrations add the pool's base, and the replay adds the base of the pool the command buffer selected to every
+// handle it binds (vk_exec_draw.c).
+// A pool set up again at the same address keeps its base when it is no larger.
+#define POOLS 32
+typedef struct { const void *pool; int32_t base, n; } PoolBase;
+static PoolBase tpools[POOLS], spools[POOLS];
+static int ntpools, nspools;
+static int32_t tnext, snext;
+static PlatMutex pools_lock = PLAT_MUTEX_INIT;
+
+static void pool_add(PoolBase *t, int *n, int32_t *next, const void *pool, int32_t count, int32_t limit, const char *kind) {
+    plat_mutex_lock(&pools_lock);
+    int i = 0;
+    while (i < *n && t[i].pool != pool) i++;
+    if (i < *n && count <= t[i].n) {
+        plat_mutex_unlock(&pools_lock);
+        return;
+    }
+    if (i == *n) {
+        if (*n == POOLS) rt_fatal("nvn: more than %d %s pools", POOLS, kind);
+        (*n)++;
+    }
+    if (*next + count > limit) {   // no room left in the id space: share it from 0 (the old single-space behaviour)
+        rt_log("[RED] nvn: %s pool %p of %d ids does not fit after %d: it shares ids with the first pool", kind, pool,
+               count, *next);
+        t[i] = (PoolBase){pool, 0, count};
+    } else {
+        t[i] = (PoolBase){pool, *next, count};
+        *next += count;
+    }
+    rt_log("nvn: %s pool %p: %d ids at %d", kind, pool, count, t[i].base);
+    plat_mutex_unlock(&pools_lock);
+}
+static int32_t pool_base(const PoolBase *t, int n, const void *pool) {
+    if (!pool) return 0;
+    for (int i = 0; i < n; i++)
+        if (t[i].pool == pool) return t[i].base;
+    return 0;
+}
+int32_t nvn_tex_pool_base(const void *pool) { return pool_base(tpools, ntpools, pool); }
+int32_t nvn_samp_pool_base(const void *pool) { return pool_base(spools, nspools, pool); }
+
 // NVNboolean nvnTexturePoolInitialize(NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t offset, int n)
 NVN_API(nvnTexturePoolInitialize) {
-    dpool_t p = {arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
-    dpool_ref ref;
-    int ok = nvn_dpool_snapshot(&p, 1u << 20, &ref);
-    *(dpool_t *)arg_p(c, 0) = ok ? p : (dpool_t){0};
-    NVN_LOG("TexturePool n=%d", (int)arg_x(c, 3));
-    ret_x(c, ok);
+    *(dpool_t *)arg_p(c, 0) = (dpool_t){arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
+    pool_add(tpools, &ntpools, &tnext, arg_p(c, 0), (int32_t)arg_x(c, 3), 1 << 20, "texture");
+    ret_x(c, 1);
 }
 // void nvnTexturePoolFinalize(NVNtexturePool *tp)
-NVN_API(nvnTexturePoolFinalize) { memset(arg_p(c, 0), 0, sizeof(dpool_t)); }
+NVN_API(nvnTexturePoolFinalize) { (void)c; }
 // void nvnTexturePoolRegisterTexture(const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v)
 NVN_API(nvnTexturePoolRegisterTexture) {
-    dpool_ref pool;
-    if (!nvn_dpool_snapshot(arg_p(c, 0), 1u << 20, &pool)) rt_fatal("nvn: invalid texture descriptor pool");
-    gfx_backend()->texture_register(&pool, (int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
+    gfx_backend()->texture_register(nvn_tex_pool_base(arg_p(c, 0)) + (int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
+}
+// void nvnTexturePoolRegisterImage(const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v):
+// images and textures share one registration here (image handle = texture pool index)
+NVN_API(nvnTexturePoolRegisterImage) {
+    gfx_backend()->texture_register(nvn_tex_pool_base(arg_p(c, 0)) + (int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
 }
 // NVNboolean nvnSamplerPoolInitialize(NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t offset, int n)
 NVN_API(nvnSamplerPoolInitialize) {
-    dpool_t p = {arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
-    dpool_ref ref;
-    int ok = nvn_dpool_snapshot(&p, 1u << 12, &ref);
-    *(dpool_t *)arg_p(c, 0) = ok ? p : (dpool_t){0};
-    NVN_LOG("SamplerPool n=%d", (int)arg_x(c, 3));
-    ret_x(c, ok);
+    *(dpool_t *)arg_p(c, 0) = (dpool_t){arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
+    pool_add(spools, &nspools, &snext, arg_p(c, 0), (int32_t)arg_x(c, 3), 1 << 12, "sampler");
+    ret_x(c, 1);
 }
 // void nvnSamplerPoolFinalize(NVNsamplerPool *sp)
-NVN_API(nvnSamplerPoolFinalize) { memset(arg_p(c, 0), 0, sizeof(dpool_t)); }
+NVN_API(nvnSamplerPoolFinalize) { (void)c; }
 // void nvnSamplerPoolRegisterSampler(const NVNsamplerPool *sp, int id, const NVNsampler *s)
 NVN_API(nvnSamplerPoolRegisterSampler) {
-    dpool_ref pool;
-    if (!nvn_dpool_snapshot(arg_p(c, 0), 1u << 12, &pool)) rt_fatal("nvn: invalid sampler descriptor pool");
-    gfx_backend()->sampler_register(&pool, (int)arg_x(c, 1), &((const samp_t *)arg_p(c, 2))->p);
+    gfx_backend()->sampler_register(nvn_samp_pool_base(arg_p(c, 0)) + (int)arg_x(c, 1), &((const samp_t *)arg_p(c, 2))->p);
 }
 
 // ---------- Texture builder
@@ -179,16 +221,6 @@ static void live_del(const tex_t *o) {
     free(cur);
 }
 
-int nvn_tex_live_at(const void *mem, tex_t *out) {
-    if (!mem) return 0;
-    uint64_t k = (uintptr_t)mem;
-    plat_mutex_lock_shared(&live_lock);
-    const tex_t *cur = nvn_hm_get(&live, &k);
-    if (cur) *out = *cur;
-    plat_mutex_unlock_shared(&live_lock);
-    return cur != NULL;
-}
-
 // Releases the back end's texture and the live entry of an initialized texture object.
 static void tex_release(tex_t *o) {
     live_del(o);
@@ -208,6 +240,7 @@ NVN_API(nvnTextureInitialize) {
     o->magic = NVN_TEX_MAGIC;
     o->d = s->d;
     o->pool = s->pool;
+    o->pool_flags = s->pool ? (uint16_t)s->pool->flags : 0;
     o->off = s->off;
     o->has_layout = s->has_layout;
     memcpy(o->layout, s->layout, 8);
@@ -248,6 +281,7 @@ NVN_API(nvnTextureCompare) {
 NVN_API(nvnTextureGetRawStorageClass) { ret_x(c, 1); }
 
 // ---------- Texture views
+#undef VW   // a system header defines one
 #define VW(c) ((view_t *)arg_p(c, 0))
 NVN_API(nvnTextureViewSetDefaults) { memset(arg_p(c, 0), 0, sizeof(view_t)); }
 NVN_API(nvnTextureViewSetLevels) {
@@ -334,8 +368,11 @@ NVN_API(nvnTextureReadTexelsStrided) { read_texels(c, 1); }
 NVN_API(nvnTextureWriteTexels) { write_texels(c, 0); }
 NVN_API(nvnTextureWriteTexelsStrided) { write_texels(c, 1); }
 // void nvnTexture{Flush,Invalidate}Texels(const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r): texel
-// access is coherent
-NVN_API(nvnTextureFlushTexels) { (void)c; }
+// access is coherent; flush marks the storage as written for re-upload
+NVN_API(nvnTextureFlushTexels) {
+    const tex_t *t = arg_p(c, 0);
+    if (t && t->mem && !nvn_gpu_only((uintptr_t)t->mem)) nvn_guest_written((uintptr_t)t->mem, t->L.size);
+}
 NVN_API(nvnTextureInvalidateTexels) { (void)c; }
 
 // ---------- Samplers
@@ -412,6 +449,7 @@ NVN_API(nvnSamplerInitialize) {
 NVN_API(nvnSamplerFinalize) { ((samp_t *)arg_p(c, 0))->magic = 0; }
 
 // ---------- Programs
+static void ctl_free(prog_t *o);
 // NVNboolean nvnProgramInitialize(NVNprogram *p, NVNdevice *d)
 NVN_API(nvnProgramInitialize) {
     prog_t *o = arg_p(c, 0);
@@ -422,119 +460,51 @@ NVN_API(nvnProgramInitialize) {
 static void prog_release(prog_t *o) {
     if (o->serial) gfx_backend()->program_release(o);
     o->serial = 0;
-    free(o->owned_control);
-    o->owned_control = NULL;
 }
 // void nvnProgramFinalize(NVNprogram *p)
 NVN_API(nvnProgramFinalize) {
     prog_t *o = arg_p(c, 0);
     prog_release(o);
+    ctl_free(o);
     o->magic = 0;
+}
+// NVN2 control sections are only valid during ProgramSetShaders, so the program keeps a copy (nvn2_ctl.h): a host block
+// of NVN2_CTL_COPY bytes and the key state gfx_shader.c keeps after them. prog_t.ctl_own marks the stages whose
+// control is such a copy (an NVN1 section stays the game's). The copies are freed when the program is set again or
+// finalized, after prog_release has drained the replay that could still read them.
+static void ctl_free(prog_t *o) {
+    for (uint32_t i = 0; i < o->nstage && i < 6; i++) {
+        if (o->ctl_own & 1u << i) free((void *)(uintptr_t)o->sd[i].control);
+        o->sd[i].control = NULL;
+    }
+    o->ctl_own = 0;
+}
+static const void *ctl_copy(const void *control) {
+    uint8_t *b = calloc(1, NVN2_CTL_COPY + NVN2_KEY_STATE);
+    if (!b) rt_fatal("nvn: control section copy");
+    memcpy(b, control, NVN2_CTL_COPY);
+    return b;
 }
 static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
     if (n < 0 || n > 6 || (n && !sd)) {
         rt_log("nvn: ProgramSetShaders with %d stages at %p", n, (const void *)sd);
         return 0;
     }
-    NVNshaderData next[6] = {0};
-    uint8_t *owned = NULL;
-    if (n) memcpy(next, sd, (size_t)n * sizeof *sd);
-    for (int i = 0; i < n; i++) {   // NVN 2 stages are lowered to the NVN 1 shape (nvn2_lower.cpp)
-        const uint8_t *ctl = next[i].control, *code = (const uint8_t *)(uintptr_t)next[i].data, *nctl, *ncode;
-        gfx_shader_nvn2_dump(ctl, code);   // only with DKB_SHADER_DUMP
-        if (gfx_shader_is_nvn2(ctl) && nvn2_lower(ctl, code, &nctl, &ncode))
-            next[i] = (NVNshaderData){(NVNbufferAddress)(uintptr_t)ncode, nctl};
-        ctl = next[i].control;
-        code = (const uint8_t *)(uintptr_t)next[i].data;
-        if (!ctl || !code) continue;
-        if (gfx_shader_is_nvn2(ctl)) {
-            if (!owned && !(owned = calloc((size_t)n, 0x880))) goto fail;
-            uint32_t klen = 0;
-            memcpy(&klen, ctl + 0x30, 4);
-            uint32_t copy_len = (0x48u <= klen && klen <= 0x100u) ? klen : 0x100u;
-            memcpy(owned + (size_t)i * 0x880, ctl, copy_len);
-            memcpy(owned + (size_t)i * 0x880 + 0x100, "NV2C", 4);
-            next[i].control = owned + (size_t)i * 0x880;
-            continue;
-        }
-        // Raw NVN2 controls have a different compact layout. Only the host's
-        // explicitly tagged legacy-shaped controls are copied here.
-        if (memcmp(ctl + NVN_GEOMETRY_CONTROL_OFFSET, "TKGSMETA", 8)) continue;
-        uint32_t length = nvn_geometry_control_u32(ctl + 0x704);
-        if (nvn_geometry_control_get(ctl, 0x880, code, length, NULL) != 1) goto fail;
-        if (!owned && !(owned = calloc((size_t)n, 0x880))) goto fail;
-        memcpy(owned + (size_t)i * 0x880, ctl, 0x880);
-        next[i].control = owned + (size_t)i * 0x880;
-    }
-    // Prepare first: sd may alias the old stage list or its owned controls.
-    // The back end drains replay before the old snapshot is freed.
     prog_release(o);
+    ctl_free(o);
     o->nstage = (uint32_t)n;
-    memcpy(o->sd, next, sizeof next);
-    o->owned_control = owned;
+    if (n) memcpy(o->sd, sd, (size_t)n * sizeof *sd);
+    for (int i = 0; i < n; i++)
+        if (sd[i].control && nvn2_ctl(sd[i].control)) o->sd[i].control = ctl_copy(sd[i].control), o->ctl_own |= 1u << i;
     o->serial = nvn_new_serial();
-    NVN_LOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)o, n, n ? (unsigned long long)next[0].data : 0ull);
+    NVN_LOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)o, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
-fail:
-    free(owned);
-    return 0;
 }
 // NVNboolean nvnProgramSetShaders(NVNprogram *p, int n, const NVNshaderData *sd)
 NVN_API(nvnProgramSetShaders) {
     NVN_BLOCKING();
     ret_x(c, prog_set_shaders(arg_p(c, 0), (int)arg_x(c, 1), arg_p(c, 2)));
 }
-// ---- NVN 2 program builder (Donkey Kong Bananza). The game zeroes a 0x80-byte NVNprogramBuilder on the stack, calls
-// SetDefaults, SetDevice and SetShaders(b, n, NVNshaderData[n]) and then nvnProgramInitializeFromBuilder(program, b)
-// (main+0x88be28 sub_710088BDCC; programs 0xa0 apart). The builder keeps its own copy of the stage list, so the
-// initialize step is NVN 1's Initialize + SetShaders.
-#define NVN_PROG_BUILDER_MAGIC 0x50424e32u   // "2NBP"
-typedef struct { uint32_t magic, nstage; void *dev; NVNshaderData sd[6]; } prog_builder_t;
-_Static_assert(sizeof(prog_builder_t) <= 0x80, "NVNprogramBuilder is 0x80 bytes in Bananza");
-static prog_builder_t *prog_builder(Cpu *c, const char *fn) {
-    prog_builder_t *b = arg_p(c, 0);
-    if (!b) rt_fatal("nvn: %s: null program builder", fn);
-    return b;
-}
-// void nvnProgramBuilderSetDefaults(NVNprogramBuilder *b)
-NVN_API(nvnProgramBuilderSetDefaults) {
-    prog_builder_t *b = prog_builder(c, "ProgramBuilderSetDefaults");
-    void *dev = b->magic == NVN_PROG_BUILDER_MAGIC ? b->dev : NULL;   // like the other builders, keep the device
-    memset(b, 0, sizeof *b);
-    b->magic = NVN_PROG_BUILDER_MAGIC;
-    b->dev = dev;
-}
-// void nvnProgramBuilderSetDevice(NVNprogramBuilder *b, NVNdevice *d), NVNdevice *...GetDevice(const ... *b)
-NVN_API(nvnProgramBuilderSetDevice) { prog_builder(c, "ProgramBuilderSetDevice")->dev = arg_p(c, 1); }
-NVN_API(nvnProgramBuilderGetDevice) { ret_x(c, (uint64_t)(uintptr_t)prog_builder(c, "ProgramBuilderGetDevice")->dev); }
-// void nvnProgramBuilderSetShaders(NVNprogramBuilder *b, int n, const NVNshaderData *sd)
-NVN_API(nvnProgramBuilderSetShaders) {
-    prog_builder_t *b = prog_builder(c, "ProgramBuilderSetShaders");
-    int n = (int)arg_x(c, 1);
-    const NVNshaderData *sd = arg_p(c, 2);
-    if (n < 0 || n > 6 || (n && !sd)) rt_fatal("nvn: ProgramBuilderSetShaders with %d stages at %p", n, (const void *)sd);
-    b->nstage = (uint32_t)n;
-    if (n) memcpy(b->sd, sd, (size_t)n * sizeof *sd);
-}
-// int nvnProgramBuilderGetShaderCount(const NVNprogramBuilder *b)
-NVN_API(nvnProgramBuilderGetShaderCount) { ret_x(c, prog_builder(c, "ProgramBuilderGetShaderCount")->nstage); }
-// Per-sample shading, debug data hashes, subroutine linkage and ray-tracing modules: the Vulkan path has no use for
-// them yet; each is logged so a game that depends on one shows up in a gfx trace.
-NVN_API(nvnProgramBuilderSetSampleShading) { NVN_LOG("ProgramBuilderSetSampleShading %d", (int)arg_x(c, 1)); }
-NVN_API(nvnProgramBuilderSetDebugDataHashes) { (void)c; }
-NVN_API(nvnProgramBuilderSetSubroutineLinkage) { NVN_LOG("ProgramBuilderSetSubroutineLinkage %p", arg_p(c, 1)); }
-NVN_API(nvnProgramBuilderSetRayTracingModules) { NVN_LOG("ProgramBuilderSetRayTracingModules %p", arg_p(c, 1)); }
-// NVNboolean nvnProgramInitializeFromBuilder(NVNprogram *p, const NVNprogramBuilder *b)
-NVN_API(nvnProgramInitializeFromBuilder) {
-    NVN_BLOCKING();
-    prog_t *o = arg_p(c, 0);
-    const prog_builder_t *b = arg_p(c, 1);
-    if (!o || !b || b->magic != NVN_PROG_BUILDER_MAGIC) rt_fatal("nvn: ProgramInitializeFromBuilder(%p, %p)", (void *)o, (const void *)b);
-    memset(o, 0, sizeof *o);
-    o->magic = NVN_PROG_MAGIC;
-    ret_x(c, prog_set_shaders(o, (int)b->nstage, b->sd));
-}
-
 // NVNboolean nvnProgramSetShadersExt(NVNprogram *p, int n, const NVNshaderDataExt *sd): no prototype in nvn.h; the
 // entries are {data, control, reserved} (0x18 bytes, reserved observed 0)
 typedef struct { NVNbufferAddress data; const void *control; uint64_t reserved; } shader_data_ext;
@@ -672,7 +642,7 @@ NVN_API(nvnWindowBuilderSetTextures) {
     b->ntex = n;
     for (int i = 0; i < n; i++) b->tex[i] = t[i];
 }
-// TOTK sets two active images; the limit bounds what WindowAcquireTexture hands out. No prototype in nvn.h.
+// A game may set two active images; the limit bounds what WindowAcquireTexture hands out. No prototype in nvn.h.
 NVN_API(nvnWindowBuilderSetNumActiveTextures) {
     int n = (int)arg_x(c, 1);
     if (n < 2 || n > 4) rt_fatal("nvn: unsupported active texture count %d", n);
@@ -710,16 +680,16 @@ NVN_API(nvnWindowInitialize) {
     }
     memcpy(o->tex, s->tex, sizeof o->tex);
     const tex_t *t0 = (const tex_t *)o->tex[0];
-    NVN_LOG("WindowInitialize %d textures, interval %d, first %ux%u format %#x", o->ntex, o->interval,
+    rt_log("nvn: WindowInitialize %d textures, interval %d, first %ux%u format %#x", o->ntex, o->interval,
             t0 ? t0->d.width : 0, t0 ? t0->d.height : 0, t0 ? t0->d.format : 0);
     ret_x(c, 1);
 }
-// void nvnWindowFinalize(NVNwindow *w): nothing to release (MNG lists it in g_nops)
+// void nvnWindowFinalize(NVNwindow *w): nothing to release
 NVN_API(nvnWindowFinalize) { (void)c; }
 NVN_API(nvnWindowSetPresentInterval) {
     win_t *o = WN(c);
     int v = (int)arg_x(c, 1);
-    if (o->interval != v) NVN_LOG("present interval %d -> %d", o->interval, v);
+    if (o->interval != v) rt_log("nvn: present interval %d -> %d", o->interval, v);
     o->interval = v;
 }
 // void nvnWindowSetCrop(NVNwindow *w, int x, int y, int w, int h)
@@ -733,15 +703,27 @@ NVN_API(nvnWindowSetCrop) {
 // ---------- Present pacing
 // The vsync thread ticks at a fixed 60 Hz whatever the monitor does, so one game frame lasts `interval` ticks. With
 // the real-time frame step (frame_rate.c) game speed does not depend on the interval, so a frame is shown when it is
-// ready, at most at the frame limit (TOTK_FPS_LIMIT: 30 to 360 per second or the monitor's rate): holding it to the
+// ready, at most at the frame limit (MTF_FPS_LIMIT: 30 to 240 per second or the monitor's rate): holding it to the
 // 2nd or 3rd tick would only add latency and 50 ms frames.
-#define VSYNC_HZ 60ull
+#define VSYNC_HZ ((uint64_t)gfx_vsync_hz())
+static volatile uint64_t g_present_period_ns;   // the last present's period, for the overlay
+
 static uint64_t present_period(const win_t *o) {
     if (frame_step_realtime()) return frame_step_cap_ns();
-    return (o->interval > 0 ? (uint64_t)o->interval : 1ull) * 1000000000ull / VSYNC_HZ;
+    uint64_t period = (o->interval > 0 ? (uint64_t)o->interval : 1ull) * 1000000000ull / VSYNC_HZ;
+    uint64_t background = gfx_background_period_ns();
+    if (background > period) period = background;
+    __atomic_store_n(&g_present_period_ns, period, __ATOMIC_RELAXED);
+    return period;
 }
 
-// MacNativeGames nvn_pace.h: the present slot is the previous slot plus one period. Early: wait for the slot. Late by
+// The frame rate the present pacing holds now (the game's swap interval, or the background limit); 0 before a present.
+double frame_step_limit_hz(void) {
+    uint64_t p = __atomic_load_n(&g_present_period_ns, __ATOMIC_RELAXED);
+    return p ? 1e9 / (double)p : 0;
+}
+
+// The present slot is the previous slot plus one period. Early: wait for the slot. Late by
 // less than a period: present at once and keep the phase. Behind by a period or more: restart from now, no catch-up
 // burst. Returns the ns to wait.
 static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
@@ -752,19 +734,26 @@ static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
     return 0;
 }
 
+// Waits on the OS's high-resolution timer until PLAT_WAIT_LATE_NS before the deadline (it wakes at most that late),
+// then spins the rest: at most about half a millisecond of CPU per frame, where whole-millisecond sleeps left up to
+// 2 ms of spinning.
 static void sleep_until(uint64_t deadline) {
     for (;;) {
         uint64_t now = kern_now_ns();
         if (now >= deadline) return;
         uint64_t d = deadline - now;
-        if (d >= 2000000) plat_sleep_ms((uint32_t)(d / 1000000 - 1));
-        else plat_yield();
+        if (d > PLAT_WAIT_LATE_NS + 50000) plat_wait_ns(d - PLAT_WAIT_LATE_NS);
+        else plat_pause();
     }
 }
 
 // NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow *w, NVNsync *s, int *index): blocks here, not in the
-// present, until the image's previous present plus one period has passed (the game often presents with a lock held).
-// That is the time the next frame goes to the display, so the image is free as soon as that time is reached.
+// present, until the image is free (the game often presents with a lock held). Without the frame queue that is the
+// image's previous present plus one period, when the next frame goes to the display, so a frame gets exactly one period
+// from acquire to present. Its present is a copy already on the queue by its display time, so with the frame queue
+// (MTF_FRAME_QUEUE=1) the image is free from that time on: the game draws the next frame while the previous one waits
+// for its turn, and a frame that takes up to one more period still makes its slot, for up to one frame more latency.
+// Town at 4K with DLAA at 60 on an RTX 5070: frames over 17.5 ms 1-8 per 30 s with the queue against 25-33 without.
 NVN_API(nvnWindowAcquireTexture) {
     win_t *o = arg_p(c, 0);
     sync_t *s = arg_p(c, 1);
@@ -789,12 +778,14 @@ NVN_API(nvnWindowAcquireTexture) {
 
 // void nvnQueuePresentTexture(NVNqueue *q, NVNwindow *w, int index): queues the copy and returns at once. The display
 // time comes from the pacer: the back end's present thread holds the host present until then (back-edge pacing, as the
-// Switch's display flips at vblank), so the present cadence does not follow the replay time; one period later the
-// image is free for the next acquire. Added latency: the slack of the frame (period minus its work), as on the Switch.
+// Switch's display flips at vblank), so the present cadence does not follow the replay time; one period later (at that
+// time with the frame queue) the image is free for the next acquire. Added latency: the slack of the frame (period minus
+// its work), as on the Switch, plus up to a period with the frame queue.
 NVN_API(nvnQueuePresentTexture) {
     win_t *o = arg_p(c, 1);
     int idx = (int)arg_x(c, 2);
     movie_tick(c);   // ov_movie.c: hand over decoded movie frames that are due; needs the core, so before the wait
+    res_present(c);  // resolution.c: a DLSS mode change sets the game's render size again, between frames
     NVN_BLOCKING();
     if (o->magic != NVN_WIN_MAGIC || idx < 0 || idx >= o->ntex || idx >= 4 || !o->tex[idx])
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);
@@ -804,7 +795,7 @@ NVN_API(nvnQueuePresentTexture) {
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, o->crop, slot);
     o->ticket[idx] = o->presents;
-    o->avail[idx] = slot + period;
+    o->avail[idx] = cfg_bool("MTF_FRAME_QUEUE") ? slot : slot + period;
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
     rt_frame_presented(t, o->presents);
 }

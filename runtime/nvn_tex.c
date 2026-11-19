@@ -1,6 +1,6 @@
 // NVN texture storage size / alignment / per-level offsets (Tegra X1 block-linear layout).
-// Ported from MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/nvn_tex.c @ b75be8cf; Apple parts dropped, layout math unchanged.
-// Based on deko3d source/dk_image.cpp (zlib license, Copyright (C) 2018-2020 fincs), reproduced below as in MNG's LICENSE.deko3d.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
+// The layout math is derived from code under the zlib licence, whose notice the licence asks to keep here:
 //
 // Copyright (C) 2018-2020 fincs
 //
@@ -22,11 +22,12 @@
 //    distribution.
 //
 // Storage size / alignment / per-level offsets of NVN textures (Tegra X1 block-linear layout).
-// Based on deko3d source/dk_image.cpp (zlib license, Copyright (C) 2018-2020 fincs), with NVN SDK integer rounding for automatic tile height:
+// Layout math under the zlib licence above, with NVN SDK integer rounding for automatic tile height:
 //   one GOB = 64 bytes × 8 rows = 512 bytes; the block height (tileH, in GOBs) is picked by 'height×1.5'; levels are accumulated with block alignment.
 // The game's packaged textures (SetPackagedTextureLayout) carry 8 bytes of layout parameters: byte 0 = log2 of the block height (derived by comparing 16 cases from the real game,
 // 4 of which differ from the automatic algorithm); when present it takes precedence.
 #include "cfg.h"
+#include "host.h"
 #include "nvn_tex.h"
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -110,7 +111,7 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
 static int minimal_layout_on(void) {
     static _Atomic int enabled = -1;
     int value = atomic_load(&enabled);
-    if (value < 0) { const char *e = cfg_get("TOTK_MINIMAL_LAYOUT"); value = !(e && !strcmp(e, "0")); atomic_store(&enabled, value); }
+    if (value < 0) { const char *e = cfg_get("MTF_MINIMAL_LAYOUT"); value = !(e && !strcmp(e, "0")); atomic_store(&enabled, value); }
     return value;
 }
 static uint64_t layer_bytes(const nvn_texdesc *d, unsigned dpl, int layered,

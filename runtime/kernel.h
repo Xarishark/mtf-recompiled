@@ -31,10 +31,7 @@ void kern_backtrace(const Cpu *c);
 // ---- probe support
 enum { KERN_WAIT_NONE, KERN_WAIT_LOCK, KERN_WAIT_CONDVAR, KERN_WAIT_ADDRESS, KERN_WAIT_SYNC };
 #define KERN_THREAD_EXITED 100
-int kern_thread_state(uint32_t handle);               // KERN_WAIT_*, KERN_THREAD_EXITED, or -1 for a bad handle
-void kern_core_stats(int *held_now, int *held_max);   // virtual-core holders now and the most ever at once
-void kern_core_stats_reset(void);
 extern volatile int kern_test_cv_old_order;           // WaitProcessWideKeyAtomic: release the lock before setting
-                                                      // the key (MNG's pre-fix order, the negative control)
+                                                      // the key (the order before the fix, the negative control)
 extern void (*volatile kern_test_cv_hook)(void);      // called right after the lock release, holding the kernel lock
 extern void (*volatile svc_test_exit_hook)(unsigned code);   // svc 0x07 calls it instead of ExitProcess (probes)

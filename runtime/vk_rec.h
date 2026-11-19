@@ -1,59 +1,39 @@
-// The recorder thread (vk_rec.c): the Vulkan calls the replay makes into its command buffer are made by a thread of
-// their own. vk_sync.c brackets each part of a submission with rec_begin (after vkBeginCommandBuffer, unless TOTK_REC_BEGIN=1: rec_begin_part) and rec_end
-// (before vkEndCommandBuffer). In between, every vkCmd* on that command buffer copies its arguments into a packet of a
-// ring, in call order, and the recorder makes the real call in that order; calls into any other command buffer (uploads,
-// the window, probes) are made at once. A call the ring has no packet for (a structure with a pNext chain) waits for
-// the recorder to empty the ring and is then made at once on the calling thread. rec_end returns once the recorder made
-// every call. vk_sync.c ends a part through rec_end_cb: the recorder makes the last calls into a part it recorded,
-// vkEndCommandBuffer included. A part that is not the submission's last is also submitted by the recorder (rec_submit),
-// in queue order, while the submitting thread records the next one; the last part's submit, which signals the
-// submission's value, and the command pool stay on the submitting thread.
+// The recorder thread (vk_rec.c): the Vulkan calls the replay makes into its command buffers are made by a thread of
+// their own. vk_sync.c begins each part of a submission (and the mirror prologue) with rec_begin, ends it with
+// rec_end_cb and submits it with rec_submit. In between, every vkCmd* on that command buffer copies its arguments
+// into a packet of a ring, in call order, and the recorder makes the real call in that order; calls into any other
+// command buffer (uploads, the window, probes) are made at once. A call the ring has no packet for (a structure with a
+// pNext chain) waits for the recorder to empty the ring and is then made at once on the calling thread. With
+// MTF_REC_END=1 (default) the recorder also begins, ends and submits the parts it records, so a part's command buffer
+// never changes threads; rec_submit returns once the recorder submitted it. The submitting thread allocates from the
+// part pool only while the recorder is idle (vk_sync.c claim_slot).
 //
 // Every vkCmd* the runtime calls through vk.h goes through the rc_* wrappers below (the macros at the end); the
-// extension commands called through function pointers have rec_* wrappers of their own. TOTK_VK_RECORDER=0 makes every
+// extension commands called through function pointers have rec_* wrappers of their own. MTF_VK_RECORDER=0 makes every
 // call at once (the same calls in the same order), =ab switches it with the A/B blocks (rt_ab), per submission part.
 //
-// The design follows Savage Wind Recomp's and LAS Recomp's recorder threads (LAS Recomp runtime/nvn/vulkan/record.c,
-// MIT, Copyright (c) 2026 Peiikai): the driver's work behind the commands depends on nothing the replay decides next.
+// The driver's work behind the commands depends on nothing the replay decides next.
 #pragma once
 
-void rec_begin(VkCommandBuffer cb);   // the submitting thread, sub_lock held
-// TOTK_REC_BEGIN=1: begins part cb (vkBeginCommandBuffer, the submit crumb, the start timestamp of query pair ts_pair
-// of ts_pool, -1 none) on the recorder, or here when there is no recorder, and calls rec_begin (1). Off: does nothing (0)
-// and the caller begins cb and calls rec_begin itself.
-int rec_begin_part(VkCommandBuffer cb, uint64_t fence, int ts_pair, VkQueryPool ts_pool);
+// The submitting thread, sub_lock held: vkBeginCommandBuffer (one submission) on cb and the breadcrumb crumb (0: none,
+// vk_crumbs.c) with number n, made by the recorder when it records the part, else at once; fence: the part's value.
+void rec_begin(VkCommandBuffer cb, uint64_t fence, int crumb, uint64_t n);
 void rec_end(void);                   // waits for the recorder; no-op when rec_begin did not start it
-// The end of part cb: the breadcrumb crumb (0: none, vk_crumbs.c), then vkEndCommandBuffer, both made by the recorder
-// when it records cb, and the wait for it (1); otherwise rec_end and the breadcrumb, and the caller ends cb (0).
+// The end of part cb: the breadcrumb crumb, then vkEndCommandBuffer, both queued for the recorder when it records cb
+// (1: rec_submit hands the part over); otherwise rec_end and the breadcrumb, and the caller ends cb (0).
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n);
+// vkQueueSubmit2 of si (at most two command buffers, one signal, no wait, no fence) under vk_queue_lock: by the
+// recorder after a part it ended, waited for, else at once.
+VkResult rec_submit(const VkSubmitInfo2 *si);
 void rec_drain(void);                 // waits until the recorder made every call queued so far
-// A part the recorder ended (rec_end_cb returned 1) that is not the submission's last: with TOTK_REC_SUBMIT=1 the
-// recorder submits pro (the part's mirror prologue, VK_NULL_HANDLE for none) and cb in queue order after its calls,
-// without a wait (1); 0 when the caller has to submit (no recorder, or TOTK_REC_SUBMIT at its default of 0). fence:
-// the submission's value, for the failure message.
-int rec_submit(VkCommandBuffer pro, VkCommandBuffer cb, uint64_t fence);
-void rec_submit_wait(void);           // any thread: returns once every part queued by rec_submit so far is submitted
-void rec_stats_log(void);             // TOTK_TRACE=perf: packets, bytes, drains and waits since the last call
-// The end of a sliced pass whose slices are still being recorded (vk_exec.c par_defer): between rec_capture_begin and
-// rec_capture_end the calls into the part being recorded are held back (both return the capture's position: the
-// capture is [begin, end)), and rec_capture_play makes them into cb on the calling thread once the slices are executed
-// there. The recorder must be idle for the play (rec_drain), and nothing may be captured that has no packet.
-// rec_capture_reset forgets every capture, once none is held.
-uint32_t rec_capture_begin(void);
-uint32_t rec_capture_end(void);
-void rec_capture_play(VkCommandBuffer cb, uint32_t lo, uint32_t hi);
-void rec_capture_reset(void);
-// Room for words more in the capture; the function that makes a capture's calls at once when one cannot be held (a call
-// without a packet, a full capture): it must end the capture.
-int rec_capture_room(uint32_t words);
-void rec_capture_spill(void (*fn)(void));
-// The recorder thread calls fn(arg) in order with the calls queued before it (1); 0: none, the caller calls it.
-int rec_call(void (*fn)(void *), void *arg);
-int rec_owns(VkCommandBuffer cb);     // the recorder records cb's calls (the producer's view)
+void rec_stats_log(void);             // MTF_TRACE=perf: packets, bytes, drains and waits since the last call
+// MTF_REC_CHECK=1 (debug, recorder on): vk_memory.c reports each object it defers (destroy 0, stamped tl) or destroys
+// (destroy 1) with the value the GPU reached (gpu); a packet of the part being recorded that still names it is logged
+// as a hazard when the object can go before the part ran. rec_check_log: the counts by kind and packet, at exit.
+enum { REC_IMAGE, REC_VIEW, REC_BUFFER, REC_KINDS };
+void rec_check_handle(int kind, uint64_t handle, int destroy, uint64_t tl, uint64_t gpu);
 
 // Extension commands called through device function pointers.
-void rec_crumb(VkCommandBuffer cb, int kind, uint64_t n);   // vk_crumb in order with this command buffer's packets
-void rec_checkpoint(VkCommandBuffer cb, const void *marker);   // vk_checkpoint in order with this command buffer's packets
 void rec_push_tpl(PFN_vkCmdPushDescriptorSetWithTemplateKHR fn, VkCommandBuffer cb, VkDescriptorUpdateTemplate tpl,
                   VkPipelineLayout layout, uint32_t set, const void *data, uint32_t bytes);   // data: bytes read by tpl
 void rec_push(PFN_vkCmdPushDescriptorSetKHR fn, VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout,
@@ -68,6 +48,7 @@ void rec_blend_equation(PFN_vkCmdSetColorBlendEquationEXT fn, VkCommandBuffer cb
                         const VkColorBlendEquationEXT *v);
 void rec_write_mask(PFN_vkCmdSetColorWriteMaskEXT fn, VkCommandBuffer cb, uint32_t first, uint32_t n,
                     const VkColorComponentFlags *v);
+// A pass mark (vk_crumbs.c vk_pass_mark_cmd: a buffer marker and a checkpoint), in order with the commands around it.
 
 #define REC_CMDS(X)                                                                                                       \
     X(BeginQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q, VkQueryControlFlags f), (cb, p, q, f))                  \
@@ -102,6 +83,7 @@ void rec_write_mask(PFN_vkCmdSetColorWriteMaskEXT fn, VkCommandBuffer cb, uint32
     X(EndRendering, (VkCommandBuffer cb), (cb))                                                                          \
     X(FillBuffer, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize n, uint32_t v), (cb, b, o, n, v))        \
     X(PipelineBarrier2, (VkCommandBuffer cb, const VkDependencyInfo *di), (cb, di))                                      \
+    X(ExecuteCommands, (VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *c), (cb, n, c))                           \
     X(PushConstants, (VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlags st, uint32_t o, uint32_t n,             \
                       const void *v), (cb, l, st, o, n, v))                                                              \
     X(ResetQueryPool, (VkCommandBuffer cb, VkQueryPool p, uint32_t f, uint32_t n), (cb, p, f, n))                        \
@@ -141,6 +123,7 @@ REC_CMDS(REC_DECL)
 #define vkCmdBindPipeline rc_vkCmdBindPipeline
 #define vkCmdBindVertexBuffers2 rc_vkCmdBindVertexBuffers2
 #define vkCmdBlitImage rc_vkCmdBlitImage
+#define vkCmdExecuteCommands rc_vkCmdExecuteCommands
 #define vkCmdClearAttachments rc_vkCmdClearAttachments
 #define vkCmdClearColorImage rc_vkCmdClearColorImage
 #define vkCmdClearDepthStencilImage rc_vkCmdClearDepthStencilImage

@@ -1,4 +1,3 @@
-// Adapted from LAS Recomp runtime/simd.h @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
 // Portable C lowering of AArch64 FP / AdvSIMD / crypto / CRC32 (tools/simd_c.py emits calls with constant
 // fields; everything is always_inline so the size/lane/op switches fold at -O1).
 // Semantics follow the ARM pseudocode, not the host: NaN propagation (first signalling NaN quietened, then
@@ -8,6 +7,7 @@
 // FPCR.AHP is honoured by the half-precision conversions. Host assumptions: IEEE binary32/64, MXCSR in
 // round-to-nearest outside the slow paths, with FTZ|DAZ equal to FPCR.FZ (cpu.h rt_fpcr_sync keeps it so); fma must be
 // correctly rounded: -march=x86-64-v3 has the FMA instruction, and the v2 build links runtime/fma.c for it.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #pragma once
 #include <fenv.h>
 #include <immintrin.h>

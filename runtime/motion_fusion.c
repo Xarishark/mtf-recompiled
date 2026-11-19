@@ -1,5 +1,3 @@
-// Adapted from MacNativeGames games/totk/runtime/motion_fusion.c @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames
-// contributors).
 // Six-axis sensor states (nn::hid::SixAxisSensorState) from gyro and accelerometer samples. Input per sample, in the
 // Switch controller frame (x to the right, y toward the top edge, z out of the face): acceleration in G including
 // gravity, as gravity reads (lying face up z = -1 G), and rotation rate in rad/s. Output per sample, as the Switch
@@ -10,6 +8,7 @@
 // gyro's bias. The newest MOTION_RING samples are kept; reads are newest first. A restart (StartSixAxisSensor) drops
 // the samples before it: reads return nothing until the next sample, which starts a fresh frame and angle; sampling
 // numbers go on. The feeding thread writes, guest threads read, both under the instance's SRW lock.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,11 +143,3 @@ int motion_read(MotionFusion *m, MotionState *out, int max, uint64_t now) {
     return n;
 }
 
-void motion_restart(MotionFusion *m) {
-    plat_mutex_lock(&m->lock);
-    m->restart = 1;
-    m->first = m->produced;
-    m->last_ns = 0;   // the first sample after the restart integrates nothing across the stop
-    memset(m->angle, 0, sizeof m->angle);
-    plat_mutex_unlock(&m->lock);
-}

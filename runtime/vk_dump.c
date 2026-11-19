@@ -1,35 +1,38 @@
-// TOTK_DUMP=<frame>: a frame dump for the Vulkan back end, which RenderDoc cannot capture (it hides
+// MTF_DUMP=<frame> (or "key": the frame after each F12 press in the game window, each press into a new folder,
+// dump-f12-<time>-<n> or <MTF_DUMP_DIR>-<n>; MTF_DUMP_SEQ=<n> dumps n consecutive frames from there, MTF_DUMP_MINW=<w>
+// copies only images at least w texels wide): a frame dump for the Vulkan back end, which RenderDoc cannot capture (it hides
 // VK_EXT_external_memory_host). Between presents frame-1 and frame, the replay's command buffers also copy, after each
 // render pass, its colour and depth targets and, after each dispatch, the storage images it writes into host buffers;
 // the completion thread turns them into 8-bit PNGs once the submission is done. 3D textures (LUTs, volumes) sampled or
-// written in the frame are copied once each, slices side by side. Files in TOTK_DUMP_DIR (default "dump"):
+// written in the frame are copied once each, slices side by side. Files in MTF_DUMP_DIR (default "dump"):
 //   pass_<seq>_t<i>_<w>x<h>_<vkformat>_<name>.png   colour target i (td: depth; img<slot>: storage image; lut<id>: 3D;
 //                                                    a BC target drawn through a block view: its blocks as that view)
 //   ..._tm.png                                       float formats: x/(1+x) of the same image (the plain one clamps)
-//   ..._nan.png                                      an image with NaN texels: those in magenta over the _tm image
-//                                                    at a third of its brightness
 //   passes.txt   per pass or dispatch: targets, draws, each distinct pipeline + texture set with its shaders' SPIR-V
 //                hashes (sh_<hash>.spv written once) and the bound textures with their samplers
 //   images.txt   per image: channel min/max, distinct texel values over the image and over its top quarter
 // Sampled 8-bit 2D textures up to TEX2D_CAP texels are copied once each as pass_<seq>_tex<id>_... at the end of the pass
 // that samples them; texture lines carry the storage address, mirror state, upload count and the image's and slot's
-// swizzle. Copies and texture clears are logged as "copy/clear after pass N". TOTK_DUMP_LOG=<from> also logs the
-// frames from..frame-1 to passes.txt, with PNGs only of targets up to 64K texels. TOTK_DUMP_BUF=<addr>:<size>[:...]
+// swizzle. Copies and texture clears are logged as "copy/clear after pass N". MTF_DUMP_LOG=<from> also logs the
+// frames from..frame-1 to passes.txt, with PNGs only of targets up to 64K texels. MTF_DUMP_BUF=<addr>:<size>[:...]
 // snapshots one GPU buffer range after every logged pass (buf_<pass>.bin and bufs.txt, see buf_snap).
+// MTF_DUMP_SSBO=1: after each dispatch of the dump frame, every bound compute storage buffer as the GPU sees it
+// (first 4 MiB) goes to pass_<seq>_ssbo<k>_<addr>.bin (ssbo_snap).
 // PNGs are opaque (alpha dropped). Integer formats are scaled by the image maximum, depth by its min..max range, SNORM
 // as x/2+1/2, UNORM and sRGB bytes written as stored. Caps: MAX_PASSES passes copied, PNG_CAP bytes of PNGs.
-// TOTK_DUMP_TEX=<id>|<w>x<h>[,...]: those texture slots, or 2D textures of that size, are copied where first sampled,
+// MTF_DUMP_TEX=<id>|<w>x<h>[,...]: those texture slots, or 2D textures of that size, are copied where first sampled,
 // whatever their format.
-// TOTK_DUMP_UBO=1: each listed pipeline also prints the first 16 vec4 of its user uniform blocks (c3 and up), read from
-// guest memory when the entry is listed. A block the submission rewrites with UpdateUniformBuffer shows its value from
+// MTF_DUMP_UBO=<n>: each listed pipeline also prints the first n vec4 of its user uniform blocks (c3 and up; 1 means 16,
+// the cap is 4096), read from guest memory when the entry is listed. A block the submission rewrites with UpdateUniformBuffer shows its value from
 // before the submission (vk_exec_draw.c upd_note).
-// TOTK_DUMP_SKIP_RUNS=1: a render pass with the same targets as the render pass before it is logged but not copied
+// MTF_DUMP_SKIP_RUNS=1: a render pass with the same targets as the render pass before it is logged but not copied
 // (the terrain decals draw one pass each into the G-buffer and would use up both caps).
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "cfg.h"
 #include "host.h"
@@ -46,12 +49,16 @@
 #define TEX2D_CAP (1u << 20)        // texels of a sampled 2D texture that is dumped
 
 int vk_dump_armed;
-static uint64_t dump_frame, log_from;   // log_from: TOTK_DUMP_LOG, first frame logged to passes.txt without images
+static int key_mode;                    // MTF_DUMP=key: each F12 sets dump_frame (vk_dump_request)
+static uint64_t dump_frame, dump_last, log_from;   // the dump's first and last frame (MTF_DUMP_SEQ); log_from:
+                                                   // MTF_DUMP_LOG, first frame logged to passes.txt without images
+static int seq_frames = 1;                         // MTF_DUMP_SEQ: consecutive frames per dump
+static uint32_t min_w;                             // MTF_DUMP_MINW: images narrower than this are logged, not copied
 static char dir[400];
 static FILE *passes_f, *images_f;
 static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
-static int skip_runs, dump_ubo;        // TOTK_DUMP_SKIP_RUNS, TOTK_DUMP_UBO
-static uint32_t want_tex[16][2];       // TOTK_DUMP_TEX: slot id and 0, or width and height
+static int skip_runs, dump_ubo;        // MTF_DUMP_SKIP_RUNS, MTF_DUMP_UBO (vec4 per block, 0 for none)
+static uint32_t want_tex[16][2];       // MTF_DUMP_TEX: slot id and 0, or width and height
 static int nwant_tex;
 static uint64_t last_targets;          // targets_sig of the last render pass; 0 after a dispatch
 static const char *pass_skip;          // why the current pass copies nothing, or NULL
@@ -220,8 +227,8 @@ static void write_images(const Job *j) {
     uint32_t pw = j->w * j->d, ph = j->h;
     uint64_t n = (uint64_t)pw * ph;
     float *px = malloc(n * 16);
-    uint8_t *out = malloc(n * 4), *nanm = calloc(n, 1);
-    if (!px || !out || !nanm) rt_fatal("vk_dump: out of memory for %s", j->name);
+    uint8_t *out = malloc(n * 4);
+    if (!px || !out) rt_fatal("vk_dump: out of memory for %s", j->name);
     float mn[4] = {INFINITY, INFINITY, INFINITY, INFINITY}, mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
     uint64_t nans = 0;
     for (uint32_t z = 0; z < j->d; z++)
@@ -230,7 +237,7 @@ static void write_images(const Job *j) {
                 float *o = px + 4 * ((uint64_t)y * pw + (uint64_t)z * j->w + x);
                 decode(j->f, j->map + (((uint64_t)z * j->h + y) * j->w + x) * j->f->bytes, o);
                 for (int c = 0; c < 4; c++) {
-                    if (isnan(o[c])) { nans++, o[c] = 0, nanm[(uint64_t)y * pw + (uint64_t)z * j->w + x] = 1; continue; }
+                    if (isnan(o[c])) { nans++, o[c] = 0; continue; }
                     if (o[c] < mn[c]) mn[c] = o[c];
                     if (o[c] > mx[c]) mx[c] = o[c];
                 }
@@ -259,14 +266,6 @@ static void write_images(const Job *j) {
         snprintf(path, sizeof path, "%s/%s%s.png", dir, j->name, pass ? "_tm" : "");
         rt_write_png(path, out, pw, ph);
     }
-    if (nans) {   // out holds the last image written: _tm for float formats
-        for (uint64_t i = 0; i < n; i++)
-            for (int c = 0; c < 3; c++) out[4 * i + c] = nanm[i] ? (c == 1 ? 0 : 255) : (uint8_t)(out[4 * i + c] / 3);
-        char path[600];
-        snprintf(path, sizeof path, "%s/%s_nan.png", dir, j->name);
-        rt_write_png(path, out, pw, ph);
-    }
-    free(nanm);
     uint64_t all = distinct(j, 0, j->h), top = distinct(j, 0, j->h / 4 ? j->h / 4 : 1);
     plat_mutex_lock(&img_lock);
     if (images_f) {
@@ -300,8 +299,9 @@ static const char *copy_region(VkExec *ex, VkImage image, VkFormat vf, VkImageAs
                                const char *name) {
     const Fmt *f = fmt_of(vf);
     if (!f) return "format not decoded";
-    if (__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1 != dump_frame && (uint64_t)w * h * d > 65536)
-        return "logged frame, large image";
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    if ((fr < dump_frame || fr > dump_last) && (uint64_t)w * h * d > 65536) return "logged frame, large image";
+    if (min_w && w < min_w) return "narrower than MTF_DUMP_MINW";
     if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
     else if (aspect != VK_IMAGE_ASPECT_COLOR_BIT) return "stencil only";
     uint64_t bytes = (uint64_t)w * h * d * f->bytes;
@@ -350,7 +350,7 @@ static const char *copy_out(VkExec *ex, VkImage image, VkFormat vf, VkImageAspec
     return copy_region(ex, image, vf, aspect, level, layer, 0, (VkExtent3D){w, h, d}, w, h, d, name);
 }
 
-// ---- TOTK_DUMP_BUF=<addr>:<size>[:<off>:<stride>:<w>:<h>]: after every pass and dispatch that is logged, the GPU
+// ---- MTF_DUMP_BUF=<addr>:<size>[:<off>:<stride>:<w>:<h>]: after every pass and dispatch that is logged, the GPU
 // buffer range is copied to a host buffer; when it differs from the previous copy it goes to buf_<pass>.bin, and
 // bufs.txt gets the changed bytes' extent plus, with the grid arguments, one map per dword of the w x h records of
 // `stride` bytes at `off` (each record a letter: its value's index in the table under the map).
@@ -360,7 +360,10 @@ static uint32_t bd_w, bd_h;
 static uint8_t *bd_prev;
 static FILE *bufs_f;
 
-typedef struct { VkBuffer buf; VmaAllocation alloc; const uint8_t *map; int pass; } BufJob;
+// name[0] != 0: a named snapshot (MTF_DUMP_SSBO), written raw to <name>.bin with no diffing.
+typedef struct { VkBuffer buf; VmaAllocation alloc; const uint8_t *map; int pass; uint64_t size; char name[96]; } BufJob;
+static int dump_ssbo;   // MTF_DUMP_SSBO=1: after each dispatch, every bound compute storage buffer (up to SSBO_CAP)
+#define SSBO_CAP (4ull << 20)
 
 static void buf_grid(const uint8_t *m) {
     for (uint32_t dw = 0; dw < bd_stride / 4; dw++) {
@@ -395,7 +398,12 @@ static void buf_done(void *arg) {
     BufJob *j = arg;
     vmaInvalidateAllocation(vk_ctx()->vma, j->alloc, 0, VK_WHOLE_SIZE);
     plat_mutex_lock(&img_lock);
-    if (bufs_f) {
+    if (j->name[0]) {
+        char path[600];
+        snprintf(path, sizeof path, "%s/%s.bin", dir, j->name);
+        FILE *f = fopen(path, "wb");
+        if (f) fwrite(j->map, 1, j->size, f), fclose(f);
+    } else if (bufs_f) {
         uint64_t lo = bd_size, hi = 0;
         for (uint64_t i = 0; i < bd_size; i++)
             if (!bd_prev || j->map[i] != bd_prev[i]) { if (i < lo) lo = i; hi = i + 1; }
@@ -417,21 +425,25 @@ static void buf_done(void *arg) {
     free(j);
 }
 
-static void buf_snap(VkExec *ex, int pass) {
-    if (!bd_size) return;
+// Copies [addr, addr+size) as the GPU sees it into a host buffer once the commands so far ran; buf_done takes it from
+// there. Returns NULL when copied, else why not.
+static const char *snap_range(VkExec *ex, uint64_t addr, uint64_t size, int pass, const char *name) {
     VkMemSpan s;
-    if (!vk_mem_resolve(bd_addr, bd_size, &s) || s.avail < bd_size) return;
+    if (!vk_mem_resolve(addr, size, &s)) return "not mapped";
+    if (s.avail < size) return "range crosses a mapping";
     VK_MEM_PICK(s);   // the GPU's view of the buffer
     BufJob *j = calloc(1, sizeof *j);
     if (!j) rt_fatal("vk_dump: out of memory");
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bd_size,
+    j->size = size;
+    if (name) snprintf(j->name, sizeof j->name, "%s", name);
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     VmaAllocationInfo info;
     if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &j->buf, &j->alloc, &info) != VK_SUCCESS || !info.pMappedData) {
         free(j);
-        return;
+        return "no host buffer";
     }
     j->map = info.pMappedData, j->pass = pass;
     VkMemoryBarrier2 mb[2] = {
@@ -444,19 +456,97 @@ static void buf_snap(VkExec *ex, int pass) {
          .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT}};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb[0]};
     vkCmdPipelineBarrier2(ex->cb, &di);
-    VkBufferCopy c = {s.offset, 0, bd_size};
+    VkBufferCopy c = {s.offset, 0, size};
     vkCmdCopyBuffer(ex->cb, s.buffer, j->buf, 1, &c);
     di.pMemoryBarriers = &mb[1];
     vkCmdPipelineBarrier2(ex->cb, &di);
     ex->recorded += 3;
     vk_completion_add(ex->fence, buf_done, j);
+    return NULL;
+}
+
+static void buf_snap(VkExec *ex, int pass) {
+    if (bd_size) snap_range(ex, bd_addr, bd_size, pass, NULL);
+}
+
+// MTF_DUMP_SSBO also lists the dump frame's draws that read a range some dispatch of the frame had bound as a storage
+// buffer, through a vertex buffer or a vertex-stage storage buffer, and copies those ranges at the end of their pass
+// (pass_<seq>_vread_<addr>.bin: what the draws read, since nothing in a pass writes them).
+typedef struct { uint64_t addr, size; int pass, slot; } CsRange;
+static CsRange cs_ranges[256];
+static int ncs_ranges;
+typedef struct { uint64_t addr, size, vs; int draw, draws, ssbo, idx, src_pass, src_slot; char layout[120]; } VRead;
+static VRead vreads[64];
+static int nvreads, vreads_over;
+
+static const CsRange *cs_overlap(uint64_t a, uint64_t n) {
+    for (int i = ncs_ranges - 1; i >= 0; i--)
+        if (a < cs_ranges[i].addr + cs_ranges[i].size && cs_ranges[i].addr < a + n) return &cs_ranges[i];
+    return NULL;
+}
+
+// layout: for a vertex buffer, its stream's stride and the attributes (location:nvn format@offset) that read it.
+static void vread_note(uint64_t a, uint64_t n, int ssbo, int idx, uint64_t vs, int draw, const VkPipeState *ps) {
+    if (!a || !n) return;
+    const CsRange *c = cs_overlap(a, n);
+    if (!c) return;
+    for (int i = 0; i < nvreads; i++)
+        if (vreads[i].addr == a && vreads[i].size == n && vreads[i].vs == vs) { vreads[i].draws++; return; }
+    if (nvreads == 64) { vreads_over++; return; }
+    VRead *v = &vreads[nvreads++];
+    *v = (VRead){a, n, vs, draw, 1, ssbo, idx, c->pass, c->slot, {0}};
+    if (ssbo) return;
+    size_t k = (size_t)snprintf(v->layout, sizeof v->layout, " stride %u divisor %u attrs", ps->vstream[idx].stride,
+                                ps->vstream[idx].divisor);
+    for (int i = 0; i < 16 && k < sizeof v->layout; i++) {
+        uint32_t w = ps->vattr[i];
+        if ((w & 0xff) && (int)(w >> 27) == idx)
+            k += (size_t)snprintf(v->layout + k, sizeof v->layout - k, " %d:%#x@%u", i, w & 0xff, (w >> 8) & 0x7ffff);
+    }
+}
+
+static void vread_flush(VkExec *ex, int pass) {
+    for (int i = 0; i < nvreads; i++) {
+        const VRead *v = &vreads[i];
+        uint64_t size = v->size < SSBO_CAP ? v->size : SSBO_CAP;
+        char name[96];
+        snprintf(name, sizeof name, "pass_%04d_vread_%llx", pass, (unsigned long long)v->addr);
+        const char *why = snap_range(ex, v->addr, size, pass, name);
+        fprintf(passes_f, "  draw %d (+%d like it) vs %016llx reads %s %d %#llx+%#llx%s, written by dispatch %d ssbo %d -> "
+                "%s.bin%s%s\n", v->draw, v->draws - 1, (unsigned long long)v->vs, v->ssbo ? "vs ssbo" : "vbuf", v->idx,
+                (unsigned long long)v->addr, (unsigned long long)v->size, v->layout, v->src_pass, v->src_slot, name,
+                why ? " skipped: " : "", why ? why : "");
+    }
+    if (vreads_over) fprintf(passes_f, "  ... %d more draw reads of dispatch output\n", vreads_over);
+    nvreads = vreads_over = 0;
+}
+
+// MTF_DUMP_SSBO: the compute stage's storage buffers after dispatch `pass`, as pass_<seq>_ssbo<k>_<addr>.bin.
+static void ssbo_snap(VkExec *ex, int pass) {
+    if (!dump_ssbo) return;
+    for (int k = 0; k < 16; k++) {
+        const p_bind_buf *b = &ex->ssbo[5][k];
+        if (!b->addr || !b->size) continue;
+        if (ncs_ranges < 256) cs_ranges[ncs_ranges++] = (CsRange){b->addr, b->size, pass, k};
+        uint64_t size = b->size < SSBO_CAP ? b->size : SSBO_CAP;
+        char name[96];
+        snprintf(name, sizeof name, "pass_%04d_ssbo%d_%llx", pass, k, (unsigned long long)b->addr);
+        const char *why = snap_range(ex, b->addr, size, pass, name);
+        fprintf(passes_f, "  ssbo %d %#llx+%#llx -> %s.bin%s%s%s\n", k, (unsigned long long)b->addr,
+                (unsigned long long)b->size, name, size < b->size ? " (first 4 MiB)" : "", why ? " skipped: " : "",
+                why ? why : "");
+    }
 }
 
 static int active(void) {
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    return !finished && (f == dump_frame || (log_from && f >= log_from && dump_frame != UINT64_MAX && f < dump_frame));   // TOTK_DUMP=key logs only once F9 chose the frame
+    return !finished && ((f >= dump_frame && f <= dump_last) || (log_from && f >= log_from && f < dump_frame));
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
+static int in_dump(void) {   // the frame being recorded is one of the dump's (not a MTF_DUMP_LOG frame)
+    uint64_t f = frame_now();
+    return f >= dump_frame && f <= dump_last;
+}
 
 typedef struct { char *s; size_t n, cap; } Str;
 
@@ -500,20 +590,23 @@ static uint64_t shader_hash(const GfxShader *s) {
 typedef struct { VkPipeline p; uint64_t th; int draws; char *text; } Ent;
 static Ent ents[MAX_ENTS];
 static int nents, ents_over, pass_draws;
-typedef struct { VkImage image; VkFormat format; uint32_t w, h, d; int id, is2d; } Lut;
+typedef struct { VkImage image; VkFormat format; uint32_t w, h, d, layer; int id, is2d; } Lut;
 static Lut luts[MAX_LUTS];          // queued for the next pass end or dispatch
 static int nluts;
 static VkImage luts_done[MAX_LUTS];
 static int nluts_done;
 
 static void queue_lut(const VkTexImage *t, int id) {
-    if (frame_now() != dump_frame) return;
+    if (!in_dump()) return;
     for (int i = 0; i < nluts_done; i++)
         if (luts_done[i] == t->image) return;
     if (nluts_done == MAX_LUTS) return;
     luts_done[nluts_done++] = t->image;
-    luts[nluts++] = (Lut){t->image, t->format, t->width, t->height, t->type == VK_IMAGE_TYPE_3D ? t->depth : 1, id,
-                          t->type != VK_IMAGE_TYPE_3D};
+    // every layer of an array or cube (a cube's six faces); nluts is bounded like luts_done
+    uint32_t layers = t->type == VK_IMAGE_TYPE_3D ? 1 : t->layers ? t->layers : 1;
+    for (uint32_t l = 0; l < layers && nluts < MAX_LUTS; l++)
+        luts[nluts++] = (Lut){t->image, t->format, t->width, t->height, t->type == VK_IMAGE_TYPE_3D ? t->depth : 1, l, id,
+                              t->type != VK_IMAGE_TYPE_3D};
 }
 
 // The uncompressed format of a BC format's block size, UNDEFINED for other formats: a BC texture is dumped as its raw
@@ -532,11 +625,11 @@ static void flush_luts(VkExec *ex, int n) {
         const Lut *l = &luts[i];
         char name[160];
         VkFormat bf = block_format(l->format);
-        snprintf(name, sizeof name, "pass_%04d_%s%d_%ux%ux%u_%d_%s%s", n, l->is2d ? "tex" : "lut", l->id, l->w, l->h, l->d,
-                 (int)l->format, fmt_name(l->format, fn), bf ? "_blocks" : "");
+        snprintf(name, sizeof name, "pass_%04d_%s%d_L%u_%ux%ux%u_%d_%s%s", n, l->is2d ? "tex" : "lut", l->id, l->layer, l->w, l->h,
+                 l->d, (int)l->format, fmt_name(l->format, fn), bf ? "_blocks" : "");
         const char *why = bf ? copy_region(ex, l->image, bf, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 0,
                                            (VkExtent3D){l->w, l->h, l->d}, (l->w + 3) / 4, (l->h + 3) / 4, l->d, name)
-                             : copy_out(ex, l->image, l->format, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, l->w, l->h, l->d, name);
+                             : copy_out(ex, l->image, l->format, VK_IMAGE_ASPECT_COLOR_BIT, 0, l->layer, l->w, l->h, l->d, name);
         fprintf(passes_f, "  %s tex %d -> %s.png%s%s\n", l->is2d ? "2D" : "3D", l->id, name, why ? " skipped: " : "",
                 why ? why : "");
     }
@@ -563,54 +656,6 @@ static uint64_t handle_of(const VkExec *ex, int st, int slot, int img) {
     return slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
 }
 
-// The vertex inputs of the entry's first draw: each attribute the vertex shader reads (NVN format, the Vulkan format
-// it is read as, offset, stream), its stream (stride, divisor, the bound buffer range) and the first 4 vertices of the
-// attribute as raw words and as floats. A mesh drawn with long sheets across the screen shows here whether its
-// positions arrive as data the transform can turn into those sheets.
-static void describe_vertex(Str *b, const VkExec *ex, const VkPipeState *s, const VkPipeInfo *info) {
-    // The fixed-function state the entry was drawn with, in NVN's numbering (nvn.h): which faces are culled, the depth
-    // test and clamp, and target 0's blend and channel mask. A mask built by drawing a volume the camera sits in
-    // depends on all of them.
-    sp(b, "    state: cull %u front %u fill %u | depth test %u write %u func %u clamp %u | stencil %u | blend en %#x "
-          "t0 src %u/%u dst %u/%u eq %u/%u mask %#x | prim %u restart %u\n",
-       (unsigned)s->poly.cull, (unsigned)s->poly.front, (unsigned)s->poly.mode, (unsigned)s->ds.dt, (unsigned)s->ds.dw,
-       (unsigned)s->ds.df, (unsigned)s->depth_clamp, (unsigned)s->ds.st, (unsigned)s->color.blend_en,
-       (unsigned)s->blend[0].src_rgb, (unsigned)s->blend[0].src_a, (unsigned)s->blend[0].dst_rgb,
-       (unsigned)s->blend[0].dst_a, (unsigned)s->blend[0].eq_rgb, (unsigned)s->blend[0].eq_a, s->chmask.mask & 15,
-       (unsigned)s->prim, (unsigned)s->prim_restart);
-    for (int i = 0; i < 16; i++) {
-        if (!(info->vs_inputs >> i & 1)) continue;
-        va_st a;
-        memcpy(&a, &s->vattr[i], sizeof a);
-        if (!a.fmt) {
-            sp(b, "    vertex a%d: no attribute (zero buffer)\n", i);
-            continue;
-        }
-        int type = 0;
-        VkFormat vf = vk_vertex_format((int)a.fmt, &type);
-        const vs_st *st = &s->vstream[a.stream & 15];
-        const NVNbufferRange *r = &ex->vbuf[a.stream & 15];
-        sp(b, "    vertex a%d: nvn fmt %#x -> vk %d type %d offset %#x stream %u stride %u divisor %u buf %#llx+%#llx", i,
-           (unsigned)a.fmt, (int)vf, type, (unsigned)a.offset, (unsigned)a.stream, st->stride, st->divisor,
-           (unsigned long long)r->address, (unsigned long long)r->size);
-        VkMemSpan ms;
-        if (r->address && vk_mem_resolve(r->address, 1, &ms) && !ms.alloc) {
-            uint64_t avail = r->size && r->size < ms.avail ? r->size : ms.avail;
-            for (uint32_t v = 0; v < 4; v++) {
-                uint64_t off = (uint64_t)a.offset + (uint64_t)v * st->stride;
-                if (off + 16 > avail) break;
-                const uint32_t *w = (const uint32_t *)(uintptr_t)(r->address + off);
-                float f[4];
-                memcpy(f, w, sizeof f);
-                sp(b, "\n      v%u: %08x %08x %08x %08x | %g %g %g %g", v, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]);
-            }
-        } else {
-            sp(b, " (not host-readable)");
-        }
-        sp(b, "\n");
-    }
-}
-
 // The textures, images and samplers of info's bindings; 3D textures are queued for a copy.
 static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) {
     static const char *stn[6] = {"vs", "fs", "?", "?", "?", "cs"};
@@ -632,9 +677,14 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             VkMemSpan ms;
             sp(b, "    %s ubo c%d addr %#llx size %#llx", stn[st], r->slot, (unsigned long long)u->addr, (unsigned long long)u->size);
             if (u->addr && vk_mem_resolve(u->addr, 1, &ms)) {
+                // the bytes the draw reads: guest memory or the submit snapshot, with the submission's updates so far
                 uint64_t n = u->size && u->size < ms.avail ? u->size : ms.avail;
-                const float *f = (const float *)(uintptr_t)u->addr;
-                for (uint64_t k = 0; k < 16 && (k + 1) * 16 <= n; k++)
+                if (n > (uint64_t)dump_ubo * 16) n = (uint64_t)dump_ubo * 16;
+                static float f[4096 * 4];   // rec_lock held
+                int src = vk_exec_ub_peek(ex, u->addr, f, (size_t)n);
+                sp(b, " (%s%s)", src & 2 ? "submit snapshot" : src & 4 ? "guest memory" : "unreadable",
+                   src & 1 ? " + updates of this submission" : "");
+                for (uint64_t k = 0; src && k < (uint64_t)dump_ubo && (k + 1) * 16 <= n; k++)
                     sp(b, "%s[%llu] %g %g %g %g", k % 4 ? " " : "\n      ", (unsigned long long)k, f[4 * k], f[4 * k + 1],
                        f[4 * k + 2], f[4 * k + 3]);
             } else {
@@ -651,14 +701,18 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             continue;
         }
         for (uint32_t k = 0; k < (bd->count ? bd->count : 1u); k++) {
-            int slot = r->slot + (int)k;
+            // a handle array (vk_exec_draw.c res_tex_slot): element k is texture slot (handle*4 + 8k - 0x20) / 8
+            uint32_t byte = (uint32_t)r->handle * 4 + 8 * k;
+            int arr = r->count > 1 && r->slot < 0;
+            int slot = !arr ? r->slot + (int)k : byte >= 0x20 && byte < 0x120 ? (int)(byte - 0x20) / 8 : -1;
             uint64_t h = handle_of(ex, st, slot, img);
-            sp(b, "    %s %s slot %d decl %s%s: ", stn[st], img ? "img" : "tex", slot, decl_type(r->type, dt),
-               img && (r->flags & 4) ? " store" : "");
+            if (arr && !h) continue;   // the dummy elements of a 301-element array
+            sp(b, "    %s %s slot %d%s decl %s%s: ", stn[st], img ? "img" : "tex", slot, arr ? " (array element)" : "",
+               decl_type(r->type, dt), img && (r->flags & 4) ? " store" : "");
             if (!h) { sp(b, "no handle (dummy)\n"); continue; }
             view_t v;
             int hv = 0;
-            const VkTexImage *t = vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(h), &v, &hv);
+            const VkTexImage *t = vk_texture_by_id(NVN_HANDLE_TEX(h), &v, &hv);
             if (!t) { sp(b, "tex %d unresolved (dummy)\n", NVN_HANDLE_TEX(h)); continue; }
             static const char *vt[] = {"1D", "2D", "3D", "cube", "1DArray", "2DArray", "cubeArray"};
             sp(b, "tex %d %s(%d) %ux%ux%u levels %u layers %u image %s", NVN_HANDLE_TEX(h), fmt_name(t->format, fn),
@@ -672,7 +726,7 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
                 // storage image: no sampler
             } else if (r->separate) {
                 sp(b, " | separate sampler (not replayed: default sampler)");
-            } else if (vk_sampler_params(&ex->samp_pool, NVN_HANDLE_SAMP(h), &s)) {
+            } else if (vk_sampler_params(NVN_HANDLE_SAMP(h), &s)) {
                 static const char *minn[] = {"N", "L", "N_mipN", "L_mipN", "N_mipL", "L_mipL"};
                 int mf = s.minf;
                 sp(b, " | samp %d: mag %s min %s (vk min %s mip %s) wrap %s/%s/%s aniso %g lod %g..%g bias %g%s",
@@ -689,7 +743,7 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             sp(b, " | addr %#llx mirrored %d gpu_owned %d bound %d uploads %u last-check %d written-since %d",
                (unsigned long long)t->addr, t->mirrored, t->gpu_owned, t->bound, ups, last, wr);
             uint8_t ssw[4] = {0};
-            vk_texture_slot_swz(&ex->tex_pool, NVN_HANDLE_TEX(h), ssw);
+            vk_texture_slot_swz(NVN_HANDLE_TEX(h), ssw);
             sp(b, " | swz image %u%u%u%u slot %u%u%u%u", t->swz[0], t->swz[1], t->swz[2], t->swz[3], ssw[0], ssw[1], ssw[2],
                ssw[3]);
             if (hv && v.set_swizzle) sp(b, " view %u%u%u%u", v.swz[0], v.swz[1], v.swz[2], v.swz[3]);
@@ -726,18 +780,16 @@ static uint64_t bindings_hash(const VkExec *ex, const VkPipeInfo *info) {
 }
 
 void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info) {
+    if (!active()) return;   // without the lock: MTF_DUMP=key keeps the hooks armed for the whole run
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
     pass_draws++;
+    if (ncs_ranges && in_dump()) {
+        uint64_t vh = shader_hash(s->vs);
+        for (int k = 0; k < 16; k++) vread_note(ex->vbuf[k].address, ex->vbuf[k].size, 0, k, vh, pass_draws, s);
+        for (int k = 0; k < 16; k++) vread_note(ex->ssbo[0][k].addr, ex->ssbo[0][k].size, 1, k, vh, pass_draws, s);
+    }
     uint64_t th = bindings_hash(ex, info);
-    // Cull, depth and blend are dynamic state on most hosts, so draws with one pipeline can still differ in them: they
-    // get entries of their own.
-    uint64_t fixed[4] = {0};
-    memcpy(&fixed[0], &s->poly, sizeof s->poly);
-    memcpy(&fixed[1], &s->ds, sizeof s->ds);
-    memcpy(&fixed[2], &s->blend[0], sizeof s->blend[0]);
-    fixed[3] = (uint64_t)s->depth_clamp << 32 | s->color.blend_en << 8 | (s->chmask.mask & 15);
-    for (int k = 0; k < 4; k++) th = (th ^ fixed[k]) * 0x100000001b3ull;
     for (int i = 0; i < nents; i++)
         if (ents[i].p == p && ents[i].th == th) {
             ents[i].draws++;
@@ -748,14 +800,8 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
         goto out;
     }
     Str b = {0};
-    sp(&b, "vs %016llx fs %016llx prog %llu prim %d", (unsigned long long)shader_hash(s->vs),
+    sp(&b, "vs %016llx fs %016llx prog %llu prim %d\n", (unsigned long long)shader_hash(s->vs),
        (unsigned long long)shader_hash(s->fs), (unsigned long long)(ex->prog ? ex->prog->serial : 0), s->prim);
-    for (uint32_t k = 0; ex->prog && k < ex->prog->nstage && k < 6; k++) {   // NVN 2 stages: their DKB_SHADER_DUMP names
-        uint64_t o = nvn2_origin((const uint8_t *)(uintptr_t)ex->prog->sd[k].data);
-        if (o) sp(&b, " nvn2 %016llx", (unsigned long long)o);
-    }
-    sp(&b, "\n");
-    describe_vertex(&b, ex, s, info);
     describe_bindings(&b, ex, info);
     ents[nents++] = (Ent){p, th, 1, b.s};
 out:
@@ -799,20 +845,25 @@ static uint64_t targets_sig(const VkExec *ex) {
 
 // Sets pass_skip for the pass or dispatch being logged and counts it when it copies.
 static void pass_decide(int same_targets) {
-    if (frame_now() != dump_frame) copied = 0;
+    static uint64_t copied_frame;   // the cap counts per frame; MTF_DUMP_LOG frames copy only small images
+    if (frame_now() != copied_frame) copied = 0, copied_frame = frame_now();
     pass_skip = copied >= MAX_PASSES ? "pass cap" : same_targets ? "same targets as the previous pass" : NULL;
     if (!pass_skip) copied++;
 }
 
 void vk_dump_pass_end(VkExec *ex) {
+    if (!active()) return;   // without the lock: MTF_DUMP=key keeps the hooks armed for the whole run
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
     int n = seq++;
     uint64_t sig = targets_sig(ex);
     pass_decide(skip_runs && sig == last_targets);
     last_targets = sig;
-    fprintf(passes_f, "pass %04d: render pass, draws %d, area %ux%u layers %u, fence %llu, frame %llu\n", n, pass_draws,
+    fprintf(passes_f, "pass %04d: render pass, draws %d, area %ux%u layers %u, fence %llu, frame %llu", n, pass_draws,
             ex->pass_w, ex->pass_h, ex->pass_layers, (unsigned long long)ex->fence, (unsigned long long)frame_now());
+    if (ex->has_vp)   // the game's last viewport 0 in the pass: a dynamic resolution renders into part of the target
+        fprintf(passes_f, ", viewport %gx%g at %g,%g", ex->vp[0][2], ex->vp[0][3], ex->vp[0][0], ex->vp[0][1]);
+    fprintf(passes_f, "\n");
     for (int i = 0; i < 8; i++) {
         if (!ex->color[i].tex) continue;
         char tag[8];
@@ -828,6 +879,7 @@ void vk_dump_pass_end(VkExec *ex) {
     if (!pass_skip) flush_luts(ex, n);
     else nluts = 0;
     buf_snap(ex, n);
+    vread_flush(ex, n);
     fflush(passes_f);
     nents = ents_over = pass_draws = 0;
 out:
@@ -836,6 +888,7 @@ out:
 
 void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPipeInfo *info, const p_dispatch *d) {
     (void)p;
+    if (!active()) return;
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
     int n = seq++;
@@ -854,7 +907,7 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
         uint64_t h = handle_of(ex, 5, bd->res->slot, 1);
         view_t v;
         int hv = 0;
-        const VkTexImage *t = h ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(h), &v, &hv) : NULL;
+        const VkTexImage *t = h ? vk_texture_by_id(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
         if (!t) continue;
         uint32_t lv = hv && v.set_levels ? v.base_level : 0, layer = hv && v.set_layers ? v.min_layer : 0;
         if (lv >= t->levels || layer >= t->layers) continue;
@@ -875,7 +928,23 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
     if (!pass_skip) flush_luts(ex, n);
     else nluts = 0;
     buf_snap(ex, n);
+    if (in_dump()) ssbo_snap(ex, n);
     fflush(passes_f);
+out:
+    plat_mutex_unlock(&rec_lock);
+}
+
+// MTF_DUMP_UBO: each UpdateUniformBuffer of the dump frames, with its first vec4s (at most 4).
+void vk_dump_update_ub(VkExec *ex, const p_update_ub *u) {
+    if (!dump_ubo || !active()) return;
+    plat_mutex_lock(&rec_lock);
+    if (!active()) goto out;
+    fprintf(passes_f, "update ub after pass %d, draw %d of the open pass%s: %#llx+%#llx", seq - 1, pass_draws,
+            ex->in_pass ? "" : " (outside a pass)", (unsigned long long)u->dst, (unsigned long long)u->size);
+    const float *f = (const float *)u->data;
+    for (uint64_t k = 0; k < 4 && (k + 1) * 16 <= u->size; k++)
+        fprintf(passes_f, " [%llu] %g %g %g %g", (unsigned long long)k, f[4 * k], f[4 * k + 1], f[4 * k + 2], f[4 * k + 3]);
+    fprintf(passes_f, "\n");
 out:
     plat_mutex_unlock(&rec_lock);
 }
@@ -892,6 +961,7 @@ static void region_desc(const NVNcopyRegion *r, char *buf, size_t n) {
 }
 
 void vk_dump_copy(VkExec *ex, uint32_t op, const void *payload) {
+    if (!active()) return;   // without the lock: MTF_DUMP=key keeps the hooks armed for the whole run
     (void)ex;
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
@@ -934,35 +1004,15 @@ out:
 
 static void make_dirs(char *path) { plat_file_mkdir_p(path); }
 
-// TOTK_DUMP=key: no frame is dumped until F9 is pressed in the game window; then the frame after next is (one dump per
-// run). A frame number is hard to hit on a screen the player opens by hand, such as Bananza's map.
-static int dump_on_key;
+static const char *dir_base;   // MTF_DUMP_DIR, or NULL
+static int n_dumps;            // dumps opened in this run
 
-void vk_dump_request(void) {
-    if (!dump_on_key || finished) return;
-    uint64_t want = frame_now() + 2, none = UINT64_MAX;
-    if (__atomic_compare_exchange_n(&dump_frame, &none, want, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-        rt_log("vk_dump: F9: frame %llu goes to %s", (unsigned long long)want, dir);
-}
-
-void vk_dump_init(void) {
-    const char *e = cfg_get("TOTK_DUMP");
-    if (e && !strcmp(e, "key")) dump_on_key = 1, dump_frame = UINT64_MAX;
-    else if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
-    const char *lf = cfg_get("TOTK_DUMP_LOG");
-    if (lf && *lf) log_from = strtoull(lf, NULL, 10);
-    const char *sr = cfg_get("TOTK_DUMP_SKIP_RUNS");
-    skip_runs = sr && *sr && *sr != '0';
-    const char *du = cfg_get("TOTK_DUMP_UBO");
-    dump_ubo = du && *du && *du != '0';
-    const char *wt = cfg_get("TOTK_DUMP_TEX");
-    for (char *q = (char *)wt; q && *q && nwant_tex < 16; q += *q == ',') {
-        uint32_t *w = want_tex[nwant_tex++];
-        w[0] = (uint32_t)strtoul(q, &q, 10);
-        w[1] = *q == 'x' ? (uint32_t)strtoul(q + 1, &q, 10) : 0;
-    }
-    const char *d = cfg_get("TOTK_DUMP_DIR");
-    snprintf(dir, sizeof dir, "%s", d && *d ? d : "dump");
+// Opens the folder and logs of a new dump. MTF_DUMP=key: dump-f12-<time>-<n> (or <MTF_DUMP_DIR>-<n>), one per press.
+static void open_dump(void) {
+    n_dumps++;
+    if (key_mode && dir_base) snprintf(dir, sizeof dir, "%s-%d", dir_base, n_dumps);
+    else if (key_mode) snprintf(dir, sizeof dir, "dump-f12-%llu-%d", (unsigned long long)time(NULL), n_dumps);
+    else snprintf(dir, sizeof dir, "%s", dir_base ? dir_base : "dump");
     make_dirs(dir);
     char path[600];
     snprintf(path, sizeof path, "%s/passes.txt", dir);
@@ -970,7 +1020,56 @@ void vk_dump_init(void) {
     snprintf(path, sizeof path, "%s/images.txt", dir);
     images_f = fopen(path, "w");
     if (!passes_f || !images_f) rt_fatal("vk_dump: cannot write to %s", dir);
-    const char *bf = cfg_get("TOTK_DUMP_BUF");
+    snprintf(path, sizeof path, "%s/bufs.txt", dir);
+    if (bd_size && !(bufs_f = fopen(path, "w"))) bd_size = 0;
+}
+
+// What one dump accumulates, cleared before the next (rec_lock held, no dump active).
+static void dump_reset(void) {
+    seq = copied = 0;
+    png_bytes = 0;
+    last_targets = 0;
+    pass_skip = NULL;
+    for (int i = 0; i < nents; i++) free(ents[i].text);
+    nents = ents_over = pass_draws = 0;
+    nluts = nluts_done = 0;
+    ncs_ranges = nvreads = vreads_over = 0;
+    free(bd_prev);
+    bd_prev = NULL;
+}
+
+void vk_dump_init(void) {
+    const char *e = cfg_get("MTF_DUMP");
+    if (!e || !*e) return;
+    if (!strcmp(e, "key")) key_mode = 1, dump_frame = dump_last = UINT64_MAX;   // vk_dump_request sets the frames
+    else if (!(dump_frame = strtoull(e, NULL, 10))) return;
+    const char *sq = cfg_get("MTF_DUMP_SEQ");
+    seq_frames = sq && *sq ? atoi(sq) : 1;
+    if (seq_frames < 1) seq_frames = 1;
+    if (seq_frames > 60) seq_frames = 60;
+    if (!key_mode) dump_last = dump_frame + (uint64_t)seq_frames - 1;
+    const char *mw = cfg_get("MTF_DUMP_MINW");
+    min_w = mw && *mw ? (uint32_t)strtoul(mw, NULL, 10) : 0;
+    const char *lf = cfg_get("MTF_DUMP_LOG");
+    if (lf && *lf && !key_mode) log_from = strtoull(lf, NULL, 10);   // key mode has no folder open between presses
+    const char *sr = cfg_get("MTF_DUMP_SKIP_RUNS");
+    skip_runs = sr && *sr && *sr != '0';
+    const char *du = cfg_get("MTF_DUMP_UBO");
+    dump_ubo = du && *du ? atoi(du) : 0;
+    if (dump_ubo == 1) dump_ubo = 16;
+    if (dump_ubo > 4096) dump_ubo = 4096;
+    if (dump_ubo < 0) dump_ubo = 0;
+    const char *ds = cfg_get("MTF_DUMP_SSBO");
+    dump_ssbo = ds && *ds && *ds != '0';
+    const char *wt = cfg_get("MTF_DUMP_TEX");
+    for (char *q = (char *)wt; q && *q && nwant_tex < 16; q += *q == ',') {
+        uint32_t *w = want_tex[nwant_tex++];
+        w[0] = (uint32_t)strtoul(q, &q, 10);
+        w[1] = *q == 'x' ? (uint32_t)strtoul(q + 1, &q, 10) : 0;
+    }
+    const char *d = cfg_get("MTF_DUMP_DIR");
+    dir_base = d && *d ? d : NULL;
+    const char *bf = cfg_get("MTF_DUMP_BUF");
     if (bf && *bf) {
         char *q;
         bd_addr = strtoull(bf, &q, 0);
@@ -980,20 +1079,37 @@ void vk_dump_init(void) {
         if (*q == ':') bd_w = (uint32_t)strtoul(q + 1, &q, 0);
         if (*q == ':') bd_h = (uint32_t)strtoul(q + 1, &q, 0);
         if (!bd_w || !bd_h) bd_stride = 0;
-        snprintf(path, sizeof path, "%s/bufs.txt", dir);
-        if (bd_size && !(bufs_f = fopen(path, "w"))) bd_size = 0;
     }
+    if (!key_mode) open_dump();
     vk_dump_armed = 1;
-    if (dump_on_key) rt_log("vk_dump: press F9 in the game window to dump the frame after next to %s", dir);
-    else rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+    if (key_mode) rt_log("vk_dump: each F12 in the game window dumps the next %d frame(s) to a new dump-f12-* folder",
+                         seq_frames);
+    else rt_log("vk_dump: frames %llu..%llu go to %s", (unsigned long long)dump_frame, (unsigned long long)dump_last, dir);
+}
+
+// MTF_DUMP=key: an F12 press in the game window (gfx_window_win.c) dumps the frames after it (MTF_DUMP_SEQ, default 1)
+// into a new folder; a press while a dump runs is ignored.
+void vk_dump_request(void) {
+    if (!key_mode) return;
+    plat_mutex_lock(&rec_lock);
+    if (dump_frame == UINT64_MAX) {
+        dump_reset();
+        open_dump();
+        finished = 0;
+        dump_frame = frame_now() + 1;
+        dump_last = dump_frame + (uint64_t)seq_frames - 1;
+        rt_log("vk_dump: F12: frames %llu..%llu go to %s", (unsigned long long)dump_frame, (unsigned long long)dump_last,
+               dir);
+    }
+    plat_mutex_unlock(&rec_lock);
 }
 
 void vk_dump_present(uint64_t frame) {
-    if (frame != dump_frame) return;
+    if (frame != dump_last) return;
     plat_mutex_lock(&rec_lock);
     finished = 1;
     plat_mutex_unlock(&rec_lock);
-    vk_sync_finish();   // the frame's copies are converted and written
+    vk_sync_finish();   // the frames' copies are converted and written
     plat_mutex_lock(&img_lock);
     fclose(images_f);
     images_f = NULL;
@@ -1001,72 +1117,11 @@ void vk_dump_present(uint64_t frame) {
     plat_mutex_unlock(&img_lock);
     fclose(passes_f);
     passes_f = NULL;
-    rt_log("vk_dump: frame %llu: %d passes and dispatches, about %llu MB of PNGs in %s", (unsigned long long)frame, seq,
-           (unsigned long long)(png_bytes >> 20), dir);
-}
-
-// ---- F7 continuous log capture (no PNG readback; logs host messages + per-pass & per-frame summaries)
-static int cap_log_on;
-static FILE *cap_log_file;
-static uint32_t cap_log_seq, cap_pass_seq;
-static uint64_t cap_log_frames, cap_last_ns;
-static char cap_log_path[256];
-static PlatMutex cap_toggle_lock = PLAT_MUTEX_INIT;
-
-int vk_capture_log_active(void) {
-    return __atomic_load_n(&cap_log_on, __ATOMIC_ACQUIRE);
-}
-
-void vk_capture_log_toggle(void) {
-    plat_mutex_lock(&cap_toggle_lock);
-    if (!cap_log_on) {
-        plat_file_mkdir_p("logs");
-        snprintf(cap_log_path, sizeof cap_log_path, "logs/capture_%u.log", ++cap_log_seq);
-        FILE *f = fopen(cap_log_path, "w");
-        if (!f) {
-            rt_log("capture: cannot open %s", cap_log_path);
-            plat_mutex_unlock(&cap_toggle_lock);
-            return;
-        }
-        cap_log_file = f;
-        cap_pass_seq = 0;
-        cap_log_frames = 0;
-        cap_last_ns = plat_now_ns();
-        rt_log_set_capture_file(f);
-        __atomic_store_n(&cap_log_on, 1, __ATOMIC_RELEASE);
-        rt_log("capture: F7 started -> %s (press F7 again to stop)", cap_log_path);
-    } else {
-        __atomic_store_n(&cap_log_on, 0, __ATOMIC_RELEASE);
-        rt_log("capture: F7 stopped (%llu frames) -> %s", (unsigned long long)cap_log_frames, cap_log_path);
-        rt_log_set_capture_file(NULL);
-        if (cap_log_file) {
-            fclose(cap_log_file);
-            cap_log_file = NULL;
-        }
+    rt_log("vk_dump: frames %llu..%llu: %d passes and dispatches, about %llu MB of PNGs in %s",
+           (unsigned long long)dump_frame, (unsigned long long)frame, seq, (unsigned long long)(png_bytes >> 20), dir);
+    if (key_mode) {   // ready for the next press
+        plat_mutex_lock(&rec_lock);
+        dump_frame = dump_last = UINT64_MAX;
+        plat_mutex_unlock(&rec_lock);
     }
-    plat_mutex_unlock(&cap_toggle_lock);
-}
-
-void vk_capture_log_pass(const VkExec *ex, uint32_t draws) {
-    if (!vk_capture_log_active() || !ex) return;
-    uint64_t td_addr = ex->depth.img ? ex->depth.img->addr : 0;
-    uint64_t t0_addr = ex->color[0].img ? ex->color[0].img->addr : 0;
-    rt_log_capture_printf("  pass %02u: %ux%u L=%u draws=%u nc=%d td=0x%llx(%d) t0=0x%llx(%d)\n",
-                          cap_pass_seq++, ex->pass_w, ex->pass_h, ex->pass_layers, draws, ex->pass_ncolor,
-                          (unsigned long long)td_addr, (int)ex->depth.format,
-                          (unsigned long long)t0_addr, (int)ex->color[0].format);
-}
-
-void vk_capture_log_frame(uint64_t frame) {
-    if (!vk_capture_log_active()) return;
-    uint64_t now = plat_now_ns();
-    double dt_ms = cap_last_ns ? (double)(now - cap_last_ns) / 1e6 : 0.0;
-    cap_last_ns = now;
-    cap_log_frames++;
-    cap_pass_seq = 0;
-    GfxStats st = gfx_stats();
-    rt_log_capture_printf("=== frame %llu (%.2f ms) nvn=%llu skipped=%llu val_err=%llu shader_fail=%llu ===\n",
-                          (unsigned long long)frame, dt_ms, (unsigned long long)st.nvn_calls,
-                          (unsigned long long)st.draws_skipped, (unsigned long long)st.validation_errors,
-                          (unsigned long long)st.shader_failures);
 }

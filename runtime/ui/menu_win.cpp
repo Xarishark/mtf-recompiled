@@ -1,18 +1,16 @@
-// Win32 adapter of the in-game menu: window messages to menu events (menu.h). The only Win32 code of the menu; the SDL3
-// window has its own (ui/menu_sdl.cpp). Window thread.
+// Win32 adapter of the in-game menu: window messages to menu events (menu.h). Window thread.
 //
-// F1 opens and closes the menu, Esc opens it (with the menu open, Esc goes to the menu, which closes). Esc also releases
-// the cursor (input_window_msg runs first; closing the menu gives the capture back). While the menu is open, its keys,
-// the mouse and focus changes go to it; the game polls the keyboard on its own (input_win.c) and gets nothing while the
-// menu is open (input_menu).
+// F1 opens and closes the menu, Esc opens it (with the menu open, Esc goes to the menu, which closes). While the menu is
+// open, its keys, the mouse and focus changes go to it; the game reads the keyboard on its own (input.c) and gets a
+// released controller while the menu is open (input_poll).
+//
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <windows.h>
 #include <windowsx.h>
 
 #include "imgui.h"
 
 extern "C" {
-#include "input.h"
-#include "input_win.h"
 #include "ui/menu.h"
 }
 
@@ -27,7 +25,6 @@ static ImGuiKey key_of(WPARAM vk) {
     case VK_ESCAPE: return ImGuiKey_Escape;
     case VK_TAB: return ImGuiKey_Tab;
     case VK_BACK: return ImGuiKey_Backspace;
-    case VK_DELETE: return ImGuiKey_Delete;   // clears a cell of the remapping rows
     case VK_HOME: return ImGuiKey_Home;
     case VK_END: return ImGuiKey_End;
     case VK_PRIOR: return ImGuiKey_PageUp;
@@ -45,15 +42,9 @@ extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res)
     switch (m) {
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        // bit 30: auto-repeat
-        // Esc with the menu open (opened by F1 too) is not a toggle here: it goes to the menu, which closes itself
+        // bit 30: auto-repeat. Esc with the menu open is not a toggle here: it goes to the menu, which closes itself
         if (!(l & (1 << 30)) && (w == VK_F1 || (w == VK_ESCAPE && !menu_is_open()))) {
             menu_toggle();
-            *res = 0;
-            return 1;
-        }
-        if (w == VK_F10) {   // also keeps F10 from opening the window menu
-            if (!(l & (1 << 30))) menu_perf_cycle();
             *res = 0;
             return 1;
         }
@@ -62,7 +53,7 @@ extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res)
     case WM_SYSKEYUP:
         if (!menu_is_open()) return 0;
         if (ImGuiKey k = key_of(w)) menu_event_key(k, m == WM_KEYDOWN || m == WM_SYSKEYDOWN);
-        return 0;   // F11 and the system keys keep working
+        return 0;   // F11, F12 and the system keys keep working
     case WM_MOUSEMOVE:
         if (menu_is_open()) menu_event_mouse_pos((float)GET_X_LPARAM(l), (float)GET_Y_LPARAM(l));
         return 0;
@@ -83,6 +74,7 @@ extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res)
     case WM_KILLFOCUS:
         menu_event_focus(m == WM_SETFOCUS);
         return 0;
+    default:
+        return 0;
     }
-    return 0;
 }

@@ -1,11 +1,10 @@
-// Ported from MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/nvn_hmap.h @ b75be8cf (MIT, Copyright (c) 2026
-// jhaizhou; origin d2r-mobile); Chinese duplicate comments dropped, code unchanged.
 //
 // Open-addressing hash table from fixed-length byte keys -> pointers (linear probing + backward shift on deletion, no
 // tombstones). The replay hot path uses it instead of a boxed dictionary: keys are not boxed, no allocation, a lookup
 // does only one hash + memcmp.
 // No locking: callers protect it with their own locks. Ownership of values belongs to the caller (put / del return the
 // replaced / deleted old value).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #pragma once
 #include <stdint.h>
 #include <stdlib.h>

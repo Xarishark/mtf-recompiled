@@ -17,25 +17,21 @@ from nso import Nso
 FIRST_BASE = 0x7000000000
 ALIGN = 0x200000
 ADDRESS_LIMIT = 1 << 39
-ORDER = ['main'] + [f'subsdk{i}' for i in range(10)] + ['sdk']
+ORDER = ['main'] + [f'subsdk{i}' for i in range(10)] + ['sdk', 'nro']
 
 
 def align_up(v, a=ALIGN):
     return (v + a - 1) & ~(a - 1)
 
 
-def layout(exefs, nros=None):
-    """[(name, base, size)] for the modules present in the ExeFS directory (and optional NROs), in load order."""
+def layout(exefs):
+    """[(name, base, size)] for the modules present in the ExeFS directory, in load order."""
     exefs = Path(exefs)
     out, base = [], FIRST_BASE
     for name in ORDER:
         path = exefs / name
         if not path.exists():
             continue
-        size = Nso(str(path)).size
-        out.append((name, base, size))
-        base = align_up(base + size)
-    for name, path in (nros or ()):
         size = Nso(str(path)).size
         out.append((name, base, size))
         base = align_up(base + size)

@@ -1,25 +1,84 @@
 // Vulkan instance, physical device choice, logical device, VMA, timeline semaphore and the validation messenger.
-// Ported from LAS Recomp, runtime/nvn/vulkan/device.c:33-330
-// (https://github.com/peiikai/LASRecomp @ da35b83a9611d046a9a681aae668d7085954d37f, MIT, Copyright (c) 2026 Peiikai),
-// without SDL. The VMA implementation is runtime/vk_vma.cpp (VMA is C++ only).
+// The VMA implementation is runtime/vk_vma.cpp (VMA is C++ only).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "cfg.h"
 #include "host.h"
 #include "vk.h"
-#include "vk_dlaa.h"
 #include "platform/platform.h"
+#include "vk_dlaa.h"
 
 static VkCtx g_vk;
 static int g_ready;
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
 
+// ---- GPU address map for device faults
+// VK_EXT_device_address_binding_report: the driver reports each bind and unbind of an object's GPU virtual range through
+// the debug messenger. The newest AB_N events stay in a ring written without a lock (one atomic add each), so a device
+// fault names the object behind its address and whether it was unbound before the fault, which is memory freed while
+// a submission still used it. One event per image, buffer or memory block made or freed, none per draw.
+// MTF_ADDR_REPORT=0 turns it off.
+#define AB_N (1u << 15)
+typedef struct { uint64_t seq, base, size, handle, issued, done; int32_t type; uint32_t unbind; } AbEvent;
+static AbEvent *ab_ring;
+static uint64_t ab_head;
+static int ab_want;   // the instance has the messenger for it (create_instance)
+
+static void ab_record(const VkDebugUtilsMessengerCallbackDataEXT *d) {
+    const VkDeviceAddressBindingCallbackDataEXT *b = NULL;
+    for (const VkBaseInStructure *p = d->pNext; p; p = p->pNext)
+        if (p->sType == VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) b = (const void *)p;
+    if (!b || !ab_ring) return;
+    uint64_t i = __atomic_fetch_add(&ab_head, 1, __ATOMIC_RELAXED);
+    AbEvent *e = &ab_ring[i & (AB_N - 1)];
+    __atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
+    e->base = b->baseAddress, e->size = b->size;
+    e->handle = d->objectCount ? d->pObjects[0].objectHandle : 0;
+    e->type = d->objectCount ? (int32_t)d->pObjects[0].objectType : 0;
+    e->unbind = b->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT;
+    e->issued = vk_sync_issued(), e->done = vk_sync_fence_done();
+    __atomic_store_n(&e->seq, i + 1, __ATOMIC_RELEASE);
+}
+
+static const char *ab_type_name(int32_t t, char *buf, size_t n) {
+    switch (t) {
+    case VK_OBJECT_TYPE_IMAGE: return "image";
+    case VK_OBJECT_TYPE_BUFFER: return "buffer";
+    case VK_OBJECT_TYPE_DEVICE_MEMORY: return "memory";
+    default: snprintf(buf, n, "object type %d", (int)t); return buf;
+    }
+}
+
+// The newest events whose range meets the precision-aligned range around a fault address, newest first.
+static void ab_report(uint64_t addr, uint64_t precision) {
+    if (!ab_ring) return;
+    uint64_t lo = precision > 1 ? addr & ~(precision - 1) : addr, hi = lo + (precision > 1 ? precision : 1);
+    uint64_t head = __atomic_load_n(&ab_head, __ATOMIC_ACQUIRE), n = head < AB_N ? head : AB_N;
+    int found = 0;
+    for (uint64_t k = 1; k <= n && found < 6; k++) {
+        const AbEvent *e = &ab_ring[(head - k) & (AB_N - 1)];
+        if (__atomic_load_n(&e->seq, __ATOMIC_ACQUIRE) != head - k + 1) continue;
+        if (e->base >= hi || e->base + e->size <= lo) continue;
+        found++;
+        char tn[32];
+        rt_log("vk: fault address %#llx: %s %#llx [%#llx, +%#llx] %s %llu address events before the fault, "
+               "submitted %llu, done %llu", (unsigned long long)addr, ab_type_name(e->type, tn, sizeof tn),
+               (unsigned long long)e->handle, (unsigned long long)e->base, (unsigned long long)e->size,
+               e->unbind ? "unbound" : "bound", (unsigned long long)k, (unsigned long long)e->issued,
+               (unsigned long long)e->done);
+    }
+    if (!found) rt_log("vk: fault address %#llx: no binding in the last %llu address events", (unsigned long long)addr,
+                       (unsigned long long)n);
+}
+
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
-    (void)type, (void)user;
+    (void)user;
+    if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT) { ab_record(d); return VK_FALSE; }
+    if (sev < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) return VK_FALSE;   // info, asked for the address events
     int err = (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0;
     if (err) plat_inc32(&g_vk.validation_errors);
     static volatile int32_t logged;
@@ -29,11 +88,6 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) {
     for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1;
-    return 0;
-}
-
-static int listed(const char *const *names, uint32_t n, const char *name) {
-    for (uint32_t i = 0; i < n; i++) if (!strcmp(names[i], name)) return 1;
     return 0;
 }
 
@@ -48,16 +102,13 @@ static int layer_present(const char *name) {
     return found;
 }
 
-// An instance extension the loader offers. Enabling one it does not offer fails vkCreateInstance outright, so
-// create_instance asks first: for the HDR10 colour-space extension, for what DLSS wants, and on macOS for the
-// portability enumeration extension.
 static int instance_ext_present(const char *name) {
     uint32_t n = 0;
     vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
     VkExtensionProperties *e = calloc(n ? n : 1, sizeof *e);
-    if (!e) return 0;
     vkEnumerateInstanceExtensionProperties(NULL, &n, e);
-    int found = has_ext(e, n, name);
+    int found = 0;
+    for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) found = 1;
     free(e);
     return found;
 }
@@ -77,71 +128,42 @@ static void mesa_cache_beside_exe(void) {
 
 static int create_instance(void) {
     mesa_cache_beside_exe();
-    const char *ext[28];
-    uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 8);
+    const char *ext[12];
+    uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 7);
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
-    int validate = cfg_bool("TOTK_VK_VALIDATION");
+    int validate = cfg_bool("MTF_VK_VALIDATION");
     if (validate && !layer_present(layers[0])) {
-        rt_log("vk: TOTK_VK_VALIDATION set but %s is not installed; continuing without", layers[0]);
+        rt_log("vk: MTF_VK_VALIDATION set but %s is not installed; continuing without", layers[0]);
         validate = 0;
     }
-    // The checkpoints also want debug utils, for the device address binding messenger (vk_crumbs.c).
-    int utils = validate;
-    const char *ck = cfg_get("TOTK_GPU_CHECKPOINTS");
-    if (!utils && ck && !strcmp(ck, "1")) {
-        uint32_t ni = 0;
-        vkEnumerateInstanceExtensionProperties(NULL, &ni, NULL);
-        VkExtensionProperties *ip = calloc(ni ? ni : 1, sizeof *ip);
-        if (ip) {
-            vkEnumerateInstanceExtensionProperties(NULL, &ni, ip);
-            utils = has_ext(ip, ni, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-            free(ip);
-        } else utils = 0;
-    }
-    if (utils) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    g_vk.debug_utils = utils;
-    if (vk_hdr_wanted() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {   // HDR10 surface formats
-        g_vk.has_swapchain_colorspace = 1;
+    const char *ar = cfg_get("MTF_ADDR_REPORT");
+    ab_want = !(ar && !strcmp(ar, "0")) && instance_ext_present(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (ab_want && !ab_ring && !(ab_ring = calloc(AB_N, sizeof *ab_ring))) ab_want = 0;
+    if (validate || ab_want) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    if (vk_hdr_wanted() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))   // HDR10 surface formats
         ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
-    }
-    if (vk_dlss_wanted()) {   // upscaler = dlss: what NVIDIA NGX asks for (vk_dlss.c), where the loader offers it
-        const char *dx[16];
-        int nd = vk_dlss_instance_exts(dx, 16);
-        for (int i = 0; i < nd && n_ext < 26; i++)
-            if (!listed(ext, n_ext, dx[i]) && instance_ext_present(dx[i])) ext[n_ext++] = dx[i];
-    }
-    vk_dlaa_instance_exts(ext, &n_ext, 26);
-    // MoltenVK is a portability implementation: the loader only lists it for an instance that asks for the portability
-    // enumeration extension, and the logical device then enables VK_KHR_portability_subset (create_device). Only on
-    // macOS: the Khronos loader offers the extension on Windows and Linux too, and asking there would let a portability
-    // device in, without the geometryShader requirement, where none was accepted before.
-    VkInstanceCreateFlags flags = 0;
-#ifdef __APPLE__
-    if (n_ext < 12 && instance_ext_present(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
-        ext[n_ext++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
-        flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-    }
-#endif
-    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "TotK Recomp",
-                             .pEngineName = "TotK Recomp", .apiVersion = VK_API_VERSION_1_3};
+    vk_dlaa_instance_exts(ext, &n_ext, 12);
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "MTF Recomp",
+                             .pEngineName = "MTF Recomp", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
-                               .flags = flags,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
     rdoc_init();
     VkResult r = vkCreateInstance(&ci, NULL, &g_vk.instance);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateInstance failed (%d); is a Vulkan 1.3 driver installed?", (int)r); return 0; }
     g_vk.validation = validate;
-    if (validate) {
+    if (validate || ab_want) {
         PFN_vkCreateDebugUtilsMessengerEXT f =
             (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.instance, "vkCreateDebugUtilsMessengerEXT");
         VkDebugUtilsMessengerCreateInfoEXT mi = {
             .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
-            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                               (ab_want ? VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT : 0),
+            .messageType = (validate ? VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT : 0) |
+                           (ab_want ? VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT : 0),
             .pfnUserCallback = debug_cb};
-        if (f) f(g_vk.instance, &mi, NULL, &g_vk.messenger);
+        if (!f || f(g_vk.instance, &mi, NULL, &g_vk.messenger) != VK_SUCCESS) ab_want = 0;
     }
     return 1;
 }
@@ -149,10 +171,6 @@ static int create_instance(void) {
 static const char *const k_required_ext[] = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
-
-// VK_KHR_portability_subset is in <vulkan/vulkan_beta.h>, which only the VK_ENABLE_BETA_EXTENSIONS define pulls in;
-// the subset itself is final and MoltenVK requires it on every device it exposes.
-#define VK_KHR_PORTABILITY_SUBSET_NAME "VK_KHR_portability_subset"
 
 // Name of the first missing required extension, or NULL.
 static const char *missing_required(VkPhysicalDevice pd) {
@@ -182,19 +200,18 @@ static int name_has(const char *s, const char *sub) {
     return 0;
 }
 
-// First discrete GPU with Vulkan 1.3, the required extensions and a graphics+present queue; TOTK_GPU_INDEX (index) or
-// TOTK_GPU_NAME (case-insensitive part of the name) overrides.
+// First discrete GPU with Vulkan 1.3, the required extensions and a graphics+present queue; MTF_GPU_INDEX (index) or
+// MTF_GPU_NAME (case-insensitive part of the name) overrides.
 static int pick_device(void) {
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(g_vk.instance, &n, NULL);
     if (!n) { rt_log("vk: no Vulkan device"); return 0; }
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
     vkEnumeratePhysicalDevices(g_vk.instance, &n, pd);
-    const char *e = cfg_get("TOTK_GPU_INDEX");   // no fixed default: the best device when unset
+    const char *e = cfg_get("MTF_GPU_INDEX");   // no fixed default: the best device when unset
     int want = e && *e ? atoi(e) : -1;
-    const char *name = cfg_get("TOTK_GPU_NAME");
+    const char *name = cfg_get("MTF_GPU_NAME");
     int best = -1, best_score = -1;
-    VkPhysicalDeviceProperties best_p = {0};
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
@@ -214,19 +231,11 @@ static int pick_device(void) {
         if (fam == UINT32_MAX) { rt_log("vk: gpu %u skipped: no graphics+compute+present queue family", i); continue; }
         int score = (int)i == want ? 100 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
                   : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
-        // The loader lists the same GPU twice when an old driver's ICD json is left behind, and the old driver can come
-        // first. On a tie in score between entries with the same vendor and device ID, the newer driverVersion wins.
-        // Follows ocarina-recomp runtime/vk_device.c (Hookshot, ef4c2b0), at 14566bd, GPL-3.0.
-        int dup = best >= 0 && score == best_score && p.vendorID == best_p.vendorID && p.deviceID == best_p.deviceID;
-        if (dup) rt_log("vk: gpu %u and gpu %d are the same GPU (leftover driver); keeping the newer driver",
-                        i, best);
-        if (score > best_score || (dup && p.driverVersion > best_p.driverVersion)) {
-            best_score = score; best = (int)i; best_p = p;
-        }
+        if (score > best_score) { best_score = score; best = (int)i; }
     }
     if (best < 0) {
-        if (want >= 0) rt_log("vk: TOTK_GPU_INDEX=%d is not usable (see above)", want);
-        else if (name && *name) rt_log("vk: no usable gpu matches TOTK_GPU_NAME=%s (see above)", name);
+        if (want >= 0) rt_log("vk: MTF_GPU_INDEX=%d is not usable (see above)", want);
+        else if (name && *name) rt_log("vk: no usable gpu matches MTF_GPU_NAME=%s (see above)", name);
         else rt_log("vk: no device with Vulkan 1.3 and the required extensions (see above)");
         free(pd);
         return 0;
@@ -274,8 +283,6 @@ typedef struct {
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceAddressBindingReportFeaturesEXT abr;
-    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pei;
-    VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT lrs;
 } FeatureChain;
 
 static int create_device(void) {
@@ -283,13 +290,9 @@ static int create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[48];
+    const char *ext[56];
     uint32_t n_ext = 0;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
-    // A portability implementation (MoltenVK) requires this one on every device it exposes; no feature of it is needed
-    // here, so its feature struct is left out and both sides stay at the defaults.
-    int portable = has_ext(ep, ne, VK_KHR_PORTABILITY_SUBSET_NAME);
-    if (portable) ext[n_ext++] = VK_KHR_PORTABILITY_SUBSET_NAME;
 
     FeatureChain *c = calloc(1, sizeof *c);
     void **tail = &c->f2.pNext;
@@ -311,12 +314,16 @@ static int create_device(void) {
     OPTIONAL_EXT(has_provoking_vertex, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, pv, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
     OPTIONAL_EXT(has_robustness2, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, rob2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
     OPTIONAL_EXT(has_device_fault, VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
-    // Ryujinx's SPIR-V declares fragment shader interlock whenever the host reports it (spirv_rewrite.c spirv_fixup_linked).
+    // The translator's SPIR-V declares fragment shader interlock whenever the host reports it (vk_pipeline.c spirv_fixup).
     OPTIONAL_EXT(has_fragment_shader_interlock, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, fsi,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT);
-    // Maxwell applies primitive restart to list draws too (docs/maxwell.md 5.2); core Vulkan only to strips and fans.
-    OPTIONAL_EXT(has_list_restart, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME, lrs,
-                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT);
+    // The GPU address map for device faults (ab_record), with the messenger made for it
+    int has_abr = 0;
+    if (ab_want && has_ext(ep, ne, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+        has_abr = 1;
+        ext[n_ext++] = VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME;
+        CHAIN(abr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT);
+    }
     // Feedback loops (vk.h VkCtx.feedback): the layout, and barriers inside dynamic rendering
     int has_fbl = 0, has_lr = 0;
     if (has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
@@ -327,6 +334,7 @@ static int create_device(void) {
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
+    vk_dlaa_device_exts(ep, ne, ext, &n_ext, 40);   // NGX's; the eight slots after it stay for the eight below
     // MTF's layer-picking geometry shaders are NV passthrough ones (GeometryShaderPassthroughNV)
     if (has_ext(ep, ne, VK_NV_GEOMETRY_SHADER_PASSTHROUGH_EXTENSION_NAME)) ext[n_ext++] = VK_NV_GEOMETRY_SHADER_PASSTHROUGH_EXTENSION_NAME;
     else rt_log("vk: no VK_NV_geometry_shader_passthrough: passthrough geometry shaders will not build");
@@ -334,28 +342,25 @@ static int create_device(void) {
     if (has_ext(ep, ne, "VK_NV_viewport_array2")) g_vk.has_viewport_array2 = 1, ext[n_ext++] = "VK_NV_viewport_array2";
     else rt_log("vk: no VK_NV_viewport_array2: shadow cascades past the first stay empty");
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
+    // a UNORM view of the sRGB swapchain images, for the menu overlay (gfx_present.c): ImGui blends in sRGB code values
+    if (has_ext(ep, ne, VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME)) {
+        g_vk.has_swapchain_mutable = 1;
+        ext[n_ext++] = VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME;
+    }
+    // GPU timestamps on the CPU clock (vk_sync.c): the perf line splits GPU idle time into waiting for a submission or not.
+    if (has_ext(ep, ne, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) { g_vk.has_calibrated = 2; ext[n_ext++] = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME; }
+    else if (has_ext(ep, ne, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) { g_vk.has_calibrated = 1; ext[n_ext++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME; }
     if (vk_hdr_wanted() && has_ext(ep, ne, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {   // the display's peak (vk_hdr_metadata)
         g_vk.has_hdr_metadata = 1;
         ext[n_ext++] = VK_EXT_HDR_METADATA_EXTENSION_NAME;
     }
     // GPU breadcrumbs for a lost device (vk_crumbs.c): AMD's drivers and RADV report it.
     if (has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) { g_vk.has_buffer_marker = 1; ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME; }
-    // NVIDIA's counterpart, opt-in because every pipeline bind then carries a checkpoint command.
-    {
-        const char *e = cfg_get("TOTK_GPU_CHECKPOINTS");
-        if (e && !strcmp(e, "1") && has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
-            g_vk.has_nv_checkpoints = 1;
-            ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
-            // Which VAs the driver maps and unmaps, to name the memory a fault address falls in (vk_crumbs.c).
-            if (g_vk.debug_utils && has_ext(ep, ne, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
-                g_vk.has_address_binding_report = 1;
-                ext[n_ext++] = VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME;
-                CHAIN(abr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT);
-            }
-            // The driver's compiled code size and ISA per pipeline, to map a faulting shader binary to our stages.
-            OPTIONAL_EXT(has_pipeline_exec_info, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, pei,
-                         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
-        }
+    // Pass marks on NVIDIA (vk_crumbs.c): checkpoints only with MTF_PASS_CRUMBS=1, since NVIDIA documents a cost for
+    // the extension. NVIDIA's drivers report it, AMD's do not.
+    if (vk_pass_marks_want_nv() && has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+        g_vk.has_nv_checkpoints = 1;
+        ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
     }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
@@ -365,6 +370,7 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
+    free(ep);
 
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
@@ -378,19 +384,6 @@ static int create_device(void) {
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
         if (!vk_caps_gpl(&c->gpl, &gp)) { *gpl_link = NULL; n_ext -= 2; }
     }
-    // upscaler = dlss on an NVIDIA GPU: the device extensions NVIDIA NGX asks for (vk_dlss.c), where the device has
-    // them, after the two above that n_ext -= 2 may take back. VK_EXT_buffer_device_address stays out when the core
-    // bufferDeviceAddress feature is on: both together are invalid (VUID-VkDeviceCreateInfo-pNext-04748).
-    if (vk_dlss_wanted() && g_vk.props.vendorID == 0x10de) {
-        const char *dx[16];
-        int nd = vk_dlss_device_exts(dx, 16);
-        for (int i = 0; i < nd && n_ext < 48; i++)
-            if (!listed(ext, n_ext, dx[i]) && has_ext(ep, ne, dx[i]) &&
-                !(c->f12.bufferDeviceAddress && !strcmp(dx[i], VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)))
-                ext[n_ext++] = dx[i];
-    }
-    if (g_vk.props.vendorID == 0x10de) vk_dlaa_device_exts(ep, ne, ext, &n_ext, 48);
-    free(ep);
     const VkPhysicalDeviceFeatures *h = &c->f2.features;
     const char *miss = NULL;
     if (!c->f12.timelineSemaphore) miss = "timelineSemaphore";
@@ -401,32 +394,24 @@ static int create_device(void) {
     else if (!h->shaderInt64) miss = "shaderInt64";
     else if (!h->samplerAnisotropy) miss = "samplerAnisotropy";
     else if (!h->independentBlend) miss = "independentBlend";
-    // Metal has no geometry stage, so MoltenVK reports no geometryShader. Only the pipelines that use one are lost
-    // (with a log line when they are created), which is better than refusing every device on a portability driver.
-    else if (!h->geometryShader && !portable) miss = "geometryShader";
+    else if (!h->geometryShader) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
-    if (!h->geometryShader)   // vk_pipeline.c skips the pipelines that need it (P.f_geometry)
-        rt_log("vk: %s has no geometry stage (portability subset): draws that need one are skipped", g_vk.props.deviceName);
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
-    if (g_vk.has_list_restart && !c->lrs.primitiveTopologyListRestart) g_vk.has_list_restart = 0;
-    rt_log("vk: primitive restart on list draws: %s", g_vk.has_list_restart ? "yes (primitiveTopologyListRestart)"
-           : "no: a list draw's restart index is fetched as a vertex");
-    if (g_vk.has_address_binding_report && !c->abr.reportAddressBinding) g_vk.has_address_binding_report = 0;
-    if (g_vk.has_pipeline_exec_info && !c->pei.pipelineExecutableInfo) g_vk.has_pipeline_exec_info = 0;
+    rt_log("vk: GPU address map for device faults: %s",
+           has_abr && c->abr.reportAddressBinding ? "on (VK_EXT_device_address_binding_report; MTF_ADDR_REPORT=0 turns it off)"
+           : !ab_want ? "off (MTF_ADDR_REPORT=0 or no VK_EXT_debug_utils)"
+                      : "unavailable (no VK_EXT_device_address_binding_report)");
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {
-        const char *e = cfg_get("TOTK_FEEDBACK");
+        const char *e = cfg_get("MTF_FEEDBACK");
         int layout_ok = has_fbl && has_lr && c->fbl.attachmentFeedbackLoopLayout && c->lr.dynamicRenderingLocalRead;
-        // Under RADV the feedback layout is not the default: an RX 6600 hung (ring gfx timeout, no page fault) on the
-        // first frame that used it (issue #122, a guess until a tester confirms); TOTK_FEEDBACK=layout opts back in.
-        int layout_wanted = e && !strcmp(e, "layout") ? 1 : !vk_caps.radv;
         g_vk.feedback = e && !strcmp(e, "0") ? VK_FEEDBACK_OFF
-                      : layout_ok && layout_wanted && !(e && !strcmp(e, "restart")) ? VK_FEEDBACK_LAYOUT : VK_FEEDBACK_RESTART;
+                      : layout_ok && !(e && !strcmp(e, "restart")) ? VK_FEEDBACK_LAYOUT : VK_FEEDBACK_RESTART;
         rt_log("vk: feedback loops: %s (attachmentFeedbackLoopLayout %d, dynamicRenderingLocalRead %d)",
                g_vk.feedback == VK_FEEDBACK_LAYOUT ? "feedback layout + by-region barrier"
-               : g_vk.feedback == VK_FEEDBACK_RESTART ? "pass restart + full barrier" : "off (TOTK_FEEDBACK=0)",
+               : g_vk.feedback == VK_FEEDBACK_RESTART ? "pass restart + full barrier" : "off (MTF_FEEDBACK=0)",
                has_fbl && c->fbl.attachmentFeedbackLoopLayout, has_lr && c->lr.dynamicRenderingLocalRead);
     }
 
@@ -476,10 +461,8 @@ static int create_device(void) {
 static long g_errors_total;     // outlives the device so the probe can print it after vk_shutdown
 
 static void destroy_all(void) {
-    vk_present_release();
+    gfx_window_release_vk();
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
-    if (g_vk.device) vk_clear_shutdown(g_vk.device);
-    if (g_vk.device) vk_dlss_release();
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
@@ -510,12 +493,6 @@ int vk_init(void) {
     return ok;
 }
 
-void vk_shutdown(void) {
-    plat_mutex_lock(&g_lock);
-    if (g_ready) { destroy_all(); g_ready = 0; }
-    plat_mutex_unlock(&g_lock);
-}
-
 VkCtx *vk_ctx(void) { return g_ready ? &g_vk : NULL; }
 
 static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
@@ -541,17 +518,9 @@ void vk_device_fault_report(VkResult r) {
     if (done) { plat_mutex_unlock(&lock); return; }
     done = 1;
     vk_crumbs_report();
+    vk_pass_marks_report();
+    vk_mem_fault_log();
     VkCtx *c = vk_ctx();
-    if (c && c->vma) {   // how full each heap was: a fault under memory pressure reads differently
-        VmaBudget b[VK_MAX_MEMORY_HEAPS];
-        vmaGetHeapBudgets(c->vma, b);
-        VkPhysicalDeviceMemoryProperties mp;
-        vkGetPhysicalDeviceMemoryProperties(c->phys, &mp);
-        for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
-            rt_log("vk: device lost: heap %u usage %llu MiB of budget %llu MiB (VMA blocks %llu MiB)", i,
-                   (unsigned long long)(b[i].usage >> 20), (unsigned long long)(b[i].budget >> 20),
-                   (unsigned long long)(b[i].statistics.blockBytes >> 20));
-    }
     PFN_vkGetDeviceFaultInfoEXT get =
         c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(c->device, "vkGetDeviceFaultInfoEXT")
                                  : NULL;
@@ -567,43 +536,18 @@ void vk_device_fault_report(VkResult r) {
     VkDeviceFaultVendorInfoEXT *vi = calloc(n.vendorInfoCount + 1, sizeof *vi);
     VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = ai, .pVendorInfos = vi};
     uint64_t binary = n.vendorBinarySize;
-    // The vendor binary is fetched only under DKB_GPU_CHECKPOINTS=1 and within a sane size; otherwise its size alone is
-    // logged. Per the spec the first call returns sizes and the second fills the data pointers.
-    void *bin = NULL;
-    if (vk_checkpoints_on() && binary > 0 && binary <= (64ull << 20)) bin = malloc((size_t)binary);
-    n.vendorBinarySize = bin ? binary : 0;
-    info.pVendorBinaryData = bin;
+    n.vendorBinarySize = 0;   // the vendor binary is not fetched; its size alone is logged
     if (q == VK_SUCCESS && ai && vi) q = get(c->device, &n, &info);
-    if (bin && (q == VK_SUCCESS || q == VK_INCOMPLETE)) {
-        // Best effort: any failure here is a log line only. The dump can hold derived shader code, so it stays in the
-        // local logs folder next to dkb.log and is never attached to reports.
-        const VkDeviceFaultVendorBinaryHeaderVersionOneEXT *h = bin;
-        if (n.vendorBinarySize >= sizeof *h)
-            rt_log("vk: device fault binary header: vendor %#x device %#x driver %#x app name offset %u app version %#x "
-                   "engine version %#x api version %#x", h->vendorID, h->deviceID, h->driverVersion, h->applicationNameOffset,
-                   h->applicationVersion, h->engineVersion, h->apiVersion);
-        const char *lp = rt_log_path();
-        char path[PLAT_PATH_MAX * 3 + 48];
-        const char *cut = lp ? strrchr(lp, '/') : NULL;
-        if (cut) {
-            snprintf(path, sizeof path, "%.*s/dkb-fault-%llu.bin", (int)(cut - lp), lp, (unsigned long long)time(NULL));
-            if (plat_file_write_atomic(path, bin, (size_t)n.vendorBinarySize))
-                rt_log("vk: device fault binary saved: %s (%llu bytes)", path, (unsigned long long)n.vendorBinarySize);
-            else rt_log("vk: device fault binary: cannot write %s", path);
-        } else rt_log("vk: device fault binary not saved (no log file)");
-    }
-    free(bin);
     if (q != VK_SUCCESS && q != VK_INCOMPLETE) {
         rt_log("vk: device lost; vkGetDeviceFaultInfoEXT failed (%d)", (int)q);
     } else {
         rt_log("vk: device fault: \"%s\" (%u address infos, %u vendor infos, vendor binary %llu bytes)", info.description,
                n.addressInfoCount, n.vendorInfoCount, (unsigned long long)binary);
         // The faulting access lies in the precision-aligned range around the reported address.
-        for (uint32_t i = 0; i < n.addressInfoCount; i++)
-        {
+        for (uint32_t i = 0; i < n.addressInfoCount; i++) {
             rt_log("vk: device fault address %u: %s at %#llx, precision %#llx", i, fault_address_type(ai[i].addressType),
                    (unsigned long long)ai[i].reportedAddress, (unsigned long long)ai[i].addressPrecision);
-            vk_crumbs_report_address(ai[i].reportedAddress);
+            ab_report(ai[i].reportedAddress, ai[i].addressPrecision);
         }
         for (uint32_t i = 0; i < n.vendorInfoCount; i++)
             rt_log("vk: device fault vendor info %u: \"%s\" code %#llx data %#llx", i, vi[i].description,
@@ -614,46 +558,3 @@ void vk_device_fault_report(VkResult r) {
     plat_mutex_unlock(&lock);
 }
 
-int vk_selftest(void) {
-    if (!vk_init()) return 1;
-    VkCtx *c = &g_vk;
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64 << 10,
-                             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
-    VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO, .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT};
-    VkBuffer buf;
-    VmaAllocation alloc;
-    VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &buf, &alloc, NULL);
-    if (r != VK_SUCCESS) { rt_log("vk selftest: vmaCreateBuffer failed (%d)", (int)r); return 2; }
-    vmaDestroyBuffer(c->vma, buf, alloc);
-
-    VkSemaphoreSignalInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = c->timeline, .value = 1};
-    if ((r = vkSignalSemaphore(c->device, &sig)) != VK_SUCCESS) { rt_log("vk selftest: vkSignalSemaphore failed (%d)", (int)r); return 3; }
-    uint64_t value = 1;
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &c->timeline,
-                              .pValues = &value};
-    if ((r = vkWaitSemaphores(c->device, &wi, 1000000000ull)) != VK_SUCCESS) { rt_log("vk selftest: vkWaitSemaphores failed (%d)", (int)r); return 4; }
-    uint64_t now = 0;
-    vkGetSemaphoreCounterValue(c->device, c->timeline, &now);
-    if (now != 1) { rt_log("vk selftest: timeline value %llu, expected 1", (unsigned long long)now); return 5; }
-    return 0;
-}
-
-// --probe-vkdevice (host.h)
-int probe_vkdevice(void) {
-    int rc = vk_selftest();
-    VkCtx *c = vk_ctx();
-    if (rc || !c) { printf("probe-vkdevice: FAILED (selftest %d)\n", rc ? rc : 1); vk_shutdown(); return 1; }
-    uint32_t v = c->props.apiVersion;
-    printf("probe-vkdevice: device %d \"%s\" api %u.%u.%u, gfx queue family %u, transfer family %u%s, host import alignment %#x\n",
-           c->device_index, c->props.deviceName, VK_API_VERSION_MAJOR(v), VK_API_VERSION_MINOR(v), VK_API_VERSION_PATCH(v),
-           c->gfx_family, c->xfer_family, c->xfer_shared ? " (shared queue)" : "", c->min_imported_host_alignment);
-    printf("probe-vkdevice: optional: custom_border=%d eds=%d eds2=%d eds3=%d vertex_input=%d cond_render=%d xfb=%d provoking=%d "
-           "robustness2=%d fault=%d budget=%d bda=%d interlock=%d validation=%d\n",
-           c->has_custom_border_color, c->has_eds, c->has_eds2, c->has_eds3, c->has_vertex_input_dynamic_state,
-           c->has_conditional_rendering, c->has_transform_feedback, c->has_provoking_vertex, c->has_robustness2,
-           c->has_device_fault, c->has_memory_budget, c->has_buffer_device_address, c->has_fragment_shader_interlock,
-           c->validation);
-    vk_shutdown();
-    printf("probe-vkdevice: %s (validation errors %ld)\n", g_errors_total ? "FAILED" : "passed", g_errors_total);
-    return g_errors_total ? 1 : 0;
-}

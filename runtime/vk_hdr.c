@@ -1,15 +1,21 @@
-// HDR output (hdr = 1, experimental): an HDR10 swapchain (Rec. 2020 primaries, PQ) and a final pass that lifts the
-// game's SDR picture into it. Settings: hdr (read at start), hdr_peak_nits (the display's peak), hdr_game_nits (the
-// picture's white, "paper white") and hdr_ui_nits (the in-game menu's white; the game's HUD is part of the picture and follows hdr_game_nits), the three read when the settings change. With
-// hdr = 0 nothing here runs and the present is what it was.
+// HDR output (MTF_HDR=1, read at start): an HDR10 swapchain (Rec. 2020 primaries, PQ) with the scene's highlights above
+// the SDR white. Settings: MTF_HDR_PEAK_NITS (the display's peak), MTF_HDR_PAPER_WHITE (the picture's white) and
+// MTF_HDR_UI_NITS (the HUD's and this menu's white), read again when the settings change. With MTF_HDR=0 nothing here
+// runs and the present is what it was.
 //
-// The present chain on an HDR10 swapchain: game -> FSR -> SMAA -> vk_hdr_record -> menu. FSR and SMAA work on an 8-bit
-// sRGB image of the swapchain's size (vk_hdr_mid) as on an SDR swapchain. vk_hdr_record then reads it, decodes the sRGB
-// curve, lifts the highlights above a knee towards the display's peak (shaders/hdr_encode.frag; all channels scale
-// together, so the hue stays), puts the picture's white at hdr_game_nits and writes PQ code values in Rec. 2020 to the
-// swapchain image. vk_hdr_ui_*: the in-game menu draws into an RGBA8 image and shaders/hdr_ui.frag blends it onto the
-// swapchain at hdr_ui_nits. The game is untouched and its window texture is 8-bit, so the lifted highlights are an
-// inverse tonemap of what the game already clipped, not the scene's real range.
+// MTF has no HDR output of its own: no shader of it encodes PQ or converts to Rec. 2020, and it calls none of the
+// system's HDR functions. Its scene is HDR until one pass: the tonemap, which takes the light target (r11g11b10f) and
+// the bloom, multiplies them by the exposure it measured, and maps them with ACES (Hill's fit) to 0..1 in an 8-bit sRGB
+// target; the FXAA pass copies that into the window texture and the HUD is drawn over it. So:
+// 1. vk_hdr_draw: the tonemap's draw (its fragment shader holds the fit's constants) gives its two textures and the
+//    exposure (c5.x), noted with the frame.
+// 2. vk_hdr_encode: on the present, shaders/hdr_compose.comp computes each pixel's SDR value again from those inputs;
+//    where the window texture holds that value the pixel is the scene and gets the HDR value of the same inputs (the
+//    game's curve up to 0.8, then a roll-off to the display's peak), anything else keeps its SDR value at the HUD's
+//    white. A frame without the tonemap (menus, movies) is SDR at the HUD's white (shaders/hdr_encode.comp).
+// 3. vk_hdr_ui_*: the in-game menu draws into an RGBA8 image and shaders/hdr_ui.frag blends it onto the swapchain.
+// The swapchain, metadata, encode and menu passes contain adapted code under the MIT licence: authors and licence texts
+// in THIRD_PARTY_NOTICES.md.
 #include "vk.h"
 
 #include <math.h>
@@ -24,20 +30,24 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "vk_exec.h"
+#include "vk_rec.h"
 #include "platform/platform.h"
+
+#define SLOTS 8
 
 // ---- settings
 
 static int g_wanted = -1;
 
 int vk_hdr_wanted(void) {
-    if (g_wanted < 0) g_wanted = cfg_bool("TOTK_HDR");
+    if (g_wanted < 0) g_wanted = cfg_bool("MTF_HDR");
     return g_wanted;
 }
 
 void vk_hdr_off(void) { g_wanted = 0; }
 
-// The three nits, read again when the settings change.
+// The three nits, read again when the settings change. The replay and the present thread read them: an update fills
+// the snapshot not in use and then publishes it.
 typedef struct { float peak, game, ui; } Nits;
 static struct { unsigned seen; int cur; Nits snap[2]; PlatMutex lock; } N = {.seen = ~0u, .lock = PLAT_MUTEX_INIT};
 
@@ -47,9 +57,9 @@ static Nits nits(void) {
         plat_mutex_lock(&N.lock);
         if (N.seen != v) {
             Nits *n = &N.snap[!N.cur];
-            n->peak = fmaxf((float)cfg_double("TOTK_HDR_PEAK_NITS"), 80.0f);
-            n->game = fmaxf((float)cfg_double("TOTK_HDR_GAME_NITS"), 80.0f);
-            n->ui = fmaxf((float)cfg_double("TOTK_HDR_UI_NITS"), 80.0f);
+            n->peak = fmaxf((float)cfg_double("MTF_HDR_PEAK_NITS"), 80.0f);
+            n->game = fmaxf((float)cfg_double("MTF_HDR_PAPER_WHITE"), 80.0f);
+            n->ui = fmaxf((float)cfg_double("MTF_HDR_UI_NITS"), 80.0f);
             __atomic_store_n(&N.cur, !N.cur, __ATOMIC_RELEASE);
             __atomic_store_n(&N.seen, v, __ATOMIC_RELEASE);
         }
@@ -58,10 +68,30 @@ static Nits nits(void) {
     return N.snap[__atomic_load_n(&N.cur, __ATOMIC_ACQUIRE)];
 }
 
-// ---- MTF tonemap input tracking (hdr_compose.comp)
+// The support buffer's HDR words (read only by a replaced tonemap shader, which MTF does not have): the picture's white
+// against the HUD's, the peak against the picture's white.
+void vk_hdr_support(float out[4]) {
+    Nits n = nits();
+    out[0] = n.game / n.ui;
+    out[1] = n.peak > n.game ? n.peak / n.game : 1.0f;
+    out[2] = out[3] = 0;
+}
 
-int vk_hdr_track;
+// The game's shaders run as they are: the HDR picture is made on the present (vk_hdr_encode).
+void vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words) { (void)spirv, (void)words; }
 
+// ---- 1. the tonemap's inputs
+
+int vk_hdr_track;                   // vk_exec_draw.c calls vk_hdr_draw: set at the first present with MTF_HDR=1
+static volatile int32_t g_active;   // the swapchain is HDR10 (gfx_present.c vk_hdr_set_active)
+
+void vk_hdr_set_active(int on) { plat_xchg32(&g_active, on); }
+int vk_hdr_active(void) { return plat_cas32(&g_active, 0, 0); }
+
+enum { SPV_OP_TYPE_FLOAT = 22, SPV_OP_CONSTANT = 43 };
+
+// 1 when the shader holds the ACES fit's constants: its input matrix (0.59719), the fit (0.983729, 0.4329510) and its
+// output matrix (1.60475): the tonemap, whatever its hash.
 static int has_aces(const GfxShader *s) {
     uint64_t n = 0;
     const uint32_t *w = gfx_shader_spirv(s, &n);
@@ -71,8 +101,8 @@ static int has_aces(const GfxShader *s) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) return 0;
         const uint32_t *a = w + i + 1;
-        if (op == 22 && len == 3 && a[1] == 32) float_type = a[0];
-        else if (op == 43 && len == 4 && a[0] == float_type && float_type)
+        if (op == SPV_OP_TYPE_FLOAT && len == 3 && a[1] == 32) float_type = a[0];
+        else if (op == SPV_OP_CONSTANT && len == 4 && a[0] == float_type && float_type)
             for (int k = 0; k < 4; k++) {
                 float f;
                 memcpy(&f, &a[2], 4);
@@ -98,6 +128,8 @@ static int is_tonemap(const GfxShader *fs) {
     return 0;
 }
 
+// The last tonemap draw's inputs: the light target and the bloom, the exposure, the frame. Replay thread writes, the
+// present reads (under T.lock).
 static struct {
     PlatMutex lock;
     VkImage light, bloom;
@@ -107,11 +139,13 @@ static struct {
     uint64_t frame;
 } T = {.lock = PLAT_MUTEX_INIT};
 
+// Whether the exposure can be read. Every draw of a shader that carries the tonemap asks (22 such shaders in a match),
+// and an OS query per draw took 0.4 of a core: the last page that passed answers until a pool is mapped or goes away.
 static int exposure_readable(uint64_t a) {
-    static uint64_t page, gen;
+    static uint64_t page, gen;   // replay thread
     uint64_t p = a >> 12, g = vk_mem_gen();
     if (p == page && g == gen && (a & 0xfff) <= 0xffc) return 1;
-    if (nvn_gpu_only(a) || !nvn_pool_find(a, 4)) return 0;
+    if (!mem_guest_readable(a, 4)) return 0;
     page = p, gen = g;
     return 1;
 }
@@ -125,13 +159,15 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info, const GfxShader *fs) {
         const VkPipeBinding *bd = &info->bindings[i];
         if (!bd->res || bd->stage != GFX_STAGE_FS) continue;
         if (bd->kind == GFX_RES_TEX && ntex < 2 && bd->res->slot >= 0 && bd->res->slot < 128 && ex->tex[1][bd->res->slot])
-            tex[ntex++] = vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(ex->tex[1][bd->res->slot]), NULL, NULL);
+            tex[ntex++] = vk_texture_by_id(NVN_HANDLE_TEX(ex->tex[1][bd->res->slot]), NULL, NULL);
         if (bd->kind == GFX_RES_UBO && bd->res->slot == 5) {
             const p_bind_buf *u = &ex->ubo[1][5 - 3];
             if (u->addr && exposure_readable(u->addr)) memcpy(&exposure, (const void *)(uintptr_t)u->addr, 4);
         }
     }
     if (ntex != 2 || !tex[0] || !tex[1] || !(exposure > 0) || !isfinite(exposure)) return;
+    if (tex[0]->gone || tex[1]->gone) return;   // dropped since the lookup: kept by handle, it would outlive the image
+    // the light target is the larger one, the size of the scene; the bloom is sampled at the same coordinates
     if ((uint64_t)tex[1]->width * tex[1]->height > (uint64_t)tex[0]->width * tex[0]->height) {
         const VkTexImage *t = tex[0];
         tex[0] = tex[1], tex[1] = t;
@@ -144,20 +180,24 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info, const GfxShader *fs) {
     plat_mutex_unlock(&T.lock);
 }
 
-void vk_hdr_image_gone(VkImage image) {
+void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *format) {
+    (void)win, (void)image, (void)format;   // the present reads the window texture itself (vk_hdr_encode)
+    if (vk_hdr_wanted()) vk_hdr_track = 1;
+}
+
+void vk_hdr_image_gone(VkImage image) {   // a texture image went away: forget it as the tonemap's input
     if (!vk_hdr_track) return;
     plat_mutex_lock(&T.lock);
-    if (T.light == image) T.light = VK_NULL_HANDLE;
-    if (T.bloom == image) T.bloom = VK_NULL_HANDLE;
+    if (T.light == image || T.bloom == image) T.light = T.bloom = VK_NULL_HANDLE;
     plat_mutex_unlock(&T.lock);
 }
 
 // ---- swapchain
 
-// With hdr = 1, the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out set, else 0 and the
+// With MTF_HDR=1, the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out set, else 0 and the
 // reason logged once.
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out) {
-    if (!vk_hdr_wanted() || !vk_ctx()->has_swapchain_colorspace) return 0;
+    if (!vk_hdr_wanted()) return 0;
     static int logged;
     if (!logged) {
         char b[1024];
@@ -177,41 +217,30 @@ int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceForm
             }
     if (!logged)
         rt_log("hdr: the display offers no HDR10 format, so the picture stays SDR (Windows: turn on \"Use HDR\" in the "
-               "display settings; Linux: a Wayland compositor with colour management and HDR on)");
+               "display settings)");
     logged = 1;
     return 0;
 }
 
-// The content's peak and the picture's white for sc, sent again when either changes (vk_present.c calls it on every
-// present to an HDR10 swapchain, with new = 1 for a new swapchain). The lifted SDR picture reaches hdr_peak_nits. With
-// native HDR the game grades to its own peak, the display's capped by the game's limit for the mode (ov_gfx.c
-// hdr_game_content_peak: 1400 nits in 3.2.0 gameplay with any higher hdr_peak_nits); a display told hdr_peak_nits
-// would tone-map for a range the picture never reaches.
+// The display's peak and the picture's white for sc; again when the settings change (gfx_present.c calls it on every
+// present to an HDR10 swapchain, with new_sc = 1 for a new swapchain).
 void vk_hdr_metadata(VkSwapchainKHR sc, int new_sc) {
     static unsigned sent = ~0u;
-    static int sent_game_peak = -1;
     VkCtx *c = vk_ctx();
-    int game_peak = hdr_native_on() ? hdr_game_content_peak() : 0;
-    if (!c->has_hdr_metadata || (!new_sc && cfg_version() == sent && game_peak == sent_game_peak)) return;
+    if (!c->has_hdr_metadata || (!new_sc && cfg_version() == sent)) return;
     sent = cfg_version();
-    sent_game_peak = game_peak;
     PFN_vkSetHdrMetadataEXT set = (PFN_vkSetHdrMetadataEXT)vkGetDeviceProcAddr(c->device, "vkSetHdrMetadataEXT");
     if (!set) return;
     Nits n = nits();
-    float peak = game_peak > 0 && game_peak < n.peak ? (float)game_peak : n.peak;
     VkHdrMetadataEXT m = {.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT,
                           .displayPrimaryRed = {0.708f, 0.292f}, .displayPrimaryGreen = {0.170f, 0.797f},
                           .displayPrimaryBlue = {0.131f, 0.046f}, .whitePoint = {0.3127f, 0.3290f},
-                          .maxLuminance = peak, .minLuminance = 0.0f, .maxContentLightLevel = peak,
+                          .maxLuminance = n.peak, .minLuminance = 0.0f, .maxContentLightLevel = n.peak,
                           .maxFrameAverageLightLevel = n.game};
     set(c->device, 1, &sc, &m);
-    static float logged = -1;
-    if (peak != logged) rt_log("hdr: metadata to the display: peak %.0f nits, paper white %.0f%s", peak, n.game,
-                               game_peak > 0 && peak == (float)game_peak ? " (the game's own peak)" : "");
-    logged = peak;
 }
 
-// ---- 3. present passes
+// ---- present passes
 
 static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 ss,
                     VkAccessFlags2 sa, VkPipelineStageFlags2 ds, VkAccessFlags2 da) {
@@ -265,15 +294,15 @@ static struct {
     int tried, ok;
     PFN_vkCmdPushDescriptorSetKHR push;
     VkSampler sampler, linear;
-    VkDescriptorSetLayout dsl, dsl_comp;
-    VkPipelineLayout lay, comp_layout;
-    VkPipeline hdr, ui, comp;
-    VkFormat pipe_fmt;
-    Img mid;                        // the chain's 8-bit sRGB target, swapchain-sized
+    VkDescriptorSetLayout dsl_enc, dsl_comp, dsl_ui;
+    VkPipelineLayout enc_layout, comp_layout, ui_layout;
+    VkPipeline enc, comp;
+    VkPipeline ui;                  // for ui_fmt
+    VkFormat ui_fmt;
+    Img out;                        // PQ code values of the crop, RGBA16F
     Img menu;                       // the in-game menu, RGBA8
-    Img out;                        // PQ code values from hdr_compose.comp, RGBA16F
-    VkImageView views[2];           // light, bloom
-    float vk, yk, slope;
+    VkImageView views[SLOTS][3];    // per present slot: the window texture, the light target, the bloom
+    float vk, yk, slope;            // the curve's knee (hdr_compose.comp)
 } H;
 
 static VkShaderModule module(VkCtx *c, const uint32_t *code, size_t size) {
@@ -282,6 +311,36 @@ static VkShaderModule module(VkCtx *c, const uint32_t *code, size_t size) {
     return vkCreateShaderModule(c->device, &mi, NULL, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
+static VkDescriptorSetLayout set_layout(VkCtx *c, const VkDescriptorSetLayoutBinding *b, uint32_t n) {
+    VkDescriptorSetLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                          .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                          .bindingCount = n, .pBindings = b};
+    VkDescriptorSetLayout l = VK_NULL_HANDLE;
+    return vkCreateDescriptorSetLayout(c->device, &ci, NULL, &l) == VK_SUCCESS ? l : VK_NULL_HANDLE;
+}
+
+static VkPipelineLayout pipe_layout(VkCtx *c, VkDescriptorSetLayout *dsl, VkShaderStageFlags st, uint32_t pc) {
+    VkPushConstantRange pr = {st, 0, pc};
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    VkPipelineLayout l = VK_NULL_HANDLE;
+    return vkCreatePipelineLayout(c->device, &li, NULL, &l) == VK_SUCCESS ? l : VK_NULL_HANDLE;
+}
+
+static VkPipeline compute(VkCtx *c, const uint32_t *code, size_t size, VkPipelineLayout layout) {
+    VkShaderModule m = module(c, code, size);
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
+                                      .layout = layout};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (m && vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    if (m) vkDestroyShaderModule(c->device, m, NULL);
+    return p;
+}
+
+// The ACES fit (hdr_compose.comp aces_fit) and the knee where the HDR curve leaves it: the input v_k whose output is
+// y_k (a root of the fit's quadratic), and the fit's slope there.
 static double aces_fit(double v) { return (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.4329510) + 0.238081); }
 
 static void knee(float yk) {
@@ -294,67 +353,119 @@ static void knee(float yk) {
 static int init(VkCtx *c) {
     H.tried = 1;
     H.push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
-    VkDescriptorSetLayoutBinding b = {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                      .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
-    VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-                                           .bindingCount = 1, .pBindings = &b};
     const VkShaderStageFlags CS = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding enc[2] = {
+        {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = CS},
+        {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = CS}};
     VkDescriptorSetLayoutBinding comp[4] = {
         {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = CS},
         {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = CS},
         {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = CS},
         {.binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = CS}};
-    VkDescriptorSetLayoutCreateInfo cci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-                                           .bindingCount = 4, .pBindings = comp};
+    VkDescriptorSetLayoutBinding ui = {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                       .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
                               .minFilter = VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
                               .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                               .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                               .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0};
     VkSamplerCreateInfo li = si;
-    li.magFilter = li.minFilter = VK_FILTER_LINEAR;
-    VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
-    VkPushConstantRange cpr = {CS, 0, 48};
+    li.magFilter = li.minFilter = VK_FILTER_LINEAR;   // the bloom, smaller than the scene, as the tonemap filters it
     if (!H.push || vkCreateSampler(c->device, &si, NULL, &H.sampler) != VK_SUCCESS ||
-        vkCreateSampler(c->device, &li, NULL, &H.linear) != VK_SUCCESS ||
-        vkCreateDescriptorSetLayout(c->device, &dci, NULL, &H.dsl) != VK_SUCCESS ||
-        vkCreateDescriptorSetLayout(c->device, &cci, NULL, &H.dsl_comp) != VK_SUCCESS) goto fail;
-    VkPipelineLayoutCreateInfo li_pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
-                                        .pSetLayouts = &H.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
-    VkPipelineLayoutCreateInfo cli_pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
-                                         .pSetLayouts = &H.dsl_comp, .pushConstantRangeCount = 1, .pPushConstantRanges = &cpr};
-    if (vkCreatePipelineLayout(c->device, &li_pi, NULL, &H.lay) != VK_SUCCESS ||
-        vkCreatePipelineLayout(c->device, &cli_pi, NULL, &H.comp_layout) != VK_SUCCESS) goto fail;
-    VkShaderModule cm = module(c, hdr_compose_spv, sizeof hdr_compose_spv);
-    if (cm) {
-        VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                                           .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                                     .stage = CS, .module = cm, .pName = "main"},
-                                           .layout = H.comp_layout};
-        if (vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &cpi, NULL, &H.comp) != VK_SUCCESS) H.comp = VK_NULL_HANDLE;
-        vkDestroyShaderModule(c->device, cm, NULL);
+        vkCreateSampler(c->device, &li, NULL, &H.linear) != VK_SUCCESS || !(H.dsl_enc = set_layout(c, enc, 2)) ||
+        !(H.dsl_comp = set_layout(c, comp, 4)) || !(H.dsl_ui = set_layout(c, &ui, 1)) ||
+        !(H.enc_layout = pipe_layout(c, &H.dsl_enc, CS, 32)) || !(H.comp_layout = pipe_layout(c, &H.dsl_comp, CS, 48)) ||
+        !(H.ui_layout = pipe_layout(c, &H.dsl_ui, VK_SHADER_STAGE_FRAGMENT_BIT, 16)) ||
+        !(H.enc = compute(c, hdr_encode_spv, sizeof hdr_encode_spv, H.enc_layout)) ||
+        !(H.comp = compute(c, hdr_compose_spv, sizeof hdr_compose_spv, H.comp_layout))) {
+        rt_log("hdr: the present passes could not be created; the picture goes out unconverted");
+        return 0;
     }
     knee(0.8f);
+    rt_log("hdr: the scene's curve leaves ACES at %.3f (input %.3f, slope %.3f)", H.yk, H.vk, H.slope);
     return H.ok = 1;
-fail:
-    rt_log("hdr: the present passes could not be created; falling back to SDR");
-    return 0;
 }
 
-// The image the chain (blit or FSR, then SMAA) writes in place of the swapchain image: RGBA8 UNORM of the swapchain's
-// size in TRANSFER_DST_OPTIMAL, its old content dropped. VK_NULL_HANDLE: no HDR pass, the caller presents SDR.
-VkImage vk_hdr_mid(VkCommandBuffer cb, uint32_t w, uint32_t h) {
+static VkImageView view_of(VkCtx *c, VkImageView *keep, VkImage img, VkFormat fmt) {
+    if (*keep) vkDestroyImageView(c->device, *keep, NULL);
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img,
+                                .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+                                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (vkCreateImageView(c->device, &vi, NULL, keep) != VK_SUCCESS) *keep = VK_NULL_HANDLE;
+    return *keep;
+}
+
+static VkFormat unorm_of(VkFormat f) {   // the window texture's sRGB codes, read as they are (images are MUTABLE_FORMAT)
+    return f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : f == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : f;
+}
+
+VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]) {
     VkCtx *c = vk_ctx();
     if (!H.tried) init(c);
-    if (vk_hdr_wanted()) vk_hdr_track = 1;
-    if (!H.ok || !img_ensure(c, &H.mid, w, h, VK_FORMAT_R8G8B8A8_UNORM,
-                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+    if (!H.ok || !img_ensure(c, &H.out, (uint32_t)crop[2], (uint32_t)crop[3], VK_FORMAT_R16G16B16A16_SFLOAT,
+                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
         return VK_NULL_HANDLE;
-    barrier(cb, H.mid.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    return H.mid.img;
+    slot %= SLOTS;
+    VkFormat raw = unorm_of(fmt);
+    int codes = raw == VK_FORMAT_R8G8B8A8_UNORM || raw == VK_FORMAT_B8G8R8A8_UNORM;   // 8-bit sRGB codes
+    if (!view_of(c, &H.views[slot][0], src, raw)) return VK_NULL_HANDLE;
+    // the scene: this frame's or the last one's tonemap inputs, of the crop's size
+    plat_mutex_lock(&T.lock);
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    int scene = codes && T.light && T.bloom && T.lw == (uint32_t)crop[2] && T.lh == (uint32_t)crop[3] && now - T.frame <= 2;
+    VkImage light = T.light, bloom = T.bloom;
+    VkFormat lfmt = T.lfmt, bfmt = T.bfmt;
+    float exposure = T.exposure;
+    plat_mutex_unlock(&T.lock);
+    if (scene && (!view_of(c, &H.views[slot][1], light, lfmt) || !view_of(c, &H.views[slot][2], bloom, bfmt))) scene = 0;
+    static int said = -1;
+    if (scene != said) said = scene, rt_log("hdr: %s", scene ? "the scene in HDR, the HUD at its white"
+                                                               : "no scene this frame: SDR at the HUD's white");
+    Nits n = nits();
+    const VkPipelineStageFlags2 CS = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, ALL = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkImage reads[3] = {src, scene ? light : VK_NULL_HANDLE, scene ? bloom : VK_NULL_HANDLE};
+    for (int i = 0; i < 3; i++)
+        if (reads[i])
+            barrier(cb, reads[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, ALL, VK_ACCESS_2_MEMORY_WRITE_BIT, CS,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(cb, H.out.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, ALL, 0, CS, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    VkDescriptorImageInfo oi = {VK_NULL_HANDLE, H.out.view, VK_IMAGE_LAYOUT_GENERAL};
+    if (scene) {
+        VkDescriptorImageInfo ii[3] = {{H.sampler, H.views[slot][0], VK_IMAGE_LAYOUT_GENERAL},
+                                       {H.sampler, H.views[slot][1], VK_IMAGE_LAYOUT_GENERAL},
+                                       {H.linear, H.views[slot][2], VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet w[4];
+        for (int i = 0; i < 4; i++)
+            w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
+                                          .descriptorCount = 1,
+                                          .descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                                  : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .pImageInfo = i < 3 ? &ii[i] : &oi};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, H.comp);
+        rec_push(H.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, H.comp_layout, 0, 4, w);
+        struct { int32_t offset[2], size[2]; float n[4], k[4]; } pc = {
+            {crop[0], crop[1]}, {crop[2], crop[3]}, {n.ui, n.game, n.peak, exposure},
+            {H.vk, H.yk, H.slope, fmaxf(n.peak / n.game, H.yk + 0.01f)}};
+        vkCmdPushConstants(cb, H.comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    } else {
+        VkDescriptorImageInfo ii = {H.sampler, H.views[slot][0], VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w[2] = {
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &oi}};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, H.enc);
+        rec_push(H.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, H.enc_layout, 0, 2, w);
+        struct { int32_t offset[2], size[2]; float p[4]; } pc = {{crop[0], crop[1]}, {crop[2], crop[3]},
+                                                                {n.ui, n.peak, codes ? 1.0f : 0.0f, 0}};
+        vkCmdPushConstants(cb, H.enc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    }
+    vkCmdDispatch(cb, ((uint32_t)crop[2] + 7) / 8, ((uint32_t)crop[3] + 7) / 8, 1);
+    for (int i = 0; i < 3; i++)
+        if (reads[i]) barrier(cb, reads[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, CS, 0, ALL, 0);
+    barrier(cb, H.out.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, CS, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, ALL,
+            VK_ACCESS_2_MEMORY_READ_BIT);
+    return H.out.img;
 }
 
 // The in-game menu's target: an RGBA8 image of the swapchain's size in COLOR_ATTACHMENT_OPTIMAL (its old content
@@ -371,9 +482,17 @@ VkImageView vk_hdr_ui_target(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     return H.menu.view;
 }
 
-// A full-screen triangle pipeline into a colour attachment of format fmt; blend: the fragment shader's alpha over dst.
-static VkPipeline frag_pipeline(VkCtx *c, VkFormat fmt, const uint32_t *code, size_t size, int blend) {
-    VkShaderModule vs = module(c, hdr_fullscreen_spv, sizeof hdr_fullscreen_spv), fs = module(c, code, size);
+static int ui_pipeline(VkCtx *c, VkFormat fmt) {
+    if (H.ui && H.ui_fmt == fmt) return 1;
+    if (H.ui) {   // another swapchain format: earlier presents may still use the old pipeline
+        vk_queue_lock();
+        vkDeviceWaitIdle(c->device);
+        vk_queue_unlock();
+        vkDestroyPipeline(c->device, H.ui, NULL);
+        H.ui = VK_NULL_HANDLE;
+    }
+    VkShaderModule vs = module(c, hdr_fullscreen_spv, sizeof hdr_fullscreen_spv),
+                   fs = module(c, hdr_ui_spv, sizeof hdr_ui_spv);
     VkPipelineShaderStageCreateInfo st[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs,
          .pName = "main"},
@@ -390,7 +509,7 @@ static VkPipeline frag_pipeline(VkCtx *c, VkFormat fmt, const uint32_t *code, si
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState ba = {
-        .blendEnable = blend ? VK_TRUE : VK_FALSE, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0xf};
@@ -405,162 +524,63 @@ static VkPipeline frag_pipeline(VkCtx *c, VkFormat fmt, const uint32_t *code, si
                                        .stageCount = 2, .pStages = st, .pVertexInputState = &vi,
                                        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds,
-                                       .layout = H.lay};
-    VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = vs && fs ? vkCreateGraphicsPipelines(c->device, VK_NULL_HANDLE, 1, &gi, NULL, &p) : VK_ERROR_UNKNOWN;
+                                       .layout = H.ui_layout};
+    VkResult r = vs && fs ? vkCreateGraphicsPipelines(c->device, VK_NULL_HANDLE, 1, &gi, NULL, &H.ui) : VK_ERROR_UNKNOWN;
     if (vs) vkDestroyShaderModule(c->device, vs, NULL);
     if (fs) vkDestroyShaderModule(c->device, fs, NULL);
-    return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
-}
-
-static int pipelines(VkCtx *c, VkFormat fmt) {
-    if (H.hdr && H.ui && H.pipe_fmt == fmt) return 1;
-    if (H.hdr || H.ui) {   // another swapchain format: earlier presents may still use the old pipelines
-        vk_queue_lock();
-        vkDeviceWaitIdle(c->device);
-        vk_queue_unlock();
-        if (H.hdr) vkDestroyPipeline(c->device, H.hdr, NULL);
-        if (H.ui) vkDestroyPipeline(c->device, H.ui, NULL);
-        H.hdr = H.ui = VK_NULL_HANDLE;
-    }
-    H.hdr = frag_pipeline(c, fmt, hdr_encode_spv, sizeof hdr_encode_spv, 0);
-    H.ui = frag_pipeline(c, fmt, hdr_ui_spv, sizeof hdr_ui_spv, 1);
-    if (!H.hdr || !H.ui) {
-        rt_log("hdr: the present pipelines could not be created; falling back to SDR");
+    if (r != VK_SUCCESS) {
+        H.ui = VK_NULL_HANDLE;
+        rt_log("hdr: the menu pass could not be created; the menu is not shown");
         return 0;
     }
-    H.pipe_fmt = fmt;
-    return 1;
-}
-
-// One full-screen draw of src_view (SHADER_READ_ONLY_OPTIMAL) into dst_view (COLOR_ATTACHMENT_OPTIMAL), w x h.
-static void fullscreen(VkCommandBuffer cb, VkPipeline pipe, VkImageView dst_view, int load, VkImageView src_view,
-                       const float pc[4], uint32_t w, uint32_t h) {
-    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dst_view,
-                                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                    .loadOp = load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1,
-                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
-    vkCmdBeginRendering(cb, &ri);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    VkViewport v = {0, 0, (float)w, (float)h, 0, 1};
-    VkRect2D sc = {{0, 0}, {w, h}};
-    vkCmdSetViewport(cb, 0, 1, &v);
-    vkCmdSetScissor(cb, 0, 1, &sc);
-    VkDescriptorImageInfo ii = {H.sampler, src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
-                               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
-    rec_push(H.push, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, H.lay, 0, 1, &wr);
-    vkCmdPushConstants(cb, H.lay, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc);
-    vkCmdDraw(cb, 3, 1, 0, 0);
-    vkCmdEndRendering(cb);
-}
-
-static VkImageView view_of(VkCtx *c, VkImageView *keep, VkImage img, VkFormat fmt) {
-    if (*keep) vkDestroyImageView(c->device, *keep, NULL);
-    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img,
-                                .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
-                                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    if (vkCreateImageView(c->device, &vi, NULL, keep) != VK_SUCCESS) *keep = VK_NULL_HANDLE;
-    return *keep;
-}
-
-// The HDR pass: the chain's image (vk_hdr_mid, TRANSFER_DST_OPTIMAL after the blit or FSR and SMAA) onto dst (the
-// swapchain image, UNDEFINED), left in COLOR_ATTACHMENT_OPTIMAL. 0: no pass, dst untouched and the caller presents SDR.
-int vk_hdr_record(VkCommandBuffer cb, VkImage dst, VkImageView dst_view, VkFormat fmt, uint32_t w, uint32_t h) {
-    VkCtx *c = vk_ctx();
-    if (!H.ok || !H.mid.img || !pipelines(c, fmt)) return 0;
-    plat_mutex_lock(&T.lock);
-    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    int scene = H.comp && T.light && T.bloom && now - T.frame <= 2;
-    VkImage light = T.light, bloom = T.bloom;
-    VkFormat lfmt = T.lfmt, bfmt = T.bfmt;
-    float exposure = T.exposure;
-    plat_mutex_unlock(&T.lock);
-    if (scene && img_ensure(c, &H.out, w, h, VK_FORMAT_R16G16B16A16_SFLOAT,
-                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
-        view_of(c, &H.views[0], light, lfmt) && view_of(c, &H.views[1], bloom, bfmt)) {
-        Nits n = nits();
-        const VkPipelineStageFlags2 CS = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, ALL = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        barrier(cb, H.mid.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, CS, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        barrier(cb, light, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, ALL, VK_ACCESS_2_MEMORY_WRITE_BIT, CS,
-                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        barrier(cb, bloom, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, ALL, VK_ACCESS_2_MEMORY_WRITE_BIT, CS,
-                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        barrier(cb, H.out.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, ALL, 0, CS,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        VkDescriptorImageInfo ii[3] = {{H.sampler, H.mid.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                                       {H.sampler, H.views[0], VK_IMAGE_LAYOUT_GENERAL},
-                                       {H.linear, H.views[1], VK_IMAGE_LAYOUT_GENERAL}};
-        VkDescriptorImageInfo oi = {VK_NULL_HANDLE, H.out.view, VK_IMAGE_LAYOUT_GENERAL};
-        VkWriteDescriptorSet wr[4];
-        for (int i = 0; i < 4; i++)
-            wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
-                                           .descriptorCount = 1,
-                                           .descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                                                   : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                           .pImageInfo = i < 3 ? &ii[i] : &oi};
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, H.comp);
-        H.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, H.comp_layout, 0, 4, wr);
-        struct { int32_t offset[2], size[2]; float n[4], k[4]; } pc = {
-            {0, 0}, {(int32_t)w, (int32_t)h}, {n.ui, n.game, n.peak, exposure},
-            {H.vk, H.yk, H.slope, fmaxf(n.peak / n.game, H.yk + 0.01f)}};
-        vkCmdPushConstants(cb, H.comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
-        vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
-        barrier(cb, H.out.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, CS,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-        barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, ALL, 0,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        VkImageBlit r = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                         .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
-                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                         .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
-        vkCmdBlitImage(cb, H.out.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       1, &r, VK_FILTER_NEAREST);
-        barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        return 1;
-    }
-    barrier(cb, H.mid.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-    Nits n = nits();
-    const float pc[4] = {n.game, n.peak, 0.8f, 0};   // the picture's white and the display's peak in nits; the knee
-    fullscreen(cb, H.hdr, dst_view, 0, H.mid.view, pc, w, h);
+    H.ui_fmt = fmt;
     return 1;
 }
 
 // The menu image onto dst (a swapchain image in COLOR_ATTACHMENT_OPTIMAL, view dst_view of format fmt).
 void vk_hdr_ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, uint32_t w, uint32_t h) {
     VkCtx *c = vk_ctx();
-    if (!H.ok || !H.menu.img || !pipelines(c, fmt)) return;
+    if (!H.ok || !H.menu.img || !ui_pipeline(c, fmt)) return;
     barrier(cb, H.menu.img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    const float pc[4] = {nits().ui, 0, 0, 0};
-    fullscreen(cb, H.ui, dst_view, 1, H.menu.view, pc, w, h);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dst_view,
+                                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, H.ui);
+    VkViewport v = {0, 0, (float)w, (float)h, 0, 1};
+    VkRect2D s = {{0, 0}, {w, h}};
+    vkCmdSetViewport(cb, 0, 1, &v);
+    vkCmdSetScissor(cb, 0, 1, &s);
+    VkDescriptorImageInfo ii = {H.sampler, H.menu.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+                               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    rec_push(H.push, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, H.ui_layout, 0, 1, &wr);
+    float pc[4] = {nits().ui, 0, 0, 0};
+    vkCmdPushConstants(cb, H.ui_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
 }
 
 void vk_hdr_release(void) {
     VkCtx *c = vk_ctx();
-    img_free(c, &H.mid);
-    img_free(c, &H.menu);
+    for (int i = 0; i < SLOTS; i++)
+        for (int k = 0; k < 3; k++)
+            if (H.views[i][k]) vkDestroyImageView(c->device, H.views[i][k], NULL);
     img_free(c, &H.out);
-    for (int i = 0; i < 2; i++)
-        if (H.views[i]) vkDestroyImageView(c->device, H.views[i], NULL);
-    if (H.hdr) vkDestroyPipeline(c->device, H.hdr, NULL);
-    if (H.ui) vkDestroyPipeline(c->device, H.ui, NULL);
+    img_free(c, &H.menu);
+    if (H.enc) vkDestroyPipeline(c->device, H.enc, NULL);
     if (H.comp) vkDestroyPipeline(c->device, H.comp, NULL);
-    if (H.lay) vkDestroyPipelineLayout(c->device, H.lay, NULL);
+    if (H.ui) vkDestroyPipeline(c->device, H.ui, NULL);
+    if (H.enc_layout) vkDestroyPipelineLayout(c->device, H.enc_layout, NULL);
     if (H.comp_layout) vkDestroyPipelineLayout(c->device, H.comp_layout, NULL);
-    if (H.dsl) vkDestroyDescriptorSetLayout(c->device, H.dsl, NULL);
+    if (H.ui_layout) vkDestroyPipelineLayout(c->device, H.ui_layout, NULL);
+    if (H.dsl_enc) vkDestroyDescriptorSetLayout(c->device, H.dsl_enc, NULL);
     if (H.dsl_comp) vkDestroyDescriptorSetLayout(c->device, H.dsl_comp, NULL);
+    if (H.dsl_ui) vkDestroyDescriptorSetLayout(c->device, H.dsl_ui, NULL);
     if (H.sampler) vkDestroySampler(c->device, H.sampler, NULL);
     if (H.linear) vkDestroySampler(c->device, H.linear, NULL);
     memset(&H, 0, sizeof H);
@@ -582,7 +602,10 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) {
         uint32_t v;
         memcpy(&v, in + 4 * i, 4);
         float c[3] = {(float)(v & 1023), (float)(v >> 10 & 1023), (float)(v >> 20 & 1023)};   // A2B10G10R10: R low
-        if (a2r) { float t = c[0]; c[0] = c[2]; c[2] = t; }
+        if (a2r) {
+            float t = c[0];
+            c[0] = c[2], c[2] = t;
+        }
         for (int k = 0; k < 3; k++) c[k] = pq_nits(c[k] / 1023.0f) / ui;
         for (int k = 0; k < 3; k++) {
             float l = fminf(fmaxf(m[3 * k] * c[0] + m[3 * k + 1] * c[1] + m[3 * k + 2] * c[2], 0.0f), 1.0f);

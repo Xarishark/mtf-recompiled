@@ -1,8 +1,7 @@
 // NVN entry points beyond the core implementation that only report stored object state, attach debugging metadata,
 // convert timestamps or take hardware hints. None of them changes rendering
-// results. Ported from MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/totk_nvn_ext.c @ b75be8cf (MIT,
-// Copyright (c) 2026 jhaizhou; origin d2r-mobile); mach timing and Metal wording dropped. Its *Deferred binds and
-// memory-callback switches live with the command buffer in nvn_api_cmd.c.
+// results. The *Deferred binds and memory-callback switches live with the command buffer in nvn_api_cmd.c.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdint.h>
 #include <string.h>
 
@@ -12,7 +11,7 @@
 #include "nvn_tex.h"
 
 // The CPU is about to read what the GPU wrote into pool storage: the back end writes its host-side copies (the Vulkan
-// back end's images) back first. TotK invalidates its 260x260 R16 grass maps and 1x1 pick targets this way. A
+// back end's images) back first. Games invalidate small CPU-read maps and pick targets this way. A
 // CPU-invisible pool has no storage to read.
 void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) {
     if (!p->mem || nvn_gpu_only((uintptr_t)p->mem) || off >= p->size || !size) return;
@@ -50,13 +49,27 @@ NVN_API(nvnCommandBufferInsertDebugMarkerDynamic) { (void)c; }
 NVN_API(nvnCommandBufferInsertDebugMarker) { (void)c; }
 NVN_API(nvnCommandBufferInsertCheckpointStatic) { (void)c; }
 NVN_API(nvnCommandBufferInsertCheckpointDynamic) { (void)c; }
+// NVN 55 per-queue-type variants: Push{Compute,Graphics}(cmd, uint32_t domain_id, const char *text),
+// Pop{Compute,Graphics}(cmd), InsertDebugMarker{Compute,Graphics}(cmd, const char *text). MTF's renderer has calls to
+// all of them (the proc usage scan); none ran in the scenes played so far.
+NVN_API(nvnCommandBufferPushDebugGroupCompute) { (void)c; }
+NVN_API(nvnCommandBufferPushDebugGroupGraphics) { (void)c; }
+NVN_API(nvnCommandBufferPopDebugGroupCompute) { (void)c; }
+NVN_API(nvnCommandBufferPopDebugGroupGraphics) { (void)c; }
+NVN_API(nvnCommandBufferInsertDebugMarkerCompute) { (void)c; }
+NVN_API(nvnCommandBufferInsertDebugMarkerGraphics) { (void)c; }
 // NVNboolean nvnDeviceIsExternalDebuggerAttached(const NVNdevice *d)
 NVN_API(nvnDeviceIsExternalDebuggerAttached) { ret_x(c, 0); }
 // void nvnDeviceSetAutomaticCheckpointsMask(NVNdevice *d, uint32_t mask) (NVN 55, no prototype in nvn.h)
 NVN_API(nvnDeviceSetAutomaticCheckpointsMask) { (void)c; }
+// void nvnDeviceSetAutomaticCheckpointsEnable / SetAutomaticCheckpointsByDebugGroup / SetCheckpointCallStacksEnable
+// (NVNdevice *d, NVNboolean enable): crash-report checkpoints of the console's GPU
+NVN_API(nvnDeviceSetAutomaticCheckpointsEnable) { (void)c; }
+NVN_API(nvnDeviceSetAutomaticCheckpointsByDebugGroup) { (void)c; }
+NVN_API(nvnDeviceSetCheckpointCallStacksEnable) { (void)c; }
 
-// ---------- timestamps: counters are written in guest counter ticks, the base of GetSystemTick (rt_ticks, rt_tick_hz)
-static uint64_t ticks_to_ns(uint64_t t) { return rt_ticks_to_ns(t); }
+// ---------- timestamps: counters are written in the Switch 2's 31.25 MHz ticks, the base of GetSystemTick (rt_ticks)
+static uint64_t ticks_to_ns(uint64_t t) { return t * 32; }   // 31.25 MHz ticks (main.c rt_ticks)
 // uint64_t nvnDeviceGetCurrentTimestampInNanoseconds(const NVNdevice *d)
 NVN_API(nvnDeviceGetCurrentTimestampInNanoseconds) { ret_x(c, ticks_to_ns(rt_ticks())); }
 // uint64_t nvnDeviceGetTimestampInNanoseconds(const NVNdevice *d, const NVNcounterData *counter)
@@ -164,7 +177,7 @@ NVN_API(nvnTextureViewSetSwizzle) {
     v->set_swizzle = 1;
 }
 // void nvnTextureViewSetDepthStencilMode(NVNtextureView *v, NVNtextureDepthStencilMode mode): STENCIL makes the replay
-// sample a depth-stencil texture through a stencil-aspect view (vk_exec_draw.c get_view; nxnative hle_nvn.c)
+// sample a depth-stencil texture through a stencil-aspect view (vk_exec_draw.c get_view)
 NVN_API(nvnTextureViewSetDepthStencilMode) {
     uint32_t m = (uint32_t)arg_x(c, 1);
     if (m > NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL) rt_fatal("nvn: invalid texture view depth-stencil mode %u", m);
@@ -388,11 +401,23 @@ NVN_API(nvnCommandBufferSetConservativeRasterEnable) {
 }
 // void nvnCommandBufferSetConservativeRasterDilate(NVNcommandBuffer *cmd, float dilate)
 NVN_API(nvnCommandBufferSetConservativeRasterDilate) { (void)c; }
+// void nvnCommandBufferSetConservativeRasterMode(NVNcommandBuffer *cmd, int mode) (NVN 55, no prototype in nvn.h)
+NVN_API(nvnCommandBufferSetConservativeRasterMode) {
+    if ((int)arg_x(c, 1)) ONCE("conservative rasterisation mode %d requested: drawn normally", (int)arg_x(c, 1));
+}
+// void nvnCommandBufferSetExclusiveScissors(NVNcommandBuffer *cmd, int first, int count, const int *rects) (NVN 55):
+// the pixels outside each rectangle are kept; not drawn here
+NVN_API(nvnCommandBufferSetExclusiveScissors) {
+    if ((int)arg_x(c, 2) > 0) ONCE("exclusive scissors (%d) requested: ignored", (int)arg_x(c, 2));
+}
 // void nvnCommandBufferSetSampleMask(NVNcommandBuffer *cmd, int mask)
 NVN_API(nvnCommandBufferSetSampleMask) {
     int m = (int)arg_x(c, 1);
     if ((m & 0xffff) != 0xffff) ONCE("SetSampleMask %#x: fixed-function sample mask not applied", m);
 }
+// void nvnCommandBufferSetAlphaRef(NVNcommandBuffer *cmd, float ref): used only with the alpha test, which the replay
+// reports
+NVN_API(nvnCommandBufferSetAlphaRef) { (void)c; }
 // void nvnCommandBufferSetDepthBounds(NVNcommandBuffer *cmd, NVNboolean enable, float min, float max): disabling is
 // exact; an enabled range is drawn without the test and reported
 NVN_API(nvnCommandBufferSetDepthBounds) {

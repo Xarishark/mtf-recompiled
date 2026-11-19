@@ -1,22 +1,21 @@
-// Adapted from MacNativeGames games/totk/runtime/audio_mixer.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
-// contributors): the mixing stage (voice decode and resampling, splitters, mixes, effects, sinks) and the IAudioDevice
-// service. The CoreAudio output is replaced by SDL3 audio. Effect algorithms follow
-// Ryujinx.Audio (MIT, Copyright (c) Ryujinx Team and Contributors).
+// The audio renderer's mixing stage (voice decode and resampling, splitters, mixes, effects, sinks) and the
+// IAudioDevice service, with SDL3 audio output.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 //
 // Per 5 ms frame the render thread (audren.c, renderer lock held) decodes every started voice (PCM8/16/24/32, float,
 // DSP-ADPCM) along the sample path the voice clock consumes, resamples it linearly, runs the voice biquads, scales it
-// into its destination mix, folds the submixes, runs the mix effects and writes the device sink's mix (stereo, or 5.1 with
-// TOTK_AUDIO_CHANNELS, Mixer.channels) into a single-producer single-consumer ring. The SDL audio thread drains that
-// ring without taking any lock: an empty ring plays silence and never blocks the render thread or the guest.
-// TOTK_AUDIO=none (or TOTK_AUDIO_OFF) mixes without a device; TOTK_AUDIO_PREFILL_MS (0..500, default 20) is the
-// queued audio the output waits for after start or underrun.
+// into its destination mix, folds the submixes, runs the mix effects and writes the device sink's mix (stereo, or 5.1
+// with MTF_AUDIO_CHANNELS, output_channels) into a single-producer single-consumer ring. The SDL audio thread drains
+// that ring without taking any lock: an empty ring
+// plays silence and never blocks the render thread or the guest. MTF_AUDIO=none (or MTF_AUDIO_OFF) mixes without a
+// device; MTF_AUDIO_PREFILL_MS (0..500, default 20, 60 on Linux) is the queued audio the output waits for after start or underrun.
 // The device's clock paces the render thread, as the audio hardware paces the Switch's DSP (audio_mixer_pace_ns): a
 // frame is rendered when the ring holds less than the output target, max(prefill, two device periods), so the queue and
-// the delay from the game to the speakers stay there and the host and device clocks cannot drift apart. LASRecomp and
-// SavageWindRecomp pace their renderers by the SDL stream the same way. Without a device, while the renderer is
+// the delay from the game to the speakers stay there and the host and device clocks cannot drift apart.
+// Without a device, while the renderer is
 // stopped and while the device takes nothing (a stall), the render thread keeps real time on its own timer; what piled
 // up meanwhile is skipped on the SDL thread once the device resumes (more than QUEUE_SLACK_MS above the target plus the
-// device's request), as MacNativeGames' audio_mixer.c trims its ring after a device stall.
+// device's request).
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -53,7 +52,7 @@ typedef struct Mixer {
     int *offset;                                   // first mix buffer of each mix id
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
     SDL_AudioStream *stream; int device_ok, rate;
-    int channels;                                  // output channels, 2 or 6 (output_channels; 2 when the device refuses 6)
+    int channels;                                  // output channels, 2 or 6 (output_channels)
     float ring[RING_FRAMES * OUT_MAX];
     _Atomic uint64_t wr, rd, underruns, overruns, missing_frames, callback_frames, callback_nonzero, skipped_frames;
     _Atomic int playing; int ready;                // ready: the callback's own state
@@ -65,13 +64,13 @@ typedef struct Mixer {
     uint64_t *sink_address; uint32_t *sink_size, *sink_offset, *sink_old, *sink_written;
     unsigned reported;                             // one-time reports
     float voice_scratch[6][MAX_FRAME], filter_scratch[MAX_FRAME], output_scratch[MAX_FRAME * OUT_MAX];
-    double level_sum[2], level_peak[2]; uint64_t level_frames; int first_sound_logged;   // front left [0], front right [1]
+    double level_sum, level_peak; uint64_t level_count, level_frames; int first_sound_logged;
     int prefill;                                   // render blocks
 } Mixer;
 
 static _Atomic float device_volume = 1.0f;
 
-// TOTK_VOLUME: the player's volume in percent (0..100) on top of the game's own; a live setting (the
+// MTF_VOLUME: the player's volume in percent (0..100) on top of the game's own; a live setting (the
 // menu), parsed again when cfg_version changes. Render thread only.
 static float host_volume(void) {
     static float v = 1.0f;
@@ -79,7 +78,7 @@ static float host_volume(void) {
     unsigned ver = cfg_version();
     if (ver == seen) return v;
     seen = ver;
-    double pct = cfg_double("TOTK_VOLUME");
+    double pct = cfg_double("MTF_VOLUME");
     v = (float)((pct < 0 ? 0 : pct > 100 ? 100 : pct) / 100);
     return v;
 }
@@ -91,34 +90,40 @@ static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
 }
 
 // ---- output: SDL3 audio stream fed from the ring
-// How much audio the output waits for before it starts, and again after an underrun: TOTK_AUDIO_PREFILL_MS rounded up
+// How much audio the output waits for before it starts, and again after an underrun: MTF_AUDIO_PREFILL_MS rounded up
 // to whole 5 ms render blocks. Returns -1 for a value outside 0..500 ms.
+// The Linux default is higher: at 20 ms PipeWire's queue (max(prefill, two 1024-sample periods)) underran
+// thousands of times within minutes in busy scenes, and 60 ms removed the underruns.
+#ifdef __linux__
+#define PREFILL_DEFAULT_MS 60
+#else
+#define PREFILL_DEFAULT_MS 20
+#endif
 static int prefill_blocks_for(const char *e) {
-    if (!e || !*e) return 4;
+    if (!e || !*e) return PREFILL_DEFAULT_MS / 5;
     char *end;
     double ms = strtod(e, &end);
     if (end == e || *end || !(ms >= 0) || ms > 500) return -1;
     return (int)ceil(ms / 5.0);
 }
 
-// TOTK_AUDIO_CHANNELS: the output channels of this run, decided once. stereo gives 2; 5.1 gives 6 (FL FR C LFE RL RR,
-// the device sink's order and SDL's); auto gives 6 when the default playback device has at least six channels and 2
-// otherwise. IAudioDevice reports the same count to the game (GetActiveChannelCount), which picks its sink layout from
-// it. TOTK_AUDIO=none: 2, without touching SDL. Adapted from TotK Recomp PR 438 (MIT).
+// MTF_AUDIO_CHANNELS: the output channels of this run, decided once. stereo gives 2; 5.1 gives 6 (FL FR C LFE RL RR,
+// the device sink's order and SDL's); auto gives 6 when the default playback device has at least six channels (a 5.1
+// or 7.1 speaker setup in Windows; SDL places 5.1 on 7.1) and 2 otherwise. IAudioDevice reports the same count to the
+// game (GetActiveChannelCount), which picks its sink layout from it. MTF_AUDIO=none: 2, without touching SDL.
 static int output_channels(void) {
     static _Atomic int decided;
     int n = atomic_load(&decided);
     if (n) return n;
-    const char *want = cfg_value("TOTK_AUDIO_CHANNELS"), *mode = cfg_get("TOTK_AUDIO");
-    if ((mode && !strcmp(mode, "none")) || cfg_get("TOTK_AUDIO_OFF")) n = 2;
+    const char *want = cfg_value("MTF_AUDIO_CHANNELS"), *mode = cfg_get("MTF_AUDIO");
+    if ((mode && !strcmp(mode, "none")) || cfg_get("MTF_AUDIO_OFF")) n = 2;
     else if (!strcmp(want, "5.1")) n = 6;
     else if (!strcmp(want, "stereo")) n = 2;
     else {
         SDL_AudioSpec dev = {0};
-        int inited = SDL_InitSubSystem(SDL_INIT_AUDIO);
-        n = inited && SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, NULL) && dev.channels >= 6 ? 6 : 2;
-        if (inited) SDL_QuitSubSystem(SDL_INIT_AUDIO);   // balance the count; the real open initialises it again
-        rt_log("audio: TOTK_AUDIO_CHANNELS=auto: the default device has %d channels, output %s", dev.channels,
+        n = SDL_InitSubSystem(SDL_INIT_AUDIO) && SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, NULL) &&
+            dev.channels >= 6 ? 6 : 2;
+        rt_log("audio: MTF_AUDIO_CHANNELS=auto: the default device has %d channels, output %s", dev.channels,
                n == 6 ? "5.1" : "stereo");
     }
     int expected = 0;
@@ -202,54 +207,21 @@ static void SDLCALL sdl_pull(void *user, SDL_AudioStream *stream, int additional
 }
 
 static void output_open(Mixer *m, int rate) {
-    const char *mode = cfg_get("TOTK_AUDIO");
-    if ((mode && !strcmp(mode, "none")) || cfg_get("TOTK_AUDIO_OFF")) {
-        rt_log("audio: TOTK_AUDIO=none: mixing without a device");
+    const char *mode = cfg_get("MTF_AUDIO");
+    if ((mode && !strcmp(mode, "none")) || cfg_get("MTF_AUDIO_OFF")) {
+        rt_log("audio: MTF_AUDIO=none: mixing without a device");
         return;
     }
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         rt_log("audio: SDL audio init failed (%s): mixing without sound", SDL_GetError());
         return;
     }
-#if defined(__linux__) && defined(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES)
-    // PipeWire gave a 1024-frame period, and with it the renderer works in bursts of four or five 240-frame blocks and
-    // the output clicked at every block edge (issue #133: static on all sound; 240 frames, or 768 through PulseAudio,
-    // measured clean). Ask for one block per period unless the player's SDL_AUDIO_DEVICE_SAMPLE_FRAMES says otherwise
-    // (the default priority loses to the environment variable). A guess about the cause; the measured fix is the period.
-    SDL_SetHintWithPriority(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "240", SDL_HINT_DEFAULT);
-#endif
     SDL_AudioSpec spec = {SDL_AUDIO_F32, m->channels, rate};
     m->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdl_pull, m);
-    if (!m->stream && m->channels != 2) {   // the device refuses 5.1: stereo (the sink downmix is on the mixing side)
-        rt_log("audio: 5.1 output refused (%s): trying stereo", SDL_GetError());
-        m->channels = spec.channels = 2;
-        m->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdl_pull, m);
-    }
     if (!m->stream) {
         rt_log("audio: no output device (%s): mixing without sound", SDL_GetError());
         return;
     }
-#if !defined(__linux__) && defined(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES)
-    // The same static on a Windows laptop whose device opened with a 1024-frame period (#272), where 480-frame devices
-    // are clean: when the opened device's period is not a whole number of renderer blocks, reopen it asking for one
-    // block per period. Only the opened device's period counts; before opening, SDL reports its own default (1024 at
-    // 48 kHz) for every device. WASAPI may keep its period; then nothing changes.
-    {
-        SDL_AudioSpec d0;
-        int f0 = 0;
-        if (m->frame > 0 && SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(m->stream), &d0, &f0) && f0 > 0 &&
-            f0 % m->frame && !SDL_GetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES)) {
-            char frames[16];
-            snprintf(frames, sizeof frames, "%d", m->frame);
-            SDL_SetHintWithPriority(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames, SDL_HINT_DEFAULT);
-            SDL_DestroyAudioStream(m->stream);
-            m->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdl_pull, m);
-            rt_log("audio: the device opened with a %d-frame period, not a multiple of %d: reopened asking for %d (%s)",
-                   f0, m->frame, m->frame, m->stream ? "ok" : SDL_GetError());
-            if (!m->stream) return;
-        }
-    }
-#endif
     if (!SDL_ResumeAudioStreamDevice(m->stream)) {
         rt_log("audio: starting the output failed (%s): mixing without sound", SDL_GetError());
         SDL_DestroyAudioStream(m->stream);
@@ -271,8 +243,7 @@ static void output_open(Mixer *m, int rate) {
            dev.channels, m->prefill * 5, period, m->target * 1000.0 / rate);
 }
 
-int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) {
-    Mixer *m = r->mixer;
+static int64_t output_pace_ns(Mixer *m, uint64_t now) {
     if (!m || !m->device_ok || !atomic_load_explicit(&m->playing, memory_order_acquire)) return -1;
     uint64_t pulled = atomic_load_explicit(&m->pulled_ns, memory_order_acquire);
     if (!pulled || (now > pulled && now - pulled > m->stall_ns)) return -1;
@@ -281,6 +252,8 @@ int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) {
     int64_t ns = (int64_t)((have - (uint64_t)m->target + 1) * 1000000000ull / (uint64_t)m->rate);
     return ns < 500000 ? 500000 : ns;   // until the device has taken it below the target
 }
+
+int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) { return output_pace_ns(r->mixer, now); }
 
 // Render thread only.
 static void output_push(Mixer *m, const float *out, int frames) {
@@ -298,37 +271,102 @@ static void output_push(Mixer *m, const float *out, int frames) {
     if (!m->device_ok) atomic_store(&m->rd, wr + (uint64_t)frames);   // no device: the ring only keeps the latest frames
 }
 
-// Level meter (TOTK_TRACE=audio): one line per 5 s of output, and the first nonzero frame.
-static void level_note(AudioRenderer *r, Mixer *m, const float *lr, int frames) {
+// MTF_AUDIO_DUMP=<path>: the sink mix before the clamp as raw interleaved float32 stereo, and every 5 s one log line with
+// how many frames were rendered less than 1 ms after the one before (a burst refill). File writes on the render thread:
+// for diagnosis only.
+static void sink_dump(const float *raw, int frames) {
+    static FILE *f;
+    static int opened;
+    static uint64_t last, window_start, total, bursts;
+    if (!opened) {
+        opened = 1;
+        const char *path = cfg_get("MTF_AUDIO_DUMP");
+        if (path && *path) f = fopen(path, "wb");
+    }
+    if (!f) return;
+    fwrite(raw, sizeof(float), (size_t)frames * 2, f);
+    uint64_t now = kern_now_ns();
+    total++;
+    if (last && now - last < 1000000ull) bursts++;
+    last = now;
+    if (!window_start) window_start = now;
+    if (now - window_start >= 5000000000ull) {
+        rt_log("audio: dump: %llu frames in %.1f s, %llu rendered under 1 ms after the previous", (unsigned long long)total,
+               (now - window_start) / 1e9, (unsigned long long)bursts);
+        total = bursts = 0;
+        window_start = now;
+        fflush(f);
+    }
+}
+
+// Level meter (MTF_TRACE=audio): one line per 5 s of output, and the first nonzero frame.
+static void level_note(Mixer *m, uint64_t elapsed_frames, const float *out, int frames) {
     if (!(rt_trace & RT_TRACE_AUDIO)) return;
     int sound = 0;
-    for (int k = 0; k < m->channels * frames; k++) {   // interleaved output; levels are of the front pair (samples 0, 1)
-        double x = lr[k];
-        int ch = k % m->channels;
-        if (ch < 2) {
-            m->level_sum[ch] += x * x;
-            if (fabs(x) > m->level_peak[ch]) m->level_peak[ch] = fabs(x);
-        }
+    for (int k = 0; k < m->channels * frames; k++) {
+        double x = out[k];
+        m->level_sum += x * x;
+        if (fabs(x) > m->level_peak) m->level_peak = fabs(x);
         if (x != 0) sound = 1;
     }
+    m->level_count += (uint64_t)m->channels * (uint64_t)frames;
     m->level_frames += (uint64_t)frames;
     if (sound && !m->first_sound_logged) {
         m->first_sound_logged = 1;
-        rt_log("audio: first nonzero output after %llu frames", (unsigned long long)r->elapsed_frames);
+        rt_log("audio: first nonzero output after %llu frames", (unsigned long long)elapsed_frames);
     }
-    if (m->level_frames >= (uint64_t)r->param.sample_rate * 5) {
+    if (m->level_frames >= (uint64_t)m->rate * 5) {
         uint64_t wr = atomic_load(&m->wr), queued = wr - atomic_load(&m->rd);
-        // Per channel, so a route that reaches one side only shows (#63).
-        rt_log("audio: level rms L %.4f R %.4f, peak L %.4f R %.4f over %.1f s; written %llu frames, underruns %llu, overruns %llu, "
+        rt_log("audio: level rms %.4f peak %.4f over %.1f s; written %llu frames, underruns %llu, overruns %llu, "
                "missing frames %llu, callback frames %llu (nonzero %llu), queued %.1f ms, skipped %llu frames",
-               sqrt(m->level_sum[0] / (double)m->level_frames), sqrt(m->level_sum[1] / (double)m->level_frames),
-               m->level_peak[0], m->level_peak[1], m->level_frames / (double)r->param.sample_rate,
+               sqrt(m->level_sum / (double)m->level_count), m->level_peak, m->level_frames / (double)m->rate,
                (unsigned long long)wr, (unsigned long long)atomic_load(&m->underruns),
                (unsigned long long)atomic_load(&m->overruns), (unsigned long long)atomic_load(&m->missing_frames),
                (unsigned long long)atomic_load(&m->callback_frames), (unsigned long long)atomic_load(&m->callback_nonzero),
-               queued * 1000.0 / r->param.sample_rate, (unsigned long long)atomic_load(&m->skipped_frames));
-        m->level_sum[0] = m->level_sum[1] = m->level_peak[0] = m->level_peak[1] = 0;
-        m->level_frames = 0;
+               queued * 1000.0 / m->rate, (unsigned long long)atomic_load(&m->skipped_frames));
+        m->level_sum = m->level_peak = 0;
+        m->level_count = m->level_frames = 0;
+    }
+}
+
+static int configured_prefill_blocks(void) {
+    const char *pe = cfg_get("MTF_AUDIO_PREFILL_MS");
+    int blocks = prefill_blocks_for(pe);
+    if (blocks >= 0) return blocks;
+    rt_log("audio: MTF_AUDIO_PREFILL_MS=%s is not 0..500 ms: using %d", pe, PREFILL_DEFAULT_MS);
+    return PREFILL_DEFAULT_MS / 5;
+}
+
+// ---- the output stage alone, for a renderer that mixes elsewhere and hands over finished samples (ov_audio.c)
+struct Mixer *audio_output_open(int rate, int frame_samples) {
+    Mixer *m = calloc(1, sizeof *m);
+    if (!m) rt_fatal("audio output allocation");
+    m->frame = frame_samples;
+    m->rate = rate;
+    m->prefill = configured_prefill_blocks();
+    m->channels = output_channels();
+    atomic_store(&m->playing, 1);
+    output_open(m, rate);
+    return m;
+}
+
+int audio_output_channels(const struct Mixer *m) { return m->channels; }
+
+float audio_output_volume(void) { return host_volume(); }
+
+int64_t audio_output_pace_ns(struct Mixer *m, uint64_t now) { return output_pace_ns(m, now); }
+
+void audio_output_write(struct Mixer *m, const float *samples, int frames) {
+    const int oc = m->channels;
+    while (frames > 0) {
+        int n = frames < MAX_FRAME ? frames : MAX_FRAME;
+        float front[2 * MAX_FRAME];
+        for (int k = 0; k < n; k++) front[2 * k] = samples[oc * k], front[2 * k + 1] = samples[oc * k + 1];
+        sink_dump(front, n);
+        level_note(m, atomic_load(&m->wr) / (uint64_t)m->frame, samples, n);
+        output_push(m, samples, n);
+        samples += oc * n;
+        frames -= n;
     }
 }
 
@@ -357,12 +395,7 @@ void audio_mixer_open(AudioRenderer *r) {
     m->sink_written = calloc(sinks, sizeof(uint32_t));
     if (!m->sink_address || !m->sink_size || !m->sink_offset || !m->sink_old || !m->sink_written)
         rt_fatal("audio sink state allocation");
-    const char *pe = cfg_get("TOTK_AUDIO_PREFILL_MS");
-    m->prefill = prefill_blocks_for(pe);
-    if (m->prefill < 0) {
-        rt_log("audio: TOTK_AUDIO_PREFILL_MS=%s is not 0..500 ms: using 20", pe);
-        m->prefill = 4;
-    }
+    m->prefill = configured_prefill_blocks();
     m->channels = output_channels();
     r->mixer = m;
     atomic_store(&m->playing, r->state == 0);
@@ -426,7 +459,7 @@ static void splitters_update(AudioRenderer *r, const uint8_t *p, uint32_t n) {
         SplitInfo *s = &m->split[h[1]]; free(s->ids);
         s->ndest = (int32_t)h[3]; s->ids = calloc(h[3] ? h[3] : 1, sizeof(int32_t));
         if (!s->ids) rt_fatal("audio splitter destinations");
-        memcpy(s->ids, p + at, 4u * h[3]); at += 4u * h[3] + 12;   /* 12 reserved bytes follow the ids (measured, TOTK REV11) */
+        memcpy(s->ids, p + at, 4u * h[3]); at += 4u * h[3] + 12;   /* 12 reserved bytes follow the ids (measured, REV11) */
         if (at > n) rt_fatal("audio splitter info padding overruns section");
         for (uint32_t k = 0; k < h[3]; k++) if (s->ids[k] < 0 || s->ids[k] >= m->ndest) rt_fatal("audio splitter destination id");
     }
@@ -576,8 +609,25 @@ static void walk_step(Walk *w) {   /* the same transitions as advance_voice in a
     walk_skip_empty(w);
 }
 /* Decodes `frames` output samples per channel into out[c][k]; the renderer advances the voice afterwards by the same amount. */
+static double voice_step(const AudioRenderer *r, const ServerVoice *v) {
+    return v->in.sample_rate * (v->in.pitch > 0 ? v->in.pitch : 1.0) / r->param.sample_rate;
+}
+/* Source samples the voice consumes over `frames` output samples, counted with the exact accumulation voice_render steps by
+   (float rounding makes `fraction + seconds * rate * pitch` differ from it by one sample on some frames, a seam click);
+   leaves the fractional position in v->fraction. */
+uint64_t audio_voice_consumed(const AudioRenderer *r, ServerVoice *v, int frames) {
+    const double step = voice_step(r, v);
+    double frac = v->fraction;
+    uint64_t consumed = 0;
+    for (int k = 0; k < frames; k++) {
+        frac += step;
+        while (frac >= 1.0) { frac -= 1.0; consumed++; }
+    }
+    v->fraction = frac;
+    return consumed;
+}
 static void voice_render(AudioRenderer *r, ServerVoice *v, float out[6][MAX_FRAME], int frames) {
-    const double step = v->in.sample_rate * (v->in.pitch > 0 ? v->in.pitch : 1.0) / r->param.sample_rate;
+    const double step = voice_step(r, v);
     Walk w = {v, v->index, v->offset, v->loops_done, {0}, 0, v->adpcm.history[0], v->adpcm.history[1], v->adpcm.buffer, v->adpcm.at};
     memcpy(w.valid, v->valid, sizeof w.valid);
     walk_skip_empty(&w);
@@ -598,46 +648,13 @@ static void accumulate(Mixer *m, int buffer, const float *src, float vol, int fr
     float *d = mixbuf(m, buffer); for (int k = 0; k < frames; k++) d[k] += src[k] * vol;
 }
 static int mix_valid(AudioRenderer *r, int32_t id) { return id >= 0 && id <= r->param.submix_count && r->mixes[id].in_use; }
-static void mix_order_edge(AudioRenderer *r, int source, int destination, uint32_t edges[256][8],
-                           uint16_t incoming[256]) {
-    if (destination <= 0 || !mix_valid(r, destination)) return; // final mix is processed separately, last
-    uint32_t bit = 1u << (destination & 31);
-    if (!(edges[source][destination >> 5] & bit)) {
-        edges[source][destination >> 5] |= bit;
-        incoming[destination]++;
+static int mix_depth(AudioRenderer *r, int id) {
+    int d = 0;
+    for (int guard = 0; id > 0 && guard < 64; guard++, d++) {
+        if (!mix_valid(r, r->mixes[id].dest_mix_id)) return d + 1;
+        id = r->mixes[id].dest_mix_id;
     }
-}
-static int mix_order(AudioRenderer *r, int order[256]) {
-    const int count = r->param.submix_count + 1;
-    if (count < 1 || count > 256) rt_fatal("audio submix routing count");
-    Mixer *m = r->mixer;
-    uint32_t edges[256][8] = {{0}};
-    uint16_t incoming[256] = {0};
-    int active = 0, n = 0;
-    // Match the effective routes below, including a valid splitter with no live
-    // destination. Eglantine audio_core/renderer/mix/mix_info.cpp::MixInfo::UpdateConnection
-    // and audio_core/renderer/mix/mix_context.cpp::MixContext::TSortInfo likewise include
-    // splitter destinations in the mix dependency graph.
-    for (int i = 1; i < count; i++) if (r->mixes[i].in_use) {
-        active++;
-        const AudrenMixIn *x = &r->mixes[i];
-        if (x->dest_splitter_id != SPLITTER_UNUSED && x->dest_splitter_id < (uint32_t)m->nsplit) {
-            const SplitInfo *s = &m->split[x->dest_splitter_id];
-            for (int k = 0; k < s->ndest; k++) {
-                const SplitDest *d = &m->dest[s->ids[k]];
-                if (d->used) mix_order_edge(r, i, d->dest, edges, incoming);
-            }
-        } else mix_order_edge(r, i, x->dest_mix_id, edges, incoming);
-    }
-    for (int i = 1; i < count; i++) if (r->mixes[i].in_use && !incoming[i]) order[n++] = i;
-    for (int at = 0; at < n; at++) {
-        int source = order[at];
-        for (int destination = 1; destination < count; destination++)
-            if ((edges[source][destination >> 5] & (1u << (destination & 31))) && !--incoming[destination])
-                order[n++] = destination;
-    }
-    if (n != active) rt_fatal("audio submix routing cycle");
-    return n;
+    return d;
 }
 
 /* Guest custom effects exchange int32 samples in two rings. Each ring has CPU and DSP
@@ -649,6 +666,7 @@ static void mix_aux(AudioRenderer *r, int mix, const AudrenEffectIn *e) {
     uint8_t *send=ipc_guest(p.send_info,128+(uint64_t)p.capacity*4), *ret=ipc_guest(p.return_info,128+(uint64_t)p.capacity*4);
     uint32_t *sh=(uint32_t *)(send+64),*rh=(uint32_t *)(ret+64); int32_t *sd=(int32_t *)(send+128),*rd=(int32_t *)(ret+128);
     uint32_t wr=sh[1],read=rh[0],total=p.channels*(uint32_t)m->frame;
+    if(e->enabled) report_once(m,6,"auxiliary effect in use, channels",(int)p.channels);
     for(unsigned c=0;c<p.channels;c++) {
         if(p.input[c]>=r->mixes[mix].buffer_count || p.output[c]>=r->mixes[mix].buffer_count)rt_fatal("auxiliary effect mix buffer");
         float *input=mixbuf(m,m->offset[mix]+p.input[c]),*output=mixbuf(m,m->offset[mix]+p.output[c]);
@@ -869,8 +887,10 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             }
         }
     }
-    /* Every direct or splitter-fed source precedes its destination submix. */
-    int order[256], n = mix_order(r, order);
+    /* submixes: deepest first, so every mix is complete before it is folded into its destination */
+    int order[256], n = 0, depth[256];
+    for (int i = 1; i < mc && n < 256; i++) if (r->mixes[i].in_use) { depth[n] = mix_depth(r, i); order[n++] = i; }
+    for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++) if (depth[b] > depth[a]) { int t = order[a]; order[a] = order[b]; order[b] = t; t = depth[a]; depth[a] = depth[b]; depth[b] = t; }
     for (int a = 0; a < n; a++) {
         mix_effects(r, order[a]);
         const AudrenMixIn *x = &r->mixes[order[a]]; int src = m->offset[order[a]];
@@ -896,31 +916,38 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
         else if (r->sinks[i].type == SINK_CIRCULAR){mix_circular_sink(r,i);circular=1;}
     } else {m->sink_address[i]=0;m->sink_size[i]=m->sink_offset[i]=m->sink_old[i]=m->sink_written[i]=0;}
     const int oc = m->channels;
-    float *lr=m->output_scratch;
-    memset(lr, 0, sizeof(float) * (size_t)oc * (size_t)frames);
+    float *out=m->output_scratch;
+    memset(out, 0, sizeof(float) * (size_t)oc * (size_t)frames);
     if (sink && sink->input_count >= 1 && sink->input_count <= 6) {
+        if (!(m->reported & (1u << 6))) {
+            m->reported |= 1u << 6;
+            rt_log("audio: device sink has %u inputs, output %s", sink->input_count, oc == 6 ? "5.1" : "stereo");
+        }
         const float gain = host_volume() * atomic_load(&device_volume) * (r->mixes[0].in_use ? r->mixes[0].volume : 1.0f);
         const float *ch[6] = {0};
+        float raw[2 * MAX_FRAME];
         for (uint32_t c = 0; c < sink->input_count; c++) if (sink->inputs[c] >= 0 && sink->inputs[c] < m->nbuf) ch[c] = mixbuf(m, sink->inputs[c]);
         for (int k = 0; k < frames; k++) {
             float s[OUT_MAX] = {0};   /* FL FR C LFE RL RR */
             if (sink->input_count >= 6 && oc == 6) {
                 for (int c = 0; c < 6; c++) s[c] = ch[c] ? ch[c][k] : 0;
-            } else if (sink->input_count >= 6) {   /* 5.1 -> stereo */
-                float ff = sink->downmix_enabled ? sink->downmix[0] : 1.0f, cf = sink->downmix_enabled ? sink->downmix[1] : 0.7071f, sf = sink->downmix_enabled ? sink->downmix[3] : 0.7071f, lf = sink->downmix_enabled ? sink->downmix[2] : 0.0f;
-                float C = ch[2] ? ch[2][k] : 0, L = ch[3] ? lf * ch[3][k] : 0;   /* downmix: [0] front, [1] center, [2] LFE, [3] rear */
-                s[0] = ff * (ch[0] ? ch[0][k] : 0) + cf * C + L + sf * (ch[4] ? ch[4][k] : 0);
-                s[1] = ff * (ch[1] ? ch[1][k] : 0) + cf * C + L + sf * (ch[5] ? ch[5][k] : 0);
+            } else if (sink->input_count >= 6) {   /* 5.1 -> stereo; the LFE is left out, as the Switch's downmix does */
+                float ff = sink->downmix_enabled ? sink->downmix[0] : 1.0f, cf = sink->downmix_enabled ? sink->downmix[1] : 0.7071f, sf = sink->downmix_enabled ? sink->downmix[2] : 0.7071f;
+                float C = ch[2] ? ch[2][k] : 0;
+                s[0] = ff * (ch[0] ? ch[0][k] : 0) + cf * C + sf * (ch[4] ? ch[4][k] : 0);
+                s[1] = ff * (ch[1] ? ch[1][k] : 0) + cf * C + sf * (ch[5] ? ch[5][k] : 0);
             } else if (sink->input_count >= 2) { s[0] = ch[0] ? ch[0][k] : 0; s[1] = ch[1] ? ch[1][k] : 0; }
             else s[0] = s[1] = ch[0] ? ch[0][k] : 0;
+            raw[2 * k] = s[0] * gain; raw[2 * k + 1] = s[1] * gain;   /* MTF_AUDIO_DUMP: the front pair before clipping */
             for (int c = 0; c < oc; c++) {
                 float x = s[c] * gain;
-                lr[oc * k + c] = x > 1 ? 1 : x < -1 ? -1 : x;
+                out[oc * k + c] = x > 1 ? 1 : x < -1 ? -1 : x;
             }
         }
+        sink_dump(raw, frames);
     } else if (!sink && !circular) report_once(m, 5, "no device sink in use", r->param.sink_count);
-    level_note(r, m, lr, frames);
-    output_push(m, lr, frames);
+    level_note(m, r->elapsed_frames, out, frames);
+    output_push(m, out, frames);
 }
 
 // ---- IAudioDevice: one output device, stereo or 5.1 (output_channels)
@@ -963,12 +990,6 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
         return;
     }
     case 5: { int32_t n = output_channels(); IPC_OUT(rs, n); return; }   // GetActiveChannelCount
-    case 19: return;   // SetAudioDeviceOutputVolumeAutoTuneEnabled [18.0.0+]: the host output has no auto tune
-    case 20: case 21: {   // IsAudioDeviceOutputVolumeAutoTuneEnabled [18.0.0+], IsActiveOutputDeviceEstimatedLowLatency
-        uint8_t v = 0;   //   [21.0.0+]: both false (Switchbrew, "Audio services")
-        IPC_OUT(rs, v);
-        return;
-    }
     case 4: case 11: case 12: {   // QueryAudioDeviceSystemEvent, ...InputEvent, ...OutputEvent
         uint32_t ev = __atomic_load_n(&change_event, __ATOMIC_ACQUIRE);
         if (!ev) {

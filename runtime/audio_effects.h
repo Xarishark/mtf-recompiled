@@ -1,5 +1,5 @@
-/* Additional DSP effects. Wire layouts and algorithms follow Ryujinx.Audio
-   (MIT, third_party/licenses/Ryujinx-Audio.txt). No device or guest-memory access. */
+// The audio renderer's delay, reverb and compressor effects: wire layouts and state. No device or guest memory.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>

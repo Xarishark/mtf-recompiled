@@ -1,7 +1,7 @@
-// Tegra X1 block-linear <-> linear copies.
-// Ported from MacNativeGames games/totk/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); comments translated, the copy loop split out as tex_bl_copy.
+// Block-linear <-> linear copies (Tegra X1 and Switch 2 GOB orders).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 //
-// Layout (public descriptions: deko3d, Ryujinx BlockLinearLayout):
+// Layout (as public descriptions of the block-linear format give it):
 //   GOB = 64 bytes x 8 rows = 512 bytes; offset of (x byte, y row) within a GOB =
 //     (x%64/32)*256 + (y%8/2)*64 + (x%32/16)*32 + (y%2)*16 + x%16
 //   block = 1 GOB wide x 2^th GOBs high x 2^td GOBs deep, ordered y first then z inside a block; blocks fill the level
@@ -11,10 +11,20 @@
 #include "tex.h"
 #include <string.h>
 
-// Byte offset inside a 64 x 8 GOB in the Switch 2 layout: x[3:0] -> bits 0-3, y[0] -> 4, y[1] -> 5, x[4] -> 6, y[2] -> 7,
-// x[5] -> 8. It is the Switch 1 GOB with bits 5 and 6 swapped (Eglantine, video_core/textures/decoders.cpp,
-// NativeGobOffset, which ChannelState::Init turns on for every nx2 image through EnableNativeTiling).
+#include "cfg.h"
+
+// The Switch 2 keeps the GOB's size and place but orders its 16-byte pieces x5 y2 x4 y1 y0 where the X1 has
+// x5 y2 y1 x4 y0 (offset bits 5 and 6 exchanged): (x%64/32)*256 + (y%8/4)*128 + (x%32/16)*64 + (y%4/2)*32 + (y%2)*16
+// + x%16. Read with the X1's order, a Switch 2 game's textures break into misplaced 4x4 blocks along every edge.
+// MTF runs on the Switch 2 only; MTF_GOB_X1=1 takes the X1's order (for comparison).
+static int gob_x1(void) {
+    static int v = -1;
+    if (v < 0) v = cfg_bool("MTF_GOB_X1");
+    return v;
+}
+
 static uint32_t gob_off(uint32_t x, uint32_t y) {
+    if (gob_x1()) return (x % 64 / 32) * 256 + (y % 8 / 2) * 64 + (x % 32 / 16) * 32 + (y % 2) * 16 + x % 16;
     return (x % 64 / 32) * 256 + (y % 8 / 4) * 128 + (x % 32 / 16) * 64 + (y % 4 / 2) * 32 + (y % 2) * 16 + x % 16;
 }
 
@@ -50,10 +60,12 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
 }
 
 // nvn_bl_offset per row instead of per 16 bytes: within a row, GOB column k starts k blocks further, and the four
-// 16-byte segments of a GOB row (x % 64 = 0, 16, 32, 48) sit at 0, 64, 256 and 320 of it.
+// 16-byte segments of a GOB row (x % 64 = 0, 16, 32, 48) sit at 0, 64, 256 and 320 of it on the Switch 2 (0, 32, 256
+// and 288 on the X1).
 void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
                  unsigned th, unsigned td, int to_linear) {
-    static const uint32_t seg[4] = {0, 64, 256, 320};
+    static const uint32_t seg_s2[4] = {0, 64, 256, 320}, seg_x1[4] = {0, 32, 256, 288};
+    const uint32_t *seg = gob_x1() ? seg_x1 : seg_s2;
     uint64_t block = 512ull << th << td;
     for (uint32_t z = 0; z < slices; z++)
         for (uint32_t y = 0; y < rows; y++) {
@@ -127,7 +139,4 @@ int nvn_texels_box(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_
 
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
     return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1);
-}
-int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
-    return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0);
 }

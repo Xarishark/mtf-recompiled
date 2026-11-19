@@ -1,33 +1,32 @@
-// Adapted from MacNativeGames games/totk/runtime/services.c (lines 208-302), applet_host.c, account.c, time_host.c and
-// shared_font.c @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames contributors).
 // System service overrides: nn::oe, applet, am, prepo, nfp, err, aoc, pctl, diag,
 // account, time and pl, and the six observers. Nothing here talks to a Horizon service; each call is answered by the
 // host. Stub rule: queries and initialisation succeed with neutral values, data paths stop with a named fatal.
 //
 // Environment:
-//   TOTK_LANG=<Switch language code>   the game's language as given ("ja", "en-GB", "zh-Hant", ...)
-//   TOTK_LOCALE=<BCP 47 tag>           else the language for this locale ("pt-BR"), else the Windows user locale;
+//   MTF_LANG=<Switch language code>   the game's language as given ("ja", "en-GB", "zh-Hant", ...)
+//   MTF_LOCALE=<BCP 47 tag>           else the language for this locale ("pt-BR"), else the Windows user locale;
 //                                      a language the game does not ship becomes en-US
-//   TOTK_OPERATION_MODE=docked|handheld   operation and performance mode reported to the game (default docked)
-//   TOTK_ASSUME_FOCUS=1|0              1 (default, the Game tab's row): GetCurrentFocusState always reports in focus,
+//   MTF_OPERATION_MODE=docked|handheld   operation and performance mode reported to the game (default docked)
+//   MTF_ASSUME_FOCUS=1|0              1 (default, the Game tab's row): GetCurrentFocusState always reports in focus,
 //                                      whatever the window says; 0: out of focus while the window is, as on a Switch
-//   TOTK_SHARED_FONTS=<dir>            nn::pl shared fonts (tools/extract_fonts.py output), default
+//   MTF_SHARED_FONTS=<dir>            nn::pl shared fonts (tools/extract_fonts.py output), default
 //                                      <romfs>/../../firmware/shared-fonts
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#include "aoc_romfs.h"
+#include "amiibo.h"
 #include "cfg.h"
+#include "fs.h"
 #include "host.h"
 #include "ov.h"
 #include "platform/platform.h"
 
 #define NFP_R_DEVICE_NOT_FOUND 0x8073u     // nfp: no NFC reader on the host
-#define ACCOUNT_R_INVALID 0x7c67u          // MacNativeGames' result for an unknown user handle or uid
-#define ACCOUNT_R_REGISTRATION_REQUIRED 0x1907cu
+#define ACCOUNT_R_INVALID 0x7c67u          // the result for an unknown user handle or uid
 #define TIME_R_INVALID 0x74u
 #define TIME_R_SOURCE_MISMATCH 0x18074u
 
@@ -38,15 +37,15 @@ static void need(int ok, const char *what) {
 static const char *caller(Cpu *c, char *buf, int n) { return ldr_describe(c->x[30] - 4, buf, n); }
 
 // ==== nn::oe (services.c)
-// TOTK_OPERATION_MODE, read once: 1 handheld (OperationMode 0, PerformanceMode Normal 0), 0 docked (1, Boost 1).
+// MTF_OPERATION_MODE, read once: 1 handheld (OperationMode 0, PerformanceMode Normal 0), 0 docked (1, Boost 1).
 int ov_handheld(void) {
     static volatile int32_t v = -1;
     int32_t h = v;
     if (h < 0) {
-        const char *e = cfg_value("TOTK_OPERATION_MODE");
+        const char *e = cfg_value("MTF_OPERATION_MODE");
         if (!strcmp(e, "docked")) h = 0;
         else if (!strcmp(e, "handheld")) h = 1;
-        else rt_fatal("TOTK_OPERATION_MODE must be docked or handheld, not '%s'", e);
+        else rt_fatal("MTF_OPERATION_MODE must be docked or handheld, not '%s'", e);
         if (plat_cas32(&v, h, -1) == -1)
             rt_log("oe: operation mode reported to the game: %s", h ? "handheld (performance normal)"
                                                                   : "docked (performance boost)");
@@ -73,13 +72,11 @@ static const char *switch_language(const char *tag) {
         }
         p += k;
     }
-    // Bananza ships Portuguese only as Mals/USpt (the Americas), with no EUpt for plain "pt", so every Portuguese
-    // locale, Portugal's included, asks for pt-BR; "pt" alone would fall back to English.
-    if (!strcmp(lang, "pt") && !rt_game_version) return "pt-BR";
     if (!strcmp(lang, "ja") || !strcmp(lang, "de") || !strcmp(lang, "it") || !strcmp(lang, "nl") ||
         !strcmp(lang, "ru") || !strcmp(lang, "ko") || !strcmp(lang, "pt"))
         return !strcmp(lang, "ja") ? "ja" : !strcmp(lang, "de") ? "de" : !strcmp(lang, "it") ? "it"
-             : !strcmp(lang, "nl") ? "nl" : !strcmp(lang, "ru") ? "ru" : !strcmp(lang, "ko") ? "ko" : "pt";
+             : !strcmp(lang, "nl") ? "nl" : !strcmp(lang, "ru") ? "ru" : !strcmp(lang, "ko") ? "ko"
+             : *region && strcmp(region, "PT") ? "pt-BR" : "pt";   // Brazilian Portuguese is its own Switch language
     if (!strcmp(lang, "fr")) return !strcmp(region, "CA") ? "fr-CA" : "fr";
     if (!strcmp(lang, "es")) return *region && strcmp(region, "ES") ? "es-419" : "es";
     if (!strcmp(lang, "zh"))
@@ -91,27 +88,27 @@ static const char *switch_language(const char *tag) {
     return "en-US";
 }
 
-// The game's language as a Switch language code (TOTK_LANG, else TOTK_LOCALE, else the Windows user locale). TotK
-// accepts "zh-Hans" and "zh-Hant" for Chinese and falls back to Japanese for "zh-CN" and "zh-TW", so those two
-// spellings, which older totk.ini files and menus wrote, are mapped to them.
+// The game's language as a Switch language code: MTF_LANG, a code or "auto"; MTF_LOCALE set alone (a BCP 47 tag)
+// means auto with that tag; else the default, en-US (cfg.c). auto maps the tag, or the Windows user locale, to the
+// nearest language the Switch has. "zh-CN" and "zh-TW", which older mtf.ini files wrote, are read as zh-Hans / zh-Hant.
 const char *ov_language(void) {
     static const char *const codes[] = {"ja", "en-US", "fr", "de", "it", "es", "ko", "nl", "pt", "ru",
                                         "en-GB", "fr-CA", "es-419", "zh-Hans", "zh-Hant", "pt-BR"};
-    const char *code = cfg_get("TOTK_LANG");   // no fixed default: TOTK_LOCALE or the Windows user locale decides when unset
-    if (code && *code) {
-        if (!strcmp(code, "zh-CN")) return "zh-Hans";
-        if (!strcmp(code, "zh-TW")) return "zh-Hant";
-        for (size_t i = 0; i < sizeof codes / sizeof *codes; i++)
-            if (!strcmp(code, codes[i])) return codes[i];
-        rt_fatal("TOTK_LANG '%s' is not a Switch language code", code);
+    const char *code = cfg_get("MTF_LANG"), *tag = cfg_get("MTF_LOCALE");
+    if (!code) code = tag ? "auto" : cfg_value("MTF_LANG");
+    if (!strcmp(code, "auto")) {
+        char sys[85] = "en-US";
+        if (!tag) {
+            if (*plat_user_locale()) snprintf(sys, sizeof sys, "%s", plat_user_locale());
+            tag = sys;
+        }
+        return switch_language(tag);
     }
-    const char *tag = cfg_get("TOTK_LOCALE");
-    char sys[85] = "en-US";
-    if (!tag || !*tag) {
-        if (*plat_user_locale()) snprintf(sys, sizeof sys, "%s", plat_user_locale());
-        tag = sys;
-    }
-    return switch_language(tag);
+    if (!strcmp(code, "zh-CN")) return "zh-Hans";
+    if (!strcmp(code, "zh-TW")) return "zh-Hant";
+    for (size_t i = 0; i < sizeof codes / sizeof *codes; i++)
+        if (!strcmp(code, codes[i])) return codes[i];
+    rt_fatal("MTF_LANG '%s' is not a Switch language code (or auto)", code);
 }
 
 // LanguageCode GetDesiredLanguage(): char[8] in x0
@@ -123,72 +120,6 @@ static void ov_desired_language(Cpu *c) {
 }
 
 static void ov_oe_initialize(Cpu *c) { (void)c; rt_log("oe: application environment: a local host process"); }
-
-static void ov_nifm_initialize(Cpu *c) {
-    (void)c;
-    rt_log("nifm: offline host; network requests are unavailable");
-}
-
-static void ov_nifm_submit(Cpu *c) {
-    (void)c;
-    rt_log("nifm: network request refused (offline host)");
-}
-
-static void ov_nifm_unavailable(Cpu *c) {
-    // No request is accepted and no system network applet can resolve an error on this host.
-    ret_x(c, 0);
-}
-
-static void ov_bcat_initialize(Cpu *c) {
-    (void)c;
-    rt_log("bcat: offline host; no delivery cache is installed");
-}
-
-static void ov_friends_initialize(Cpu *c) {
-    (void)c;
-    rt_log("friends: offline host; friend list is empty");
-    ret_x(c, 0);
-}
-
-static void ov_friends_get_list(Cpu *c) {
-    int32_t *out_count = arg_p(c, 0);
-    if (out_count) *out_count = 0;
-    ret_x(c, 0);
-}
-
-static void ov_friends_ok(Cpu *c) { ret_x(c, 0); }
-
-static void ov_friends_event(Cpu *c) {
-    static uint64_t ev_addr;
-    if (!ev_addr) {
-        void *p = mem_kernel_alloc(64, 16);
-        ev_addr = (uint64_t)(uintptr_t)p;
-        kern_bind_system_event(c, ev_addr, 1);
-    }
-    ret_x(c, ev_addr);
-}
-
-static void ov_streamplay_memory(Cpu *c) {
-    // No GameShare session or streaming buffers exist on the offline host.
-    rt_log("streamplay: GameShare unavailable; no streaming work memory required");
-    ret_x(c, 0);
-}
-
-static void ov_bcat_mount(Cpu *c) {
-    // BCAT's FailedOpenEntity (module 122, description 2), not a successful mount of nonexistent content.
-    ret_x(c, 0x47a);
-}
-
-static void ov_display_version(Cpu *c) {
-    char *out = arg_p(c, 0);
-    memset(out, 0, 16);
-    if (*rt_game_display && strlen(rt_game_display) < 16) {
-        memcpy(out, rt_game_display, strlen(rt_game_display));
-        return;
-    }
-    memcpy(out, "unknown", sizeof "unknown");
-    rt_log("oe: display version unavailable (no control metadata)");
-}
 
 // void SetPerformanceConfiguration(PerformanceMode mode, int config)
 static void ov_performance_config(Cpu *c) {
@@ -224,8 +155,8 @@ static void ov_focus_mode(Cpu *c) {
 // FocusState GetCurrentFocusState(): 1 in focus, 2 out of focus (nn::oe::FocusState). The game sets focus handling
 // mode 2: on a Switch the system then suspends the whole process while it is out of focus and sends Resume when it
 // returns. Here only the game's main thread stops (it waits in PopNotificationMessage for the next message) while its
-// loader threads, audio and clocks run on, and a load interrupted that way was seen to never finish (Linux, 1.4.3).
-// So TOTK_ASSUME_FOCUS=1, the default, keeps it at 1, as MacNativeGames does; with 0 it follows the window through
+// loader threads, audio and clocks run on, and a load interrupted that way was seen to never finish (on Linux).
+// So MTF_ASSUME_FOCUS=1, the default, keeps it at 1; with 0 it follows the window through
 // oe_set_focus. The caller of oe_set_focus also pushes OE_MSG_FOCUS_STATE_CHANGED.
 //
 // The setting is read on every focus change rather than once at start: a focus change is rare, the lookup is a short
@@ -233,7 +164,7 @@ static void ov_focus_mode(Cpu *c) {
 // a restart.
 static volatile int32_t focus_state = 1;
 void oe_set_focus(int in_focus) {
-    plat_xchg32(&focus_state, in_focus || atoi(cfg_value("TOTK_ASSUME_FOCUS")) ? 1 : 2);
+    plat_xchg32(&focus_state, in_focus || atoi(cfg_value("MTF_ASSUME_FOCUS")) ? 1 : 2);
 }
 static void ov_focus_state(Cpu *c) { ret_x(c, (uint64_t)focus_state); }
 
@@ -258,6 +189,14 @@ void oe_push_message(uint32_t message) {
         plat_cond_broadcast(&message_cv);
     }
     plat_mutex_unlock(&lock);
+    oe_message_event_signal();   // ov_switch2.c: the event GetNotificationMessageEvent hands out
+}
+
+int oe_pending_messages(void) {
+    plat_mutex_lock_shared(&lock);
+    int n = (int)(tail - head);
+    plat_mutex_unlock_shared(&lock);
+    return n;
 }
 
 // void GetExpectedVolumeBalance(float *left, float *right)
@@ -280,9 +219,9 @@ static void ov_set_balance(Cpu *c) {
     plat_mutex_unlock(&lock);
 }
 
-// TimeSpan GetProgramTotalActiveTime(): nanoseconds since the process started
+// TimeSpan GetProgramTotalActiveTime(): nanoseconds since the process started (31.25 MHz ticks, 32 ns each)
 static void ov_active_time(Cpu *c) {
-    ret_x(c, rt_ticks_to_ns(rt_ticks() - start_ticks));
+    ret_x(c, (rt_ticks() - start_ticks) * 32);
 }
 
 // void SetUserInactivityDetectionTimeExtended[Unsafe](bool): the host never puts the console to sleep
@@ -336,26 +275,198 @@ static void ov_report_save(Cpu *c) {   // Result PlayReport::Save() and Save(con
 }
 static void ov_result_ok(Cpu *c) { ret_x(c, 0); }   // RequestImmediateTransmission, AddInternetConnectionStatus
 
-// nn::nfp: no NFC reader
+// nn::nfp: NFC reader & amiibo support
 static volatile int32_t nfp_state;
 static void ov_nfp_initialize(Cpu *c) { plat_xchg32(&nfp_state, 1); ret_x(c, 0); }
-static void ov_nfp_finalize(Cpu *c) { plat_xchg32(&nfp_state, 0); ret_x(c, 0); }
+static void ov_nfp_finalize(Cpu *c) {
+    plat_xchg32(&nfp_state, 0);
+    amiibo_stop_detection();
+    amiibo_unmount();
+    ret_x(c, 0);
+}
 static void ov_nfp_state(Cpu *c) { ret_x(c, (uint64_t)nfp_state); }
+
 // Result ListDevices(DeviceHandle *out, int *count, int max)
 static void ov_nfp_list(Cpu *c) {
+    void *out = arg_p(c, 0);
     int32_t *count = arg_p(c, 1);
-    if (count) *count = 0;
-    ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+    int32_t max = (int32_t)arg_x(c, 2);
+    if (!amiibo_is_device_present()) {
+        if (count) *count = 0;
+        ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+        return;
+    }
+    if (out && max > 0) {
+        static const uint8_t dev[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+        memcpy(out, dev, sizeof dev);
+    }
+    if (count) *count = 1;
+    ret_x(c, 0);
 }
+
 // Result AttachAvailabilityChangeEvent(os::SystemEventType *event)
 static void ov_nfp_availability(Cpu *c) {
     uint64_t ev = arg_x(c, 0);
     if (!ev) rt_fatal("nn::nfp::AttachAvailabilityChangeEvent: null event");
     kern_bind_system_event(c, ev, 0);
+    kern_signal_system_event(ev);
     ret_x(c, 0);
 }
-static void ov_nfp_no_device(Cpu *c) { ret_x(c, NFP_R_DEVICE_NOT_FOUND); }
-static void ov_nfp_device_state(Cpu *c) { ret_x(c, 0); }   // DeviceState GetDeviceState(const DeviceHandle &): none
+
+// DeviceState GetDeviceState(const DeviceHandle &)
+static void ov_nfp_device_state(Cpu *c) {
+    (void)c;
+    ret_x(c, (uint64_t)amiibo_get_device_state());
+}
+
+// Result Mount(const DeviceHandle &, ModelType, MountTarget)
+static void ov_nfp_mount(Cpu *c) {
+    (void)c;
+    if (!amiibo_has_tag()) {
+        ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+        return;
+    }
+    amiibo_mount();
+    ret_x(c, 0);
+}
+
+// Result GetNpadId(u32 *npad_id, const DeviceHandle &)
+static void ov_nfp_get_npad_id(Cpu *c) {
+    uint32_t *npad = arg_p(c, 0);
+    if (npad) *npad = 0; // Handheld / Player 1
+    ret_x(c, 0);
+}
+
+// Result AttachActivateEvent(os::SystemEventType *event, const DeviceHandle &)
+static void ov_nfp_attach_activate(Cpu *c) {
+    uint64_t ev = arg_x(c, 0);
+    if (ev) {
+        kern_bind_system_event(c, ev, 0);
+        if (amiibo_has_tag()) kern_signal_system_event(ev);
+    }
+    ret_x(c, 0);
+}
+
+// Result AttachDeactivateEvent(os::SystemEventType *event, const DeviceHandle &)
+static void ov_nfp_attach_deactivate(Cpu *c) {
+    uint64_t ev = arg_x(c, 0);
+    if (ev) {
+        kern_bind_system_event(c, ev, 0);
+    }
+    ret_x(c, 0);
+}
+
+// Result StartDetection(const DeviceHandle &)
+static void ov_nfp_start_detection(Cpu *c) {
+    (void)c;
+    amiibo_start_detection();
+    ret_x(c, 0);
+}
+
+// Result StopDetection(const DeviceHandle &)
+static void ov_nfp_stop_detection(Cpu *c) {
+    (void)c;
+    amiibo_stop_detection();
+    ret_x(c, 0);
+}
+
+// Result GetTagInfo(TagInfo *out, const DeviceHandle &)
+static void ov_nfp_get_tag_info(Cpu *c) {
+    void *out = arg_p(c, 0);
+    if (!amiibo_has_tag() && !amiibo_is_mounted()) {
+        ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+        return;
+    }
+    if (out) amiibo_get_tag_info(out);
+    ret_x(c, 0);
+}
+
+// Result GetModelInfo(ModelInfo *out, const DeviceHandle &)
+static void ov_nfp_get_model_info(Cpu *c) {
+    void *out = arg_p(c, 0);
+    if (!amiibo_is_mounted() && !amiibo_has_tag()) {
+        ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+        return;
+    }
+    if (out) amiibo_get_model_info(out);
+    ret_x(c, 0);
+}
+
+// ---- the rest of nn::nfp the game imports, over this runtime's amiibo emulation (amiibo.c): with a mounted tag the calls work on its dump, without
+// one they answer "device not found". The amiibo settings applets are not emulated.
+static int nfp_need_tag(Cpu *c) {
+    if (amiibo_is_mounted() || amiibo_has_tag()) return 1;
+    ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+    return 0;
+}
+// Result Unmount(const DeviceHandle &)
+static void ov_nfp_unmount(Cpu *c) {
+    amiibo_unmount();
+    ret_x(c, 0);
+}
+// Result GetCommonInfo(CommonInfo *out, const DeviceHandle &)
+static void ov_nfp_common_info(Cpu *c) {
+    void *out = arg_p(c, 0);
+    if (!nfp_need_tag(c)) return;
+    if (out) amiibo_get_common_info(out);
+    ret_x(c, 0);
+}
+// Result GetRegisterInfo(RegisterInfo *out, const DeviceHandle &)
+static void ov_nfp_register_info(Cpu *c) {
+    void *out = arg_p(c, 0);
+    if (!nfp_need_tag(c)) return;
+    if (out) amiibo_get_register_info(out);
+    ret_x(c, 0);
+}
+// Result Flush(const DeviceHandle &) / Restore(const DeviceHandle &): nothing to write back on the host
+static void ov_nfp_flush(Cpu *c) {
+    if (!nfp_need_tag(c)) return;
+    ret_x(c, 0);
+}
+// Result OpenApplicationArea(const DeviceHandle &, uint32_t access_id)
+static void ov_nfp_open_area(Cpu *c) {
+    if (!nfp_need_tag(c)) return;
+    ret_x(c, 0);
+}
+// Result GetApplicationArea(void *buf, size_t *read, const DeviceHandle &, size_t size)
+static void ov_nfp_get_area(Cpu *c) {
+    void *buf = arg_p(c, 0);
+    uint64_t *n = arg_p(c, 1);
+    uint64_t size = arg_x(c, 3);
+    if (n) *n = 0;
+    if (!nfp_need_tag(c)) return;
+    int got = buf ? amiibo_get_application_area(buf, size > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)size) : 0;
+    if (n) *n = (uint64_t)got;
+    ret_x(c, 0);
+}
+// Result SetApplicationArea(const DeviceHandle &, const void *buf, size_t size) /
+// Result CreateApplicationArea(const DeviceHandle &, const ApplicationAreaCreateInfo &): accepted, the dump is kept as
+// it was loaded (the host writes no amiibo file back)
+static void ov_nfp_set_area(Cpu *c) {
+    if (!nfp_need_tag(c)) return;
+    static int logged;
+    if (!logged++) rt_log("nfp: the game writes an amiibo application area: accepted, not saved to the dump");
+    ret_x(c, 0);
+}
+// StartRestorer / StartGameDataEraser / StartNicknameAndOwnerSettings: the amiibo settings applet, which the host lacks
+static void ov_nfp_applet(Cpu *c) {
+    static int logged;
+    if (!logged++) rt_log("nfp: the game opens an amiibo settings applet: not emulated, answered as no device");
+    ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+}
+
+// ---- nn::diag: an abort stops with the caller named; GetBacktrace has no frames
+static void ov_diag_abort(Cpu *c) {
+    char lr[96];
+    rt_fatal("nn::diag::AbortImpl() from %s: the game aborted", ldr_describe(c->x[30] - 4, lr, sizeof lr));
+}
+static void ov_diag_abort_result(Cpu *c) {
+    char lr[96];
+    const uint32_t *r = arg_p(c, 0);
+    rt_fatal("nn::diag::AbortImpl(Result %#x) from %s: the game aborted", r ? *r : 0u,
+             ldr_describe(c->x[30] - 4, lr, sizeof lr));
+}
+static void ov_diag_backtrace(Cpu *c) { ret_x(c, 0); }   // int GetBacktrace(uintptr_t *out, int n): 0 frames
 
 // void err::ShowError(Result): the game's error dialog, logged
 static void ov_show_error(Cpu *c) {
@@ -367,20 +478,13 @@ static void ov_show_error(Cpu *c) {
 
 // ==== SDK-internal initialisation (services.c)
 static void ov_diag_startup(Cpu *c) { (void)c; rt_log("diag: host diagnostics"); }
-static void ov_aoc_initialize(Cpu *c) { (void)c; rt_log("aoc: %u add-on content(s)", aoc_count()); }
-static void ov_aoc_count(Cpu *c) { ret_x(c, aoc_count()); }
-// int ListAddOnContent(int *out, int offset, int count): the add-on content indices this machine has, paged. The
-// argument layout and the count in the return value are the mangled signature's (EPiii); the buffer is checked to be
-// mapped (the host can only probe readability) before a single entry lands in it, because a wrong layout here would corrupt guest memory silently.
+static void ov_aoc_initialize(Cpu *c) { (void)c; rt_log("aoc: no add-on content"); }
+// A game's main may list add-on content: there is none.
+// int ListAddOnContent(AddOnContentIndex *out, int offset, int count)
 static void ov_aoc_list(Cpu *c) {
-    int32_t *out = arg_p(c, 0);
-    int offset = (int32_t)arg_x(c, 1), count = (int32_t)arg_x(c, 2);
+    int offset = (int)arg_x(c, 1), count = (int)arg_x(c, 2);
     if (offset < 0 || count < 0) rt_fatal("aoc: ListAddOnContent range %d+%d", offset, count);
-    uint32_t ids[AOC_MAX];
-    uint32_t n = aoc_list(ids, offset, count < AOC_MAX ? count : AOC_MAX);
-    if (n && !(out && plat_mem_readable((uintptr_t)out, n * sizeof *out))) n = 0;   // nothing written, nothing reported
-    for (uint32_t i = 0; i < n; i++) out[i] = (int32_t)ids[i];
-    ret_x(c, n);
+    ret_x(c, 0);
 }
 static void ov_err_context(Cpu *c) { (void)c; rt_log("err: error contexts stay local"); }
 static void ov_pctl_initialize(Cpu *c) { (void)c; rt_log("pctl: no parental controls"); }
@@ -512,25 +616,6 @@ static void ov_user_id(Cpu *c) {
     ret_x(c, ok ? 0 : ACCOUNT_R_INVALID);
 }
 
-static void ov_cached_account(Cpu *c) {
-    plat_mutex_lock_shared(&account_lock);
-    int ok = valid_handle(arg_p(c, 1));
-    plat_mutex_unlock_shared(&account_lock);
-    // The local user has no linked Nintendo Account; the SDK leaves both outputs untouched on failure.
-    ret_x(c, ok ? ACCOUNT_R_REGISTRATION_REQUIRED : ACCOUNT_R_INVALID);
-}
-
-// Result GetLastOpenedUser(Uid *out): the local user, the only one the host ever opens (Bananza asks after
-// TryOpenPreselectedUser)
-static void ov_last_opened_user(Cpu *c) {
-    Uid *out = arg_p(c, 0);
-    if (!out) rt_fatal("nn::account::GetLastOpenedUser: null output");
-    plat_mutex_lock_shared(&account_lock);
-    *out = local;
-    plat_mutex_unlock_shared(&account_lock);
-    ret_x(c, 0);
-}
-
 // Result GetUserExistence(bool *out, const Uid &)
 static void ov_user_existence(Cpu *c) {
     uint8_t *out = arg_p(c, 0);
@@ -555,73 +640,6 @@ static void ov_nickname(Cpu *c) {
         memcpy(out, "Local", 5);
     }
     ret_x(c, ok ? 0 : ACCOUNT_R_INVALID);
-}
-
-// Result LoadProfileImage(size_t *outSize, void *outBuffer, size_t bufferSize, const Uid &)
-static void ov_load_profile_image(Cpu *c) {
-    uint64_t *out_sz = arg_p(c, 0);
-    void *buf = arg_p(c, 1);
-    size_t buf_sz = (size_t)arg_x(c, 2);
-    const Uid *u = arg_p(c, 3);
-    plat_mutex_lock(&account_lock);
-    load_uid();
-    int ok = u && same_uid(u);
-    plat_mutex_unlock(&account_lock);
-    if (!ok) { ret_x(c, ACCOUNT_R_INVALID); return; }
-    // Minimal valid 64x64 baseline JPEG (693 bytes) so nn::account::LoadProfileImage returns a valid icon.
-    static const uint8_t k_jpeg[] = {
-        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
-        0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08,
-        0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
-        0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27, 0x20,
-        0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1f, 0x27,
-        0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xdb, 0x00, 0x43, 0x01, 0x09, 0x09,
-        0x09, 0x0c, 0x0b, 0x0c, 0x18, 0x0d, 0x0d, 0x18, 0x32, 0x21, 0x1c, 0x21, 0x32, 0x32, 0x32, 0x32,
-        0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32,
-        0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32,
-        0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0xff, 0xc0,
-        0x00, 0x11, 0x08, 0x00, 0x40, 0x00, 0x40, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11,
-        0x01, 0xff, 0xc4, 0x00, 0x1f, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
-        0x0a, 0x0b, 0xff, 0xc4, 0x00, 0xb5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05,
-        0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7d, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21,
-        0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23,
-        0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17,
-        0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a,
-        0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a,
-        0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
-        0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
-        0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
-        0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5,
-        0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1,
-        0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xff, 0xc4, 0x00, 0x1f, 0x01, 0x00, 0x03,
-        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0xff, 0xc4, 0x00, 0xb5, 0x11, 0x00,
-        0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04, 0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77, 0x00,
-        0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71, 0x13,
-        0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, 0x15,
-        0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26, 0x27,
-        0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
-        0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
-        0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
-        0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6,
-        0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4,
-        0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2,
-        0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9,
-        0xfa, 0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3f, 0x00, 0xe7,
-        0x28, 0xa2, 0x8a, 0xfb, 0x23, 0xc3, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28,
-        0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28,
-        0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28,
-        0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28, 0xa2, 0x80, 0x0a, 0x28,
-        0xa2, 0x80, 0x3f, 0xff, 0xd9,
-    };
-    if (out_sz) *out_sz = sizeof k_jpeg;
-    if (buf && buf_sz >= sizeof k_jpeg) {
-        memcpy(buf, k_jpeg, sizeof k_jpeg);
-        ret_x(c, 0);
-    } else {
-        ret_x(c, ACCOUNT_R_INVALID);
-    }
 }
 
 // ==== nn::time (time_host.c): the host clock and time zone. User and network clocks follow the host wall clock; the
@@ -837,12 +855,11 @@ static void ov_user_difference(Cpu *c) {
     ret_x(c, (uint64_t)((b->user.offset - a->user.offset) * 1000000000ll));
 }
 
-// ==== nn::pl shared fonts (shared_font.c). TotK asks for them only from its font loader, only with Simplified Chinese,
-// Korean or Traditional Chinese text, and only for type 0; tools/extract_fonts.py writes
-// them from the user's firmware. Each type is read on first use into guest-visible memory as the BFTTF file the pl
+// ==== nn::pl shared fonts (shared_font.c). A game asks for them from its font
+// loader; they are read from the user's firmware. Each type is read on first use into guest-visible memory as the BFTTF file the pl
 // shared memory holds; Address is 8 bytes past the file start (after the BFTTF header) and Size the decoded font size,
-// as in MNG. The load state is always Loaded: the game spins until it is, so missing files stop with a named fatal at
-// Address/Size instead of a hang. TOTK_SHARED_FONTS=<dir> overrides <romfs>/../../firmware/shared-fonts.
+// The load state is always Loaded: the game spins until it is, so missing files stop with a named fatal at
+// Address/Size instead of a hang. MTF_SHARED_FONTS=<dir> overrides <romfs>/../../firmware/shared-fonts.
 #define SHARED_FONT_TYPES 6
 #define BFTTF_MAGIC 0x7f9a0218u
 static const char *const font_files[SHARED_FONT_TYPES] = {
@@ -851,10 +868,10 @@ static const char *const font_files[SHARED_FONT_TYPES] = {
 static struct { PlatMutex lock; const uint8_t *file[SHARED_FONT_TYPES]; uint64_t size[SHARED_FONT_TYPES]; } fonts;
 
 const char *ov_shared_font_dir(char *buf, size_t n) {
-    const char *e = cfg_get("TOTK_SHARED_FONTS");
+    const char *e = cfg_get("MTF_SHARED_FONTS");
     if (e && *e) snprintf(buf, n, "%s", e);
     else {
-        char exe[PLAT_PATH_MAX], probe[PLAT_PATH_MAX + 40];   // shared-fonts next to totk.exe (tools/package_build.py), else the repo's
+        char exe[PLAT_PATH_MAX], probe[PLAT_PATH_MAX + 40];   // shared-fonts next to mtf-recomp.exe (tools/package_build.py), else the repo's
         int len = plat_exe_path(exe, sizeof exe);
         char *cut = len && len < sizeof exe ? plat_last_sep(exe) : NULL;
         if (cut) *cut = 0;
@@ -868,7 +885,7 @@ const char *ov_shared_font_dir(char *buf, size_t n) {
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
 // The decoded font size of a BFTTF image, 0 if it is not one: big-endian words XORed with key = word0 ^ BFTTF_MAGIC,
-// word1 = font size, then an sfnt (TrueType or OpenType) font (MNG extract_shared_fonts.py bfttf_size).
+// word1 = font size, then an sfnt (TrueType or OpenType) font.
 uint64_t ov_bfttf_size(const uint8_t *p, uint64_t len) {
     if (len < 12) return 0;
     uint32_t key = be32(p) ^ BFTTF_MAGIC, size = be32(p + 4) ^ key, first = be32(p + 8) ^ key;
@@ -886,38 +903,49 @@ static void ov_font_state(Cpu *c) { font_type(c, "GetSharedFontLoadState"); ret_
 
 // The font of type t, read and checked on first use; a named fatal when it is missing or damaged.
 static const uint8_t *font_data(Cpu *c, const char *fn, int64_t t) {
-    (void)c; (void)fn;
     plat_mutex_lock(&fonts.lock);
     if (!fonts.file[t]) {
-        char dir[PLAT_PATH_MAX], path[PLAT_PATH_MAX + 64];
+        char dir[PLAT_PATH_MAX], path[PLAT_PATH_MAX + 64], lr[96];
         snprintf(path, sizeof path, "%s/%s", ov_shared_font_dir(dir, sizeof dir), font_files[t]);
         FILE *f = fopen(path, "rb");
-        int is_raw_ttf = 0;
         if (!f) {
-            const char *win_font = "C:/Windows/Fonts/arial.ttf";
-            f = fopen(win_font, "rb");
-            if (f) {
-                is_raw_ttf = 1;
-                static volatile int32_t warned[SHARED_FONT_TYPES];
-                if (!__atomic_exchange_n(&warned[t], 1, __ATOMIC_RELAXED))
-                    rt_log("pl: shared font %lld (%s) not found at %s; using system fallback %s",
-                           (long long)t, font_type_name(t), path, win_font);
-            } else {
-                rt_fatal("nn::pl::%s(%lld): no shared font %s and no fallback %s", fn, (long long)t, path, win_font);
-            }
+            // No firmware fonts: a stand-in TrueType font in a BFTTF of key 0 (the decoded marker, then the size and
+            // the font as it is), which the SDK's font engine takes without decoding.
+            // The game's own text uses the fonts in its RomFS; system names and button icons use these.
+            const char *ttf = cfg_get("MTF_SHARED_FONT_TTF");
+            if (!ttf || !*ttf) ttf = "C:/Windows/Fonts/arial.ttf";
+            uint64_t n = 0;
+            uint8_t *font = plat_file_read(ttf, &n);
+            if (!font || n < 12 || n > (64 << 20))
+                rt_fatal("nn::pl::%s(%lld) from %s: no shared font %s and no stand-in TTF %s (set MTF_SHARED_FONTS to "
+                         "the firmware fonts or MTF_SHARED_FONT_TTF to a TrueType font)", fn, (long long)t,
+                         caller(c, lr, sizeof lr), path, ttf);
+            uint8_t *p = mem_kernel_alloc(n + 8, 16);
+            uint32_t words[2] = {__builtin_bswap32(BFTTF_MAGIC), __builtin_bswap32((uint32_t)n)};
+            memcpy(p, words, 8);
+            memcpy(p + 8, font, n);
+            free(font);
+            fonts.size[t] = n;
+            __atomic_store_n(&fonts.file[t], p, __ATOMIC_RELEASE);
+            rt_log("pl: shared font %lld (%s): stand-in %s (%llu bytes; firmware font %s not found)", (long long)t,
+                   font_type_name(t), ttf, (unsigned long long)n, path);
+            const uint8_t *q = fonts.file[t];
+            plat_mutex_unlock(&fonts.lock);
+            return q;
         }
         plat_fseek64(f, 0, SEEK_END);
         int64_t len = plat_ftell64(f);
         plat_fseek64(f, 0, SEEK_SET);
         if (len < 12 || len > (64 << 20)) rt_fatal("nn::pl: shared font %s: size %lld", path, (long long)len);
-        uint8_t *p = mem_kernel_alloc((uint64_t)len + (is_raw_ttf ? 8 : 0), 16);
-        size_t got = fread(p + (is_raw_ttf ? 8 : 0), 1, (size_t)len, f);
+        uint8_t *p = mem_kernel_alloc((uint64_t)len, 16);
+        size_t got = fread(p, 1, (size_t)len, f);
         fclose(f);
-        uint64_t size = is_raw_ttf ? (got == (size_t)len ? (uint64_t)len : 0)
-                                   : (got == (size_t)len ? ov_bfttf_size(p, (uint64_t)len) : 0);
-        if (!size) rt_fatal("nn::pl: shared font %s is not a valid font", path);
-        // Decode obfuscated firmware BFTTF to key-0 so ScalableFontEngine::LoadFont reads it directly.
-        if (!is_raw_ttf) {
+        uint64_t size = got == (size_t)len ? ov_bfttf_size(p, (uint64_t)len) : 0;
+        if (!size) rt_fatal("nn::pl: shared font %s is not a BFTTF font", path);
+        // A firmware BFTTF is obfuscated: every big-endian word XOR its key. Decoded here to the key-0 form the
+        // stand-in has, which the SDK's font engine takes as it is; MTF hands the address straight to
+        // ScalableFontEngine::LoadFont, which failed on the obfuscated font (a null glyph for "?", nro+0xaef820).
+        {
             const uint32_t key = be32(p) ^ BFTTF_MAGIC;
             for (int64_t i = 0; key && i + 4 <= len; i += 4) {
                 uint32_t w = be32(p + i) ^ key;
@@ -926,9 +954,8 @@ static const uint8_t *font_data(Cpu *c, const char *fn, int64_t t) {
         }
         fonts.size[t] = size;
         __atomic_store_n(&fonts.file[t], p, __ATOMIC_RELEASE);
-        if (!is_raw_ttf)
-            rt_log("pl: shared font %lld (%s): %llu bytes from %s", (long long)t, font_type_name(t),
-                   (unsigned long long)size, path);
+        rt_log("pl: shared font %lld (%s): %llu bytes from %s", (long long)t, font_type_name(t),
+               (unsigned long long)size, path);
     }
     const uint8_t *p = fonts.file[t];
     plat_mutex_unlock(&fonts.lock);
@@ -945,53 +972,7 @@ static void ov_font_size(Cpu *c) {
 }
 
 // ==== registration
-// ---- Switch 2 oe calls (Donkey Kong Bananza)
-// int nn::oe::GetCurrentGraphicsScale(): an enum 0-2; main+0x4686d4 maps it through a float table {3, 12, 16} and
-// ignores anything above 2. The host is a docked console with the most to give, so the highest value. Unverified
-// against hardware: what the three levels mean is not known.
-static void ov_graphics_scale(Cpu *c) { ret_x(c, 2); }
-// void nn::oe::SetGraphicsScaleChangedNotificationEnabled(bool): the scale never changes on the host
-static void ov_graphics_scale_notify(Cpu *c) { (void)c; }
-// void nn::oe::SetAlbumImageOrientation(album::ImageOrientation): there is no capture album
-static void ov_album_orientation(Cpu *c) { (void)c; }
-// void nn::oe::{Enter,Leave}ExitRequestHandlingSection(): no exit request ever arrives from a host system applet
-static void ov_exit_section(Cpu *c) { (void)c; }
-
-static void ov_default_display_resolution(Cpu *c) {
-    int32_t *w = arg_p(c, 0), *h = arg_p(c, 1);
-    if (w) *w = 1920;
-    if (h) *h = 1080;
-}
-
-static void ov_default_display_resolution_event(Cpu *c) {
-    uint64_t ev = arg_x(c, 0);
-    if (ev) kern_bind_system_event(c, ev, 1);
-    ret_x(c, 0);
-}
-
-static void ov_oe_notification_event(Cpu *c) {
-    static uint64_t ev_addr;
-    if (!ev_addr) {
-        void *p = mem_kernel_alloc(64, 16);
-        ev_addr = (uint64_t)(uintptr_t)p;
-        kern_bind_system_event(c, ev_addr, 1);
-    }
-    ret_x(c, ev_addr);
-}
-
-static void ov_oe_try_pop_notification(Cpu *c) {
-    (void)c;
-    ret_x(c, 0);
-}
-
-HOST_OVERRIDE("_ZN2nn2oe23GetCurrentGraphicsScaleEv", ov_graphics_scale);
-HOST_OVERRIDE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", ov_graphics_scale_notify);
-HOST_OVERRIDE("_ZN2nn2oe24SetAlbumImageOrientationENS_5album16ImageOrientationE", ov_album_orientation);
-HOST_OVERRIDE("_ZN2nn2oe31EnterExitRequestHandlingSectionEv", ov_exit_section);
-HOST_OVERRIDE("_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", ov_exit_section);
-
 HOST_OVERRIDE("_ZN2nn2oe10InitializeEv", ov_oe_initialize);
-HOST_OVERRIDE("_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", ov_display_version);
 HOST_OVERRIDE("_ZN2nn2oe18GetDesiredLanguageEv", ov_desired_language);
 HOST_OVERRIDE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", ov_performance_config);
 HOST_OVERRIDE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", ov_cpu_boost);
@@ -1010,46 +991,48 @@ HOST_OVERRIDE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", ov_launch_parameter);
 HOST_OVERRIDE("_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", ov_get_balance);
 HOST_OVERRIDE("_ZN2nn2oe24SetExpectedVolumeBalanceEff", ov_set_balance);
 HOST_OVERRIDE("_ZN2nn2oe25GetProgramTotalActiveTimeEv", ov_active_time);
-HOST_OVERRIDE("_ZN2nn2oe25TryPopNotificationMessageEPj", ov_oe_try_pop_notification);
-HOST_OVERRIDE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", ov_default_display_resolution);
-HOST_OVERRIDE("_ZN2nn2oe27GetNotificationMessageEventEv", ov_oe_notification_event);
-HOST_OVERRIDE("_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE", ov_default_display_resolution_event);
-HOST_OVERRIDE("_ZN2nn2oe40SendServerMaintenanceOverlayNotificationENS_4time9PosixTimeES2_", ov_exit_section);
 HOST_OVERRIDE("_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb", ov_inactivity_extended);
 HOST_OVERRIDE("_ZN2nn2oe44SetUserInactivityDetectionTimeExtendedUnsafeEb", ov_inactivity_extended);
 HOST_OVERRIDE("_ZN2nn2oe17FinishStartupLogoEv", ov_finish_logo);
 HOST_OVERRIDE("_ZN2nn2oe25TryPopNotificationMessageEPj", ov_try_pop);
 HOST_OVERRIDE("_ZN2nn2oe22PopNotificationMessageEv", ov_pop);
 HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SaveEv", ov_report_save);
-HOST_OVERRIDE("_ZN2nn4nifm10InitializeEv", ov_nifm_initialize);
-HOST_OVERRIDE("_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv", ov_nifm_submit);
-HOST_OVERRIDE("_ZN2nn4nifm18IsNetworkAvailableEv", ov_nifm_unavailable);
-HOST_OVERRIDE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", ov_nifm_unavailable);
-HOST_OVERRIDE("_ZN2nn4bcat10InitializeEv", ov_bcat_initialize);
-HOST_OVERRIDE("_ZN2nn4bcat25MountDeliveryCacheStorageEv", ov_bcat_mount);
-HOST_OVERRIDE("_ZN2nn10streamplay21GetRequiredMemorySizeENS0_14StreamPlayTypeENS0_13StreamingModeEi", ov_streamplay_memory);
 HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", ov_report_save);
 HOST_OVERRIDE("_ZN2nn5prepo28RequestImmediateTransmissionEv", ov_result_ok);
 HOST_OVERRIDE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", ov_result_ok);
 HOST_OVERRIDE("_ZN2nn3nfp10InitializeEv", ov_nfp_initialize);
+HOST_OVERRIDE("_ZN2nn3nfp7UnmountERKNS0_12DeviceHandleE", ov_nfp_unmount);
+HOST_OVERRIDE("_ZN2nn3nfp13GetCommonInfoEPNS0_10CommonInfoERKNS0_12DeviceHandleE", ov_nfp_common_info);
+HOST_OVERRIDE("_ZN2nn3nfp15GetRegisterInfoEPNS0_12RegisterInfoERKNS0_12DeviceHandleE", ov_nfp_register_info);
+HOST_OVERRIDE("_ZN2nn3nfp5FlushERKNS0_12DeviceHandleE", ov_nfp_flush);
+HOST_OVERRIDE("_ZN2nn3nfp7RestoreERKNS0_12DeviceHandleE", ov_nfp_flush);
+HOST_OVERRIDE("_ZN2nn3nfp19OpenApplicationAreaERKNS0_12DeviceHandleEj", ov_nfp_open_area);
+HOST_OVERRIDE("_ZN2nn3nfp18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm", ov_nfp_get_area);
+HOST_OVERRIDE("_ZN2nn3nfp18SetApplicationAreaERKNS0_12DeviceHandleEPKvm", ov_nfp_set_area);
+HOST_OVERRIDE("_ZN2nn3nfp21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE", ov_nfp_set_area);
+HOST_OVERRIDE("_ZN2nn3nfp13StartRestorerEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", ov_nfp_applet);
+HOST_OVERRIDE("_ZN2nn3nfp19StartGameDataEraserEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", ov_nfp_applet);
+HOST_OVERRIDE("_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", ov_nfp_applet);
+HOST_OVERRIDE("_ZN2nn4diag6detail9AbortImplEv", ov_diag_abort);
+HOST_OVERRIDE("_ZN2nn4diag6detail9AbortImplEPKNS_6ResultE", ov_diag_abort_result);
+HOST_OVERRIDE("_ZN2nn4diag12GetBacktraceEPmi", ov_diag_backtrace);
 HOST_OVERRIDE("_ZN2nn3nfp8FinalizeEv", ov_nfp_finalize);
 HOST_OVERRIDE("_ZN2nn3nfp8GetStateEv", ov_nfp_state);
 HOST_OVERRIDE("_ZN2nn3nfp11ListDevicesEPNS0_12DeviceHandleEPii", ov_nfp_list);
 HOST_OVERRIDE("_ZN2nn3nfp29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE", ov_nfp_availability);
 HOST_OVERRIDE("_ZN2nn3nfp14GetDeviceStateERKNS0_12DeviceHandleE", ov_nfp_device_state);
-HOST_OVERRIDE("_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE", ov_nfp_no_device);
-HOST_OVERRIDE("_ZN2nn3nfp9GetNpadIdEPjRKNS0_12DeviceHandleE", ov_nfp_no_device);
-HOST_OVERRIDE("_ZN2nn3nfp19AttachActivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", ov_nfp_no_device);
-HOST_OVERRIDE("_ZN2nn3nfp21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", ov_nfp_no_device);
-HOST_OVERRIDE("_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE", ov_nfp_no_device);
-HOST_OVERRIDE("_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE", ov_nfp_no_device);
-HOST_OVERRIDE("_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE", ov_nfp_no_device);
-HOST_OVERRIDE("_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", ov_nfp_no_device);
+HOST_OVERRIDE("_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE", ov_nfp_mount);
+HOST_OVERRIDE("_ZN2nn3nfp9GetNpadIdEPjRKNS0_12DeviceHandleE", ov_nfp_get_npad_id);
+HOST_OVERRIDE("_ZN2nn3nfp19AttachActivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", ov_nfp_attach_activate);
+HOST_OVERRIDE("_ZN2nn3nfp21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", ov_nfp_attach_deactivate);
+HOST_OVERRIDE("_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE", ov_nfp_start_detection);
+HOST_OVERRIDE("_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE", ov_nfp_stop_detection);
+HOST_OVERRIDE("_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE", ov_nfp_get_tag_info);
+HOST_OVERRIDE("_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", ov_nfp_get_model_info);
 HOST_OVERRIDE("_ZN2nn3err9ShowErrorENS_6ResultE", ov_show_error);
 
 HOST_OVERRIDE("nndiagStartup", ov_diag_startup);
 HOST_OVERRIDE("_ZN2nn3aoc10InitializeEv", ov_aoc_initialize);
-HOST_OVERRIDE("_ZN2nn3aoc17CountAddOnContentEv", ov_aoc_count);
 HOST_OVERRIDE("_ZN2nn3aoc16ListAddOnContentEPiii", ov_aoc_list);
 HOST_OVERRIDE("_ZN2nn3err26InitializeContextWriterApiEv", ov_err_context);
 HOST_OVERRIDE("_ZN2nn4pctl10InitializeEv", ov_pctl_initialize);
@@ -1066,25 +1049,8 @@ HOST_OVERRIDE("_ZN2nn7account10InitializeEv", ov_account_initialize);
 HOST_OVERRIDE("_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE", ov_open_user);
 HOST_OVERRIDE("_ZN2nn7account9CloseUserERKNS0_10UserHandleE", ov_close_user);
 HOST_OVERRIDE("_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE", ov_user_id);
-HOST_OVERRIDE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm", ov_cached_account);
-HOST_OVERRIDE("_ZN2nn7friends10InitializeEv", ov_friends_initialize);
-HOST_OVERRIDE("_ZN2nn7friends13GetFriendListEPiPNS0_6FriendERKNS_7account3UidEiiRKNS0_12FriendFilterE", ov_friends_get_list);
-HOST_OVERRIDE("_ZN2nn7friends14AddPlayHistoryERKNS_7account3UidERKNS0_26PlayHistoryRegistrationKeyERKNS0_15InAppScreenNameESA_", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends16UpdateFriendInfoEPNS0_6FriendERKNS_7account3UidEPKNS3_23NetworkServiceAccountIdEi", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends17NotificationQueue14GetSystemEventEv", ov_friends_event);
-HOST_OVERRIDE("_ZN2nn7friends17NotificationQueue8FinalizeEv", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends17NotificationQueue3PopEPNS0_16NotificationInfoE", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends21StartFriendInvitationERKNS_7account3UidEiRKNS0_35FriendInvitationGameModeDescriptionEPKvm", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends28DeclareOpenOnlinePlaySessionERKNS_7account3UidE", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends29DeclareCloseOnlinePlaySessionERKNS_7account3UidE", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegistrationKeyERKNS_7account3UidEb", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7friends36GetFriendInvitationNotificationEventEv", ov_friends_event);
-HOST_OVERRIDE("_ZN2nn7friends38TryPopFriendInvitationNotificationInfoEPNS_7account3UidEPmPvm", ov_friends_ok);
-HOST_OVERRIDE("_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE", ov_last_opened_user);
 HOST_OVERRIDE("_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE", ov_user_existence);
 HOST_OVERRIDE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", ov_nickname);
-HOST_OVERRIDE("_ZN2nn7account16LoadProfileImageEPmPvmRKNS0_3UidE", ov_load_profile_image);
 
 HOST_OVERRIDE("_ZN2nn4time10InitializeEv", ov_time_initialize);
 HOST_OVERRIDE("_ZN2nn4time8FinalizeEv", ov_time_finalize);

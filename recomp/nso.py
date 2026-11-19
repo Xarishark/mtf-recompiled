@@ -1,4 +1,4 @@
-# Adapted from LAS Recomp tools/nso.py @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
+# Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 """NSO loader: decompress segments, build the memory image, parse MOD0/dynamic info."""
 import struct
 import sys
@@ -15,39 +15,56 @@ R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE = 2
 class Nso:
     def __init__(self, path):
         raw = open(path, 'rb').read()
+        self.is_nro = False
         if raw[:4] == b'NSO0':
+            if len(raw) < 0x100:
+                raise ValueError(f'{path}: truncated NSO header')
             flags = struct.unpack_from('<I', raw, 0xC)[0]
             self.build_id = raw[0x40:0x60].rstrip(b'\0').hex()
             segs = []
             for i in range(3):
                 file_off, mem_off, dec_size = struct.unpack_from('<III', raw, 0x10 + i * 0x10)
                 comp_size = struct.unpack_from('<I', raw, 0x60 + i * 4)[0]
+                if file_off + comp_size > len(raw):
+                    raise ValueError(f'{path}: truncated NSO segment {i}')
                 data = raw[file_off:file_off + comp_size]
                 if flags & (1 << i):
                     data = lz4.block.decompress(data, uncompressed_size=dec_size)
+                if len(data) != dec_size:
+                    raise ValueError(f'{path}: NSO segment {i} has the wrong decompressed size')
                 segs.append((mem_off, data))
             self.bss_size = struct.unpack_from('<I', raw, 0x3C)[0]
-            self.text = (segs[0][0], len(segs[0][1]))
-            self.rodata = (segs[1][0], len(segs[1][1]))
-            self.data = (segs[2][0], len(segs[2][1]))
-            end = segs[2][0] + len(segs[2][1]) + self.bss_size
-            self.size = (end + 0xFFF) & ~0xFFF
-            img = bytearray(self.size)
-            for off, d in segs:
-                img[off:off + len(d)] = d
-        elif raw[0x10:0x14] == b'NRO0':
-            nro_size = struct.unpack_from('<I', raw, 0x18)[0]
-            self.text = struct.unpack_from('<II', raw, 0x20)
-            self.rodata = struct.unpack_from('<II', raw, 0x28)
-            self.data = struct.unpack_from('<II', raw, 0x30)
-            self.bss_size = struct.unpack_from('<I', raw, 0x38)[0]
+        elif len(raw) >= 0x80 and raw[0x10:0x14] == b'NRO0':
+            declared_size, nro_flags = struct.unpack_from('<II', raw, 0x18)
+            if nro_flags & (1 << 1):
+                raise ValueError(f'{path}: compressed NRO is not supported')
+            if declared_size != len(raw):
+                raise ValueError(f'{path}: NRO header size {declared_size:#x} differs from file size {len(raw):#x}')
+            self.is_nro = True
             self.build_id = raw[0x40:0x60].rstrip(b'\0').hex()
-            end = nro_size + self.bss_size
-            self.size = (end + 0xFFF) & ~0xFFF
-            img = bytearray(self.size)
-            img[:nro_size] = raw[:nro_size]
+            segs = []
+            expected_offset = 0
+            for i in range(3):
+                file_off, segment_size = struct.unpack_from('<II', raw, 0x20 + i * 8)
+                if file_off != expected_offset or segment_size % 0x1000:
+                    raise ValueError(f'{path}: NRO segment {i} is not page-aligned and contiguous')
+                if file_off + segment_size > declared_size:
+                    raise ValueError(f'{path}: NRO segment {i} is outside the declared module size')
+                segs.append((file_off, raw[file_off:file_off + segment_size]))
+                expected_offset += segment_size
+            if expected_offset != declared_size:
+                raise ValueError(f'{path}: NRO segments do not fill the declared module size')
+            self.bss_size = struct.unpack_from('<I', raw, 0x38)[0]
         else:
-            raise AssertionError(f'{path}: neither NSO0 nor NRO0')
+            raise ValueError(f'{path}: not an NSO0 module or NRO0 image')
+        self.text = (segs[0][0], len(segs[0][1]))
+        self.rodata = (segs[1][0], len(segs[1][1]))
+        self.data = (segs[2][0], len(segs[2][1]))
+        end = segs[2][0] + len(segs[2][1]) + self.bss_size
+        self.size = (end + 0xFFF) & ~0xFFF
+        img = bytearray(self.size)
+        for off, d in segs:
+            img[off:off + len(d)] = d
         self.image = img
         self._parse_mod0()
 
@@ -75,7 +92,7 @@ class Nso:
         strtab = dyn.get(DT_STRTAB, 0)
         self.strtab = strtab
         self.needed = [self.cstr(strtab + n) for n in needed]
-        # dynsym count from DT_HASH nchain, or from DT_GNU_HASH (1.4.3 sdk and subsdk0 have no DT_HASH)
+        # dynsym count from DT_HASH nchain, or from DT_GNU_HASH (some modules have no DT_HASH)
         self.syms = []
         nsyms = self.symbol_count()
         if nsyms and DT_SYMTAB in dyn:
@@ -92,7 +109,7 @@ class Nso:
                 for i in range(n):
                     r_off, r_info, r_add = struct.unpack_from('<QQq', self.image, b + i * 24)
                     self.relocs.append((r_off, r_info & 0xFFFFFFFF, r_info >> 32, r_add))
-        # DT_RELR (1.4.3): packed RELATIVE relocations whose addend is the word in place. An even entry is an address
+        # DT_RELR: packed RELATIVE relocations whose addend is the word in place. An even entry is an address
         # (relocate it, continue after it); an odd entry is a bitmap of the next 63 words.
         if DT_RELR in dyn:
             where = 0

@@ -1,7 +1,6 @@
-// Adapted from MacNativeGames games/totk/runtime/audio_renderer.h and audio_mixer.h @ b75be8c (MIT, Copyright (c)
-// 2026 MacNativeGames contributors). Wire layouts follow the public libnx audren.h description.
 // audren:u, the audio renderer service: RequestUpdate wire formats, the server-side
 // renderer state, and the mixer interface (audio_mixer.c: the real mixer with SDL3 output).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #pragma once
 #include <stdint.h>
 
@@ -127,7 +126,7 @@ _Static_assert(__builtin_offsetof(AudrenAuxParam, send_info) == 64, "auxiliary e
 #define AUDREN_BEHAVIOR_OUT 0xb0u
 #define AUDREN_RENDER_INFO_OUT 0x10u
 
-// Server-side voice: the DSP's view of one client voice (Ryujinx.Audio VoiceInfo, as ported in MacNativeGames).
+// Server-side voice: the DSP's view of one client voice.
 typedef struct {
     AudrenVoiceIn in;
     AudrenBiquadFloat float_biquads[2];
@@ -168,8 +167,6 @@ typedef struct AudioRenderer {
 
 // IAudioRendererManager, served under "audren:u" (ipc.c's service table).
 void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);
-void aud_user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // aud:u (Switch 2)
-long audren_renderers_live(void);      // renderers whose render tick runs
 
 // Mixer interface (audio_mixer.c). Every call but open/close/set_running runs with r->lock held.
 void audio_mixer_open(AudioRenderer *r);
@@ -185,5 +182,14 @@ void audio_mixer_render(AudioRenderer *r, double seconds);   // after audio_voic
 // many ns (the ring is at its target), -1 leaves the pace to the render thread's timer (no device, renderer stopped,
 // device stalled).
 int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now);
+// The output stage alone (audio_mixer.c), for a renderer that mixes elsewhere (ov_audio.c). Samples are interleaved
+// floats with audio_output_channels() per frame. audio_output_volume (MTF_VOLUME, 0..1) is called from one thread.
+struct Mixer;
+struct Mixer *audio_output_open(int rate, int frame_samples);
+int audio_output_channels(const struct Mixer *m);
+float audio_output_volume(void);
+void audio_output_write(struct Mixer *m, const float *samples, int frames);
+int64_t audio_output_pace_ns(struct Mixer *m, uint64_t now);   // the same answers as audio_mixer_pace_ns
+uint64_t audio_voice_consumed(const AudioRenderer *r, ServerVoice *v, int frames);   // source samples over one frame; advances v->fraction
 int audio_buffer_empty(const AudrenWaveBuffer *b);   // no samples to decode: played as soon as it is reached
 void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // IAudioDevice

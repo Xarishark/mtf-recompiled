@@ -1,6 +1,5 @@
-// From MacNativeGames games/totk/runtime/romfs_path.h @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames
-// contributors).
-// RomFS path validation shared by the runtime (romfs.c) and its probe (fs_host.c probe_fs).
+// RomFS path validation (romfs.c, fs_host.c).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #pragma once
 #include <stddef.h>
 #include <string.h>

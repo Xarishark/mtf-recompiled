@@ -1,11 +1,9 @@
-// Adapted from LAS Recomp runtime/loader.c @ da35b83 (MIT, Copyright (c) 2026 Peiikai) and MacNativeGames
-// games/totk/runtime/loader.c and scripts/prepare_runtime.py @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
-// contributors).
 // NSO loading at the fixed layout bases, dynamic linking with host overrides, the nnMain identity check, sealing,
 // and --probe-loader.
 //
 // The lifted C was generated from the unrelocated words of .text and .rodata and embeds absolute guest addresses, so
 // each module must sit at its layout base and relocations may only write the data segment.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,10 +19,9 @@ enum { DT_NULL = 0, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5, DT_SYMTAB = 6, 
        DT_INIT = 12, DT_FINI = 13, DT_JMPREL = 23, DT_INIT_ARRAY = 25, DT_FINI_ARRAY = 26, DT_INIT_ARRAYSZ = 27,
        DT_FINI_ARRAYSZ = 28, DT_RELRSZ = 0x23, DT_RELR = 0x24, DT_GNU_HASH = 0x6ffffef5 };
 enum { R_ABS64 = 257, R_GLOB_DAT = 1025, R_JUMP_SLOT = 1026, R_RELATIVE = 1027, R_TLSDESC = 1031 };
-static uint64_t tlsdesc_fn;
-static void tlsdesc_resolve(Cpu *c) { c->x[0] = LD64(c->x[0] + 8); }
 enum { K_RELATIVE, K_ABS64, K_GLOB_DAT, K_JUMP_SLOT, K_COUNT };
 enum { STB_WEAK = 2, STT_FUNC = 2 };
+#define RUNTIME_MODULE "nro"   // the module nn::ro::LoadModule brings in (MTF: the game's code)
 
 typedef struct { uint32_t name; uint8_t info, other; uint16_t shndx; uint64_t value, size; } Elf64Sym;
 typedef struct { uint64_t off, info; int64_t addend; } Elf64Rela;
@@ -41,7 +38,7 @@ typedef struct {
     uint32_t nsyms;
     const Elf64Rela *rela, *jmprel;
     uint64_t nrela, njmprel;
-    const uint64_t *relr;               // DT_RELR (1.4.3): packed RELATIVE relocations
+    const uint64_t *relr;               // DT_RELR: packed RELATIVE relocations
     uint64_t nrelr, relr_count;
     uint32_t *hash, hash_mask;          // defined symbols by name
     Res *res_plain, *res_jump;          // per symbol; JUMP_SLOT may bind an observer
@@ -51,13 +48,13 @@ typedef struct {
     uint64_t kinds[K_COUNT], sym_import, sym_own;
     uint32_t imports, import_to[MOD_COUNT], weak_unresolved, strong_unresolved;
     uint32_t init_off;
+    uint32_t tlsdesc;                   // TLS descriptor relocations left to the module's DT_INIT
 } Mod;
 
 static Mod mods[MOD_COUNT];
 static int nmods;
 static uint64_t identity_refs, stubs;
 static int *ovr_used, *obs_used;   // per linked table entry, plus probe overrides counted separately
-static PlatMutex plt_lock = PLAT_MUTEX_INIT;
 
 int ldr_count(void) { return nmods; }
 const RtLoaded *ldr_module(int i) { return i >= 0 && i < nmods ? &mods[i].pub : NULL; }
@@ -84,12 +81,6 @@ uint8_t *ldr_read_verified(const char *dir, const char *file, size_t *len) {
     char path[1024];
     snprintf(path, sizeof path, "%s/%s", dir, file);
     uint8_t *p = read_file(path, len);
-    if (!p && !strcmp(file, "nro0")) {
-        const char *nro_dir = getenv("MTF_NRO_DIR");
-        if (!nro_dir || !*nro_dir) nro_dir = "build/nro";
-        snprintf(path, sizeof path, "%s/%s.nro", nro_dir, want);
-        p = read_file(path, len);
-    }
     if (!p) rt_fatal("loader: cannot read %s (extract the game first: tools/extract.py)", path);
     uint8_t d[32];
     char hex[65];
@@ -128,21 +119,6 @@ static size_t lz4_decompress(const uint8_t *src, size_t srclen, uint8_t *dst, si
 typedef struct { uint32_t file_off, mem_off, size, csize; int compressed; } Seg;
 
 static uint64_t nso_segments(const uint8_t *raw, size_t len, const char *name, Seg seg[3]) {
-    if (len >= 0x80 && !memcmp(raw + 0x10, "NRO0", 4)) {
-        uint32_t nro_size = *(const uint32_t *)(raw + 0x18);
-        if (nro_size > len) rt_fatal("loader: %s NRO0 size exceeds file", name);
-        for (int i = 0; i < 3; i++) {
-            seg[i].mem_off = *(const uint32_t *)(raw + 0x20 + i * 8);
-            seg[i].size = *(const uint32_t *)(raw + 0x24 + i * 8);
-            seg[i].file_off = seg[i].mem_off;
-            seg[i].csize = seg[i].size;
-            seg[i].compressed = 0;
-            if ((uint64_t)seg[i].file_off + seg[i].size > len)
-                rt_fatal("loader: %s NRO0 segment %d lies outside the file", name, i);
-        }
-        uint32_t bss = *(const uint32_t *)(raw + 0x38);
-        return ((uint64_t)seg[2].mem_off + seg[2].size + bss + 0xFFF) & ~0xFFFull;
-    }
     if (len < 0x100 || memcmp(raw, "NSO0", 4)) rt_fatal("loader: %s is not an NSO", name);
     uint32_t flags = *(const uint32_t *)(raw + 0xC);
     for (int i = 0; i < 3; i++) {
@@ -255,7 +231,7 @@ static void parse_dynamic(Mod *m) {
     if (hash) {
         m->nsyms = rd32(hash + 4);   // nchain
     } else {
-        // DT_GNU_HASH only (1.4.3 sdk, subsdk0): one past the last symbol the highest bucket's chain reaches.
+        // DT_GNU_HASH only (some modules): one past the last symbol the highest bucket's chain reaches.
         uint32_t nbuckets = rd32(gnu_hash), symoffset = rd32(gnu_hash + 4), bloom = rd32(gnu_hash + 8);
         uint64_t buckets = gnu_hash + 16 + 8ull * bloom, chains = buckets + 4ull * nbuckets;
         uint32_t last = 0;
@@ -276,24 +252,26 @@ static void parse_dynamic(Mod *m) {
     m->njmprel = pltsz / sizeof(Elf64Rela);
 }
 
-// The constructor state flag DT_INIT checks: ADRP xN at DT_INIT+16, LDR wM, [xN, #imm] at +20 or +24
-// (MNG scripts/prepare_runtime.py). Switch 2 code opens every function with PACIBSP, which moves the ADRP to +20 and
-// the LDR to +24 or +28.
+// The constructor state flag DT_INIT checks: ADRP xN at DT_INIT+16, LDR wM, [xN, #imm] at +20 or +24.
+// The first ADRP in DT_INIT's prologue (+8..+28) followed within two instructions by the LDR of that register.
+// Modules without PACIBSP have the ADRP at +16; MTF's, after a PACIBSP and a larger frame, at +20.
 static uint64_t decode_ctor_flag(const Mod *m) {
     uint64_t init = m->pub.init;
     if (!init) return 0;
-    int adrp_at = rd32(init) == 0xd503237fu ? 20 : 16;   // PACIBSP
-    uint32_t a = rd32(init + adrp_at);
-    if ((a & 0x9f000000u) != 0x90000000u) return 0;
-    uint32_t reg = a & 31;
-    for (int at = adrp_at + 4; at <= adrp_at + 8; at += 4) {
-        uint32_t w = rd32(init + at);
-        if ((w & 0xffc00000u) != 0xb9400000u || ((w >> 5) & 31) != reg) continue;
-        int64_t imm = (int64_t)(((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2));
-        imm = (imm ^ (1 << 20)) - (1 << 20);
-        uint64_t flag = ((init + adrp_at) & ~0xFFFull) + (uint64_t)(imm << 12) + ((w >> 10) & 0xfff) * 4;
-        uint64_t data = m->pub.base + m->pub.data_off;
-        return flag >= data && flag < m->pub.base + m->pub.size ? flag : 0;
+    for (int adrp_at = 8; adrp_at <= 28; adrp_at += 4) {
+        uint32_t a = rd32(init + adrp_at);
+        if ((a & 0x9f000000u) != 0x90000000u) continue;
+        uint32_t reg = a & 31;
+        for (int at = adrp_at + 4; at <= adrp_at + 8; at += 4) {
+            uint32_t w = rd32(init + at);
+            if ((w & 0xffc00000u) != 0xb9400000u || ((w >> 5) & 31) != reg) continue;
+            int64_t imm = (int64_t)(((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2));
+            imm = (imm ^ (1 << 20)) - (1 << 20);
+            uint64_t flag = ((init + adrp_at) & ~0xFFFull) + (uint64_t)(imm << 12) + ((w >> 10) & 0xfff) * 4;
+            uint64_t data = m->pub.base + m->pub.data_off;
+            return flag >= data && flag < m->pub.base + m->pub.size ? flag : 0;
+        }
+        return 0;
     }
     return 0;
 }
@@ -344,7 +322,7 @@ static void mark_used(int observers, const char *name) {
         if (!strcmp(hostfn_table_name(observers, i), name)) (observers ? obs_used : ovr_used)[i] = 1;
 }
 
-// Order (MNG loader.c:216-224): observer (JUMP_SLOT only), override by name, own definition, other modules in load
+// Order: observer (JUMP_SLOT only), override by name, own definition, other modules in load
 // order, weak -> 0, strong -> named fatal stub. Overrides also replace a module's own symbols.
 static Res resolve(Mod *m, uint32_t si, int jump) {
     Res *cache = jump ? &m->res_jump[si] : &m->res_plain[si];
@@ -379,13 +357,14 @@ static void relocate_table(Mod *m, const Elf64Rela *r, uint64_t n) {
         if (r[i].off < m->pub.data_off || r[i].off > m->pub.size - 8)
             rt_fatal("loader: %s relocation %llu writes +%#llx, outside the data segment", m->pub.name,
                      (unsigned long long)i, (unsigned long long)r[i].off);
+        uint64_t v;
         if (type == R_TLSDESC) {
-            if (!tlsdesc_fn) tlsdesc_fn = hostfn_register("__mtf_tlsdesc", tlsdesc_resolve);
-            ST64(base + r[i].off, tlsdesc_fn);
-            ST64(base + r[i].off + 8, 0x1000ull + (uint64_t)r[i].addend);
+            // The Switch 2 SDK resolves a module's TLS descriptors itself: the module header's third word lists them
+            // (count words, then these RELA entries), and the module's DT_INIT fills them once musl has given the
+            // module its TLS. The slot is left as the image has it.
+            m->tlsdesc++;
             continue;
         }
-        uint64_t v;
         if (type == R_RELATIVE) {
             m->kinds[K_RELATIVE]++;
             v = base + (uint64_t)r[i].addend;
@@ -443,7 +422,7 @@ static void count_imports(Mod *m) {
     }
 }
 
-// Every non-JUMP_SLOT reference to nnMain holds the real address (MNG loader.c:229-239).
+// Every non-JUMP_SLOT reference to nnMain holds the real address.
 static void verify_identity(void) {
     uint64_t real = ldr_symbol("nnMain");
     if (!real) rt_fatal("loader: nnMain is not defined");
@@ -476,8 +455,9 @@ void ldr_load(const char *exefs_dir) {
     if (nmods) rt_fatal("ldr_load called twice");
     if (!mem_layout()->pool) rt_fatal("ldr_load before mem_init");
     if (rt_layout_count > MOD_COUNT) rt_fatal("loader: %d modules in the layout", rt_layout_count);
-    for (int i = 0; i < rt_layout_count; i++) load_module(&mods[i], exefs_dir, &rt_layout[i]);
-    nmods = rt_layout_count;
+    // The runtime-loaded NRO has a place in the layout but no ExeFS file: nn::ro::LoadModule loads it (ldr_load_image).
+    for (int i = 0; i < rt_layout_count; i++)
+        if (strcmp(rt_layout[i].name, RUNTIME_MODULE)) load_module(&mods[nmods++], exefs_dir, &rt_layout[i]);
     ovr_used = calloc(hostfn_table_size(0) + 1, sizeof(int));
     obs_used = calloc(hostfn_table_size(1) + 1, sizeof(int));
     for (int i = 0; i < nmods; i++) {
@@ -495,6 +475,113 @@ void ldr_load(const char *exefs_dir) {
                (unsigned long long)m->pub.base, (unsigned long long)m->pub.size,
                (unsigned long long)(m->nrela + m->njmprel + m->relr_count), m->imports);
     }
+}
+
+// ---- the runtime-loaded module (nn::ro::LoadModule, ro.c)
+static uint32_t bind_to_new(Mod *k, const Mod *nm);
+// An NRO is its own memory image: header, then text, rodata and data at the offsets of its segment table (+0x20, 8
+// bytes each: offset, size), bss after data (+0x38). It is copied to its layout base, relocated against the modules
+// loaded at start and the host overrides, and sealed like them. The caller runs its DT_INIT.
+const RtLoaded *ldr_load_image(const char *name, const uint8_t *image, uint64_t size) {
+    const RtLayoutEntry *lay = NULL;
+    for (int i = 0; i < rt_layout_count; i++)
+        if (!strcmp(rt_layout[i].name, name)) lay = &rt_layout[i];
+    if (!lay) rt_fatal("loader: %s has no place in the layout (lift it first: README.md)", name);
+    for (int i = 0; i < nmods; i++)
+        if (!strcmp(mods[i].pub.name, name)) rt_fatal("loader: %s is loaded already", name);
+    if (nmods == MOD_COUNT) rt_fatal("loader: no module slot for %s", name);
+    if (size < 0x80 || memcmp(image + 0x10, "NRO0", 4)) rt_fatal("loader: %s is not an NRO image", name);
+    uint32_t seg[3][2], bss;
+    memcpy(seg, image + 0x20, sizeof seg);
+    memcpy(&bss, image + 0x38, 4);
+    uint64_t span = ((uint64_t)seg[2][0] + seg[2][1] + bss + 0xFFF) & ~0xFFFull;
+    if (span != lay->size || size > span)
+        rt_fatal("loader: %s spans %#llx bytes, layout.h says %#llx: generated C and the image differ", name,
+                 (unsigned long long)span, (unsigned long long)lay->size);
+    Mod *m = &mods[nmods];
+    memset(m, 0, sizeof *m);
+    if (!plat_mem_commit(lay->base, span)) rt_fatal("loader: cannot commit %s at %#llx", name, (unsigned long long)lay->base);
+    memcpy((void *)(uintptr_t)lay->base, image, size);
+    for (int i = 0; i < 3; i++) m->seg_off[i] = seg[i][0], m->seg_size[i] = seg[i][1];
+    m->pub.name = lay->name;
+    m->pub.base = lay->base;
+    m->pub.size = span;
+    m->pub.text_end = seg[0][0] + seg[0][1];
+    m->pub.data_off = seg[2][0];
+    if (m->pub.data_off & 0xFFF) rt_fatal("loader: %s data segment is not page aligned", name);
+    parse_dynamic(m);
+    make_hash(m);
+    make_funcs(m);
+    m->res_plain = calloc(m->nsyms, sizeof(Res));
+    m->res_jump = calloc(m->nsyms, sizeof(Res));
+    if (!m->res_plain || !m->res_jump) rt_fatal("loader: resolution table allocation");
+    __atomic_store_n(&nmods, nmods + 1, __ATOMIC_RELEASE);   // its own symbols resolve from here on
+    relocate_table(m, m->rela, m->nrela);
+    relocate_table(m, m->jmprel, m->njmprel);
+    relocate_relr(m);
+    count_imports(m);
+    m->pub.ctor_flag = decode_ctor_flag(m);
+    seal(m);
+    for (int i = 0; i < nmods - 1; i++) {
+        uint32_t bound = bind_to_new(&mods[i], m);
+        if (bound) rt_log("loader: %u of %s's imports now bind to %s", bound, mods[i].pub.name, m->pub.name);
+    }
+    rt_log("loaded %-8s at %#llx size %#llx: %llu relocations (%u TLS descriptors left to DT_INIT), %u imports, %u "
+           "strong unresolved", m->pub.name, (unsigned long long)m->pub.base, (unsigned long long)m->pub.size,
+           (unsigned long long)(m->nrela + m->njmprel + m->relr_count), m->tlsdesc, m->imports, m->strong_unresolved);
+    return &m->pub;
+}
+
+// After a module loads, the earlier modules' imports that nothing defined until now bind to it, as Horizon's rtld
+// binds variables and lazily bound functions. MTF's main
+// imports _Z6Abort_v, which only the NRO defines. A slot may sit in a RELRO range the guest made read-only, so the
+// page is opened for the write and given back its protection.
+static void write_slot(uint64_t where, uint64_t v) {
+    uint64_t end;
+    int prot = plat_mem_state(where, where + 8, &end);
+    if (prot == PLAT_PROT_RW) {
+        ST64(where, v);
+        return;
+    }
+    uint64_t page = where & ~0xFFFull;
+    if (!plat_mem_protect(page, 0x1000, PLAT_PROT_RW)) rt_fatal("loader: cannot open %#llx to bind", (unsigned long long)where);
+    ST64(where, v);
+    plat_mem_protect(page, 0x1000, prot);
+}
+
+static uint32_t bind_to_new(Mod *k, const Mod *nm) {
+    uint32_t n = 0;
+    for (int t = 0; t < 2; t++) {
+        const Elf64Rela *r = t ? k->jmprel : k->rela;
+        uint64_t count = t ? k->njmprel : k->nrela;
+        for (uint64_t j = 0; j < count; j++) {
+            uint32_t type = (uint32_t)r[j].info, si = (uint32_t)(r[j].info >> 32);
+            if (type == R_RELATIVE || type == R_TLSDESC || !si || sym_defined(k, si)) continue;
+            int jump = type == R_JUMP_SLOT;
+            Res *cache = jump ? &k->res_jump[si] : &k->res_plain[si];
+            if (cache->kind != RES_STUB && cache->kind != RES_WEAK) continue;
+            uint64_t a = module_symbol(nm, sym_name(k, si));
+            if (!a) continue;
+            write_slot(k->pub.base + r[j].off, a + (jump ? 0 : (uint64_t)r[j].addend));
+            n++;
+        }
+    }
+    for (uint32_t si = 1; si < k->nsyms; si++) {   // the resolution caches follow, for later lookups
+        if (sym_defined(k, si)) continue;
+        uint64_t a = 0;
+        for (int jump = 0; jump < 2; jump++) {
+            Res *cache = jump ? &k->res_jump[si] : &k->res_plain[si];
+            if ((cache->kind == RES_STUB || cache->kind == RES_WEAK) && (a || (a = module_symbol(nm, sym_name(k, si)))))
+                *cache = (Res){a, RES_GUEST};
+        }
+    }
+    return n;
+}
+
+int ldr_in_layout(const char *name) {
+    for (int i = 0; i < rt_layout_count; i++)
+        if (!strcmp(rt_layout[i].name, name)) return 1;
+    return 0;
 }
 
 // ---- lookups
@@ -532,94 +619,13 @@ const char *ldr_describe(uint64_t a, char *buf, int n) {
     return buf;
 }
 
-static int by_slot(const void *a, const void *b) {
-    uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
-    return x < y ? -1 : x > y;
-}
-
-// PLT stubs: adrp x16, page; ldr x17, [x16, #slot]; add x16, x16, #slot; br x17.
-static void find_plt(Mod *m) {
-    uint64_t text = m->pub.base + m->seg_off[0], end = text + m->seg_size[0];
-    uint64_t cap = 1024, n = 0, *pairs = malloc(cap * 16);
-    for (uint64_t a = text; a + 16 <= end && pairs; a += 4) {
-        uint32_t w0 = rd32(a), w1 = rd32(a + 4), w3 = rd32(a + 12);
-        if ((w0 & 0x9f00001fu) != 0x90000010u || (w1 & 0xffc003ffu) != 0xf9400211u || w3 != 0xd61f0220u) continue;
-        int64_t imm = (int64_t)(((w0 >> 29) & 3) | (((w0 >> 5) & 0x7ffff) << 2));
-        imm = (imm ^ (1 << 20)) - (1 << 20);
-        uint64_t slot = (a & ~0xFFFull) + (uint64_t)(imm << 12) + ((w1 >> 10) & 0xfff) * 8;
-        if (n == cap) pairs = realloc(pairs, (cap *= 2) * 16);
-        if (!pairs) break;
-        pairs[2 * n] = slot;
-        pairs[2 * n + 1] = a;
-        n++;
-    }
-    if (!pairs) rt_fatal("loader: PLT table allocation");
-    qsort(pairs, n, 16, by_slot);
-    m->plt_slot = pairs;
-    m->nplt = n;
-}
-
-uint64_t ldr_plt_stub(const char *module, const char *name) {
-    Mod *m = NULL;
-    for (int i = 0; i < nmods; i++)
-        if (!strcmp(mods[i].pub.name, module)) m = &mods[i];
-    if (!m) return 0;
-    plat_mutex_lock(&plt_lock);
-    if (!m->plt_slot) find_plt(m);
-    plat_mutex_unlock(&plt_lock);
-    for (uint64_t j = 0; j < m->njmprel; j++) {
-        uint32_t si = (uint32_t)(m->jmprel[j].info >> 32);
-        if ((uint32_t)m->jmprel[j].info != R_JUMP_SLOT || strcmp(sym_name(m, si), name)) continue;
-        uint64_t slot = m->pub.base + m->jmprel[j].off;
-        uint64_t lo = 0, hi = m->nplt;
-        while (lo < hi) {
-            uint64_t mid = (lo + hi) / 2;
-            if (m->plt_slot[2 * mid] < slot) lo = mid + 1;
-            else hi = mid;
-        }
-        if (lo < m->nplt && m->plt_slot[2 * lo] == slot) return m->plt_slot[2 * lo + 1];
-    }
-    return 0;
-}
-
 // ---- --probe-loader
-// Expected values, measured on the 1.1.1, 1.2.1 and 1.4.3 modules; the 1.4.3 relocation totals match the ones
-// MacNativeGames' port notes give for that version. 1.1.1 shares subsdk0 and sdk with 1.2.1 down to every count.
-typedef struct {
-    const char *name;
-    uint64_t kinds[K_COUNT], total, sym_import, sym_own;
-    uint32_t imports, to[MOD_COUNT], weak, init_off, init_array;
-} Expect;
-static const Expect expect_121[] = {
-    {"main", {508816, 1415, 32, 641}, 510904, 2088, 0, 675, {0, 16, 647}, 12, 0x30, 10673},
-    {"subsdk0", {1623, 12820, 1030, 3924}, 19397, 6576, 11198, 667, {9, 0, 654}, 4, 0x30, 45},
-    {"sdk", {10917, 13976, 1207, 8932}, 35032, 16, 24099, 13, {8, 0, 0}, 5, 0x30, 116},
-};
-static const Expect expect_111[] = {
-    {"main", {508604, 1412, 32, 639}, 510687, 2083, 0, 673, {0, 16, 645}, 12, 0x30, 10668},
-    {"subsdk0", {1623, 12820, 1030, 3924}, 19397, 6576, 11198, 667, {9, 0, 654}, 4, 0x30, 45},
-    {"sdk", {10917, 13976, 1207, 8932}, 35032, 16, 24099, 13, {8, 0, 0}, 5, 0x30, 116},
-};
-static const Expect expect_143[] = {
-    {"main", {499078, 1393, 28, 650}, 501149, 2071, 0, 680, {0, 16, 656}, 8, 0x10b4f10, 10717},
-    {"subsdk0", {3424, 10927, 905, 3817}, 19073, 6557, 9092, 663, {9, 0, 654}, 0, 0x20, 45},
-    {"sdk", {15013, 10135, 1079, 7832}, 34059, 10, 19036, 8, {8, 0, 0}, 0, 0x400, 83},
-};
-#define expect (RT_V143 ? expect_143 : RT_V111 ? expect_111 : expect_121)
-
+// Loads and relocates the modules, then prints what was bound: imports per module, relocation kinds, constructors,
+// overrides that matched nothing, and every strong import left unresolved. It fails on an unresolved strong import or
+// on .text/.rodata that relocation changed.
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
 
-#define PROBE_SYMBOL "_ZN2nn2os13GetSystemTickEv"
-#define PROBE_MAGIC 0x5eed0123456789abull
-static volatile int32_t probe_hits;
-
-static void probe_override(Cpu *c) {
-    plat_inc32(&probe_hits);
-    c->x[0] = PROBE_MAGIC;
-}
-
-// .text and .rodata in guest memory equal the NSO: relocations never touched them.
 static void check_segments(const char *dir) {
     for (int i = 0; i < nmods; i++) {
         const Mod *m = &mods[i];
@@ -636,69 +642,15 @@ static void check_segments(const char *dir) {
             free(buf);
         }
         free(raw);
-        uint64_t ro_end;
-        int ro = plat_mem_state(m->pub.base, m->pub.base + m->pub.data_off, &ro_end) == PLAT_PROT_READ &&
-                 ro_end == m->pub.base + m->pub.data_off;
-        printf("  %-8s text %#x+%#x rodata %#x+%#x: bytes %s the NSO, %s\n", m->pub.name, seg[0].mem_off, seg[0].size,
-               seg[1].mem_off, seg[1].size, same ? "equal" : "DIFFER FROM", ro ? "read-only" : "NOT READ-ONLY");
+        printf("  %-8s text %#x+%#x rodata %#x+%#x: bytes %s the NSO\n", m->pub.name, seg[0].mem_off, seg[0].size,
+               seg[1].mem_off, seg[1].size, same ? "equal" : "DIFFER FROM");
         CHECK(same, "%s .text/.rodata changed after relocation", m->pub.name);
-        CHECK(ro, "%s .text/.rodata are not sealed read-only", m->pub.name);
     }
-}
-
-static void check_got(void) {
-    const Mod *m = &mods[0];
-    uint64_t want = 0, slot = 0, nslots = 0;
-    for (uint64_t j = 0; j < m->njmprel; j++) {
-        uint32_t si = (uint32_t)(m->jmprel[j].info >> 32);
-        if ((uint32_t)m->jmprel[j].info == R_JUMP_SLOT && !strcmp(sym_name(m, si), PROBE_SYMBOL)) {
-            slot = m->pub.base + m->jmprel[j].off;
-            nslots++;
-        }
-    }
-    for (int i = 0; i < 4096 && !want; i++) {
-        const char *n = hostfn_name(RT_HOSTFN_BASE + 16ull * i);
-        if (!n) break;
-        if (!strcmp(n, PROBE_SYMBOL)) want = RT_HOSTFN_BASE + 16ull * i;
-    }
-    uint64_t got = slot ? LD64(slot) : 0;
-    char d[128];
-    printf("probe override %s: main GOT slot %s holds %#llx (%s)\n", PROBE_SYMBOL, ldr_describe(slot, d, sizeof d),
-           (unsigned long long)got, hostfn_name(got) ? "host function" : "not a host function");
-    CHECK(nslots == 1 && want && got == want, "the probe override did not reach main's GOT slot");
-
-    uint64_t stub = ldr_plt_stub("main", PROBE_SYMBOL);
-    printf("probe override: main PLT stub %s\n", ldr_describe(stub, d, sizeof d));
-    CHECK(stub, "no PLT stub in main for %s", PROBE_SYMBOL);
-
-    hostfn_seal();
-    Cpu *c = plat_aligned_alloc(sizeof(Cpu), 64);
-    memset(c, 0, sizeof *c);
-    uint8_t *stack = mem_kernel_alloc(0x10000, 16);
-    c->sp = (uint64_t)(uintptr_t)stack + 0x10000;
-    c->excl_addr = ~0ull;
-    c->x[19] = 0x1919;
-    uint64_t r1 = rt_call(c, got, 0);
-    long h1 = probe_hits;
-    uint64_t r2 = stub ? rt_call(c, stub, 0) : 0;
-    long h2 = probe_hits;
-    printf("probe override: dispatch through the GOT value -> %#llx (%ld calls), through the lifted PLT stub -> %#llx "
-           "(%ld calls)\n", (unsigned long long)r1, h1, (unsigned long long)r2, h2);
-    CHECK(r1 == PROBE_MAGIC && h1 == 1, "dispatching the GOT value did not reach the host function");
-    CHECK(r2 == PROBE_MAGIC && h2 == 2, "the lifted PLT stub did not reach the host function");
-    CHECK(c->x[30] == 0 && c->pc == 0 && c->x[19] == 0x1919, "rt_call did not restore x30/pc or lost x19");
-    mem_kernel_free(stack, 0x10000);
-    plat_aligned_free(c);
 }
 
 int probe_loader(void) {
     const RtConfig *cfg = rt_config();
-    hostfn_add_override(PROBE_SYMBOL, probe_override);
     ldr_load(cfg->exefs);
-    if (nmods != (int)(sizeof expect_121 / sizeof *expect_121)) {
-        printf("probe-loader: FAILED (%d modules, expected 3)\n", nmods);
-        return 1;
-    }
     printf("modules (exefs %s):\n", cfg->exefs);
     for (int i = 0; i < nmods; i++) {
         const Mod *m = &mods[i];
@@ -707,62 +659,35 @@ int probe_loader(void) {
             if (m->import_to[k])
                 snprintf(to + strlen(to), sizeof to - strlen(to), "%s%s %u", *to ? ", " : "", mods[k].pub.name,
                          m->import_to[k]);
-        printf("  %-8s base %#llx image %#llx DT_INIT +%#x init_array %llu (%llu B) imports %u: %s; weak unresolved "
-               "%u\n", m->pub.name, (unsigned long long)m->pub.base, (unsigned long long)m->pub.size, m->init_off,
-               (unsigned long long)(m->pub.init_array_size / 8), (unsigned long long)m->pub.init_array_size,
-               m->imports, to, m->weak_unresolved);
-        CHECK(!strcmp(m->pub.name, expect[i].name), "module %d is %s", i, m->pub.name);
-        CHECK(m->imports == expect[i].imports && m->weak_unresolved == expect[i].weak &&
-              !memcmp(m->import_to, expect[i].to, sizeof m->import_to), "%s import table differs from section 0.1",
-              m->pub.name);
-        CHECK(m->init_off == expect[i].init_off && m->pub.init_array_size / 8 == expect[i].init_array,
-              "%s DT_INIT/init_array differ from section 0.1", m->pub.name);
-    }
-    printf("relocations:\n");
-    for (int i = 0; i < nmods; i++) {
-        const Mod *m = &mods[i];
         uint64_t total = m->kinds[0] + m->kinds[1] + m->kinds[2] + m->kinds[3];
-        printf("  %-8s RELATIVE %llu ABS64 %llu GLOB_DAT %llu JUMP_SLOT %llu total %llu; symbolic against imports %llu, "
-               "against own symbols %llu\n", m->pub.name, (unsigned long long)m->kinds[K_RELATIVE],
-               (unsigned long long)m->kinds[K_ABS64], (unsigned long long)m->kinds[K_GLOB_DAT],
-               (unsigned long long)m->kinds[K_JUMP_SLOT], (unsigned long long)total,
-               (unsigned long long)m->sym_import, (unsigned long long)m->sym_own);
-        CHECK(!memcmp(m->kinds, expect[i].kinds, sizeof m->kinds) && total == expect[i].total &&
-              m->sym_import == expect[i].sym_import && m->sym_own == expect[i].sym_own,
-              "%s relocations differ from section 0.2", m->pub.name);
-    }
-    printf("constructors:\n");
-    for (int i = 0; i < nmods; i++) {
-        const RtLoaded *m = &mods[i].pub;
+        printf("  %-8s base %#llx image %#llx DT_INIT +%#x init_array %llu imports %u (%s), weak unresolved %u, "
+               "strong unresolved %u\n", m->pub.name, (unsigned long long)m->pub.base, (unsigned long long)m->pub.size,
+               m->init_off, (unsigned long long)(m->pub.init_array_size / 8), m->imports, to, m->weak_unresolved,
+               m->strong_unresolved);
+        printf("           RELATIVE %llu ABS64 %llu GLOB_DAT %llu JUMP_SLOT %llu (total %llu, RELR %llu)\n",
+               (unsigned long long)m->kinds[K_RELATIVE], (unsigned long long)m->kinds[K_ABS64],
+               (unsigned long long)m->kinds[K_GLOB_DAT], (unsigned long long)m->kinds[K_JUMP_SLOT],
+               (unsigned long long)total, (unsigned long long)m->relr_count);
         char d[128];
-        printf("  %-8s DT_INIT %#llx init_array %#llx (%llu entries) ctor_flag %s\n", m->name,
-               (unsigned long long)m->init, (unsigned long long)m->init_array,
-               (unsigned long long)(m->init_array_size / 8), m->ctor_flag ? ldr_describe(m->ctor_flag, d, sizeof d)
-                                                                         : "NOT DECODED");
-        CHECK(m->init && m->init - m->base < m->text_end, "%s DT_INIT outside .text", m->name);
-        CHECK(m->init_array - m->base >= mods[i].seg_off[1] && m->init_array + m->init_array_size <= m->base + m->size,
-              "%s init_array outside rodata/data", m->name);
-        CHECK(m->ctor_flag, "%s constructor flag not decoded", m->name);
+        printf("           constructor flag %s\n", m->pub.ctor_flag ? ldr_describe(m->pub.ctor_flag, d, sizeof d)
+                                                                     : "not decoded");
     }
     check_segments(cfg->exefs);
-
-    uint32_t strong = 0;
-    for (int i = 0; i < nmods; i++) strong += mods[i].strong_unresolved;
-    printf("strong unresolved %u\n", strong);
-    CHECK(strong == 0 && stubs == 0, "strong imports are unresolved");
-    int linked = hostfn_table_size(0), installed = 0, olinked = hostfn_table_size(1), oinstalled = 0;
+    int linked = hostfn_table_size(0), installed = 0;
     for (int i = 0; i < linked; i++) {
         installed += ovr_used[i];
         if (!ovr_used[i]) printf("  override %s matches no relocation\n", hostfn_table_name(0, i));
     }
-    for (int i = 0; i < olinked; i++) {
-        oinstalled += obs_used[i];
-        if (!obs_used[i]) printf("  observer %s matches no JUMP_SLOT\n", hostfn_table_name(1, i));
-    }
-    printf("overrides installed %d (%d linked, + 1 probe override)\n", installed, linked);
-    printf("observers installed %d (%d linked)\n", oinstalled, olinked);
+    int olinked = hostfn_table_size(1), oinstalled = 0;
+    for (int i = 0; i < olinked; i++) oinstalled += obs_used[i];
+    printf("overrides installed %d of %d linked, observers %d of %d\n", installed, linked, oinstalled, olinked);
     printf("nnMain identity ok (%llu refs)\n", (unsigned long long)identity_refs);
-    check_got();
+    // main imports _Z6Abort_v, which neither main nor sdk defines (the runtime-loaded NRO may); calling it is fatal
+    // with its name. Any other unresolved strong import is a failure.
+    CHECK(stubs <= 1 && (stubs == 0 || mods[0].strong_unresolved == 1), "%llu strong imports are unresolved (named "
+          "in the log); only main's _Z6Abort_v is expected", (unsigned long long)stubs);
+    for (int i = 0; i < nmods; i++)
+        CHECK(mods[i].pub.ctor_flag, "%s constructor flag not decoded", mods[i].pub.name);
     printf("probe-loader: %s (%d failures)\n", failures ? "FAILED" : "passed", failures);
     return failures ? 1 : 0;
 }

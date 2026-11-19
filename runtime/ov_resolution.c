@@ -1,109 +1,136 @@
-// Output resolution and scene render scale (MTF_OUTPUT_RES / TOTK_OUTPUT_RES, MTF_RENDER_SCALE / TOTK_RENDER_SCALE).
+// The game's resolution: its output (window textures and HUD) and its 3D scene.
 //
-// In Mario Tennis Fever (0400D4201C6EA000, v327680):
-// 1. Display output resolution:
-//    The game calls nn::vi::QueryDisplayBufferMaxResolution(int *w, int *h, Layer *) at nro+0x92a898, writes the
-//    returned dimensions to its graphics device struct (+0x10/+0x14), and allocates its 2D UI and post-FXAA window
-//    textures at that size (default 2560x1440 in docked mode, 1920x1080 in handheld mode).
-//    ov_resolution_max_resolution overrides that query when MTF_OUTPUT_RES / TOTK_OUTPUT_RES is explicitly set by the
-//    user (or != 1920x1080 default), and ov_resolution_layer patches the layer default at nro+0x929350.
-// 2. Scene 3D render scale:
-//    The game's dynamic resolution controller at nro+0x835020 reads two floats (scale X and scale Y, default 0.666667 =
-//    2/3, giving 1706x960 for a 2560x1440 output) from a table at nro+0x14ac650 (4 entries of 8 bytes).
-//    ov_resolution_apply writes the chosen scale (MTF_RENDER_SCALE / TOTK_RENDER_SCALE: "game" keeps 2/3, or 50..200%)
-//    into that table and nop-patches the dynamic scaler clamp so the 3D scene renders at the requested fraction of the
-//    output resolution.
-#include <stdio.h>
+// Output. The game computes its 2560x1440 once (nro f_700305ecc0: width, height, their halves, into globals and its
+// renderer's settings object) and calls nn::vi::CreateLayer right after, before it reads any of them to make its window
+// textures. MTF_OUTPUT_RES (720, 1080, 1440 or 2160 lines; auto: 2160 on a display that tall, else the game's 1440)
+// replaces those values there, so the game's own code then makes every target at that size.
+//
+// Scene. The display-mode update that runs next (nro f_700305e8fc) asks vi for the largest display buffer, caps the
+// mode size it holds in x20 at that buffer, scales it by a global mode int (0 the whole output, 1 80 %: what it uses
+// docked, 2 two thirds) and sizes the scene targets from the result. At the query the output size goes into that
+// structure, and the scene's share (MTF_RENDER_SCALE in percent, or a DLSS upscaling mode, vk_dlaa.c) scales it there
+// with the mode int set to 0, so the game takes any size as it takes its own. The game does this once, at start.
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
 #include "host.h"
-#include "layout.h"
-#include "ov.h"
 
-#define NRO_LAYER_W_ADD   (MOD_NRO0_BASE + 0x929354ull)   // add w8, w8, #0x780 (1920)
-#define NRO_LAYER_H_MOV   (MOD_NRO0_BASE + 0x92935cull)   // mov w9, #0x438 (1080)
-#define NRO_SCALE_TABLE   (MOD_NRO0_BASE + 0x14ac650ull)  // 4 pairs of (float sx, float sy)
+int vk_dlaa_scene_share(void);   // vk_dlaa.c
 
-static int parse_wh(const char *s, int *w, int *h) {
-    if (!s || !*s) return 0;
-    char *end = NULL;
-    long pw = strtol(s, &end, 10);
-    if (!end || (*end != 'x' && *end != 'X')) return 0;
-    long ph = strtol(end + 1, &end, 10);
-    if (!end || *end != 0) return 0;
-    if (pw < 640 || pw > 7680 || ph < 360 || ph > 4320) return 0;
-    *w = (int)pw, *h = (int)ph;
-    return 1;
+static int scene_w, scene_h, out_w, out_h;   // ov_resolution_apply's decision
+
+#define SCALE_MODE_PTR 0x7003560ef0ull        // the game's pointer to that int
+#define CREATE_LAYER_RETURN 0x700305f258ull   // f_700305ecc0's call of nn::vi::CreateLayer
+#define LAYER_TO_SETTINGS 0xe8                // CreateLayer's first argument is this far into the settings object
+#define SETTINGS_SIZE 0x108                   // width and height in that object
+#define WIDTH_PTR 0x700355ede8ull             // the game's pointers to its output width, height and their halves
+#define HEIGHT_PTR 0x700355edf0ull
+#define HALF_WIDTH_PTR 0x7003560a30ull
+#define HALF_HEIGHT_PTR 0x7003560468ull
+#define MODE_SIZE 0x1c                        // the display-mode structure's width and height, two 16-bit values
+
+// The display's height in physical pixels (DPI scaling aside), 0 when unknown.
+static int display_lines(void) {
+#ifdef _WIN32
+    DEVMODEW dm;
+    memset(&dm, 0, sizeof dm);
+    dm.dmSize = sizeof dm;
+    return EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) ? (int)dm.dmPelsHeight : 0;
+#else
+    return 0;
+#endif
 }
 
-static void get_output_res(int *w, int *h) {
-    *w = ov_handheld() ? 1920 : 2560;
-    *h = ov_handheld() ? 1080 : 1440;
-    if (!cfg_is_set("TOTK_OUTPUT_RES")) return;
-    const char *v = cfg_get("TOTK_OUTPUT_RES");
-    int pw, ph;
-    if (v && parse_wh(v, &pw, &ph)) {
-        *w = pw, *h = ph;
+// The output's lines: MTF_OUTPUT_RES, or with auto 2160 on a display that tall and the game's own 1440 otherwise.
+int ov_resolution_lines(void) {
+    static int lines;
+    if (lines) return lines;
+    const char *v = cfg_value("MTF_OUTPUT_RES");
+    int r = atoi(v);
+    if (!strcmp(v, "auto") || r <= 0) {
+        int d = display_lines();
+        lines = d >= 2160 ? 2160 : 1440;
+        rt_log("resolution: output %d lines (auto: the display has %d)", lines, d);
+    } else {
+        lines = r >= 2160 ? 2160 : r >= 1440 ? 1440 : r >= 1080 ? 1080 : 720;
     }
+    return lines;
 }
 
-int vk_dlaa_scene_share(void);
+// The output size when it is not the game's own 2560x1440.
+static int output_size(int *w, int *h) {
+    int r = ov_resolution_lines();
+    *w = r == 2160 ? 3840 : r == 1080 ? 1920 : r == 720 ? 1280 : 0;
+    *h = r == 2160 ? 2160 : r == 1080 ? 1080 : r == 720 ? 720 : 0;
+    return *w != 0;
+}
 
-static float get_render_scale(void) {
+static void write_through(uint64_t pointer, int32_t value) {
+    if (!mem_guest_readable(pointer, 8)) return;
+    uint64_t target = *(const uint64_t *)(uintptr_t)pointer;
+    if (target && mem_guest_readable(target, 4)) *(int32_t *)(uintptr_t)target = value;
+}
+
+// From nn::vi::CreateLayer (ov_gfx.c).
+void ov_resolution_layer(Cpu *c) {
+    int w, h;
+    if (c->x[30] != CREATE_LAYER_RETURN || !output_size(&w, &h)) return;
+    uint64_t settings = c->x[0] - LAYER_TO_SETTINGS;
+    if (!mem_guest_readable(settings + SETTINGS_SIZE, 8)) return;
+    int32_t *size = (int32_t *)(uintptr_t)(settings + SETTINGS_SIZE);
+    rt_log("resolution: output %dx%d (the game's is %dx%d)", w, h, size[0], size[1]);
+    size[0] = w, size[1] = h;
+    write_through(WIDTH_PTR, w);
+    write_through(HEIGHT_PTR, h);
+    write_through(HALF_WIDTH_PTR, w / 2);
+    write_through(HALF_HEIGHT_PTR, h / 2);
+}
+
+// The scene's share of the output in thousandths: a DLSS upscaling mode (MTF_DLSS, while DLAA runs: vk_dlaa.c
+// vk_dlaa_scene_share), else MTF_RENDER_SCALE in percent; 0 keeps the game's own choice (80 % docked).
+static int scene_share(void) {
     int k = vk_dlaa_scene_share();
-    if (k > 0) return (float)k / 1000.0f;
-    const char *s = cfg_value("TOTK_RENDER_SCALE");
-    if (!s || !*s || !strcmp(s, "game")) return 0.0f;
-    char *end = NULL;
-    double pct = strtod(s, &end);
-    if (end == s || pct < 25.0 || pct > 200.0) return 0.0f;
-    return (float)(pct / 100.0);
+    if (k) return k;
+    const char *v = cfg_value("MTF_RENDER_SCALE");
+    if (!strcmp(v, "game")) return 0;
+    int pct = atoi(v);
+    return pct <= 0 ? 0 : pct > 100 ? 1000 : pct * 10;
 }
 
-void ov_resolution_layer(void) {
+// From nn::vi::QueryDisplayBufferMaxResolution (ov_net.c): right after this call the game caps the mode size in x20 at
+// the display's largest buffer, scales it by its mode (100, 80 or 67 %) and sizes its scene targets from the result
+// (f_700305e8fc). The output size goes into the structure here, and with a share of our own the scene size too, with
+// the game's mode set to 100 % so it takes that size as it is.
+void ov_resolution_apply(Cpu *c) {
+    uint64_t mode_size = c->x[20] + MODE_SIZE;
+    if (!mem_guest_readable(mode_size, 4)) return;
+    uint16_t *size = (uint16_t *)(uintptr_t)mode_size;
+    if (!size[0] || !size[1]) return;
     int w, h;
-    get_output_res(&w, &h);
-    // Patch the fallback mov/add in nro0 if nro0 is loaded
-    if (MOD_NRO0_SIZE >= 0x929360ull) {
-        uint32_t *iw = (uint32_t *)(uintptr_t)NRO_LAYER_W_ADD;
-        uint32_t *ih = (uint32_t *)(uintptr_t)NRO_LAYER_H_MOV;
-        if (*iw == 0x111e0108u && *ih == 0x52808709u && w <= 65535 && h <= 65535) {
-            *iw = 0x52800008u | ((uint32_t)w << 5);   // mov w8, #w
-            *ih = 0x52800009u | ((uint32_t)h << 5);   // mov w9, #h
-        }
-    }
-}
-
-void ov_resolution_apply(int *out_w, int *out_h) {
-    int w, h;
-    get_output_res(&w, &h);
-    if (out_w) *out_w = w;
-    if (out_h) *out_h = h;
-
-    float sc = get_render_scale();
-    if (sc > 0.0f && MOD_NRO0_SIZE >= 0x14ac670ull) {
-        float *tab = (float *)(uintptr_t)NRO_SCALE_TABLE;
-        for (int i = 0; i < 8; i++) tab[i] = sc;
-    }
+    if (output_size(&w, &h)) size[0] = (uint16_t)w, size[1] = (uint16_t)h;
+    out_w = size[0], out_h = size[1];
+    int k = scene_share();
+    if (!k || !mem_guest_readable(SCALE_MODE_PTR, 8)) return;
+    uint64_t ptr = *(const uint64_t *)(uintptr_t)SCALE_MODE_PTR;
+    if (!ptr || !mem_guest_readable(ptr, 4)) return;
+    uint32_t *mode = (uint32_t *)(uintptr_t)ptr;
+    int ow = size[0], oh = size[1];
+    int sw = (ow * k / 1000 + 1) & ~1, sh = (oh * k / 1000 + 1) & ~1;   // even sizes, as the game's own modes give
+    if (sw > ow) sw = ow;
+    if (sh > oh) sh = oh;
+    size[0] = (uint16_t)sw, size[1] = (uint16_t)sh;
     static int logged;
-    if (!logged++) {
-        float eff = sc > 0.0f ? sc : (2.0f / 3.0f);
-        rt_log("res: output %dx%d, 3D scene %dx%d (scale %.0f%%%s)",
-               w, h, (int)(w * eff + 0.5f), (int)(h * eff + 0.5f), eff * 100.0f,
-               sc > 0.0f ? "" : ", game default");
-    }
+    if (!logged++) rt_log("resolution: scene %dx%d of the output %dx%d (the game asked for mode %u)", sw, sh, ow, oh, *mode);
+    *mode = 0;
+    scene_w = sw, scene_h = sh;
 }
 
-int ov_resolution_sizes(unsigned out[2], unsigned scene[2]) {
-    int w, h;
-    get_output_res(&w, &h);
-    float sc = get_render_scale();
-    float eff = sc > 0.0f ? sc : (2.0f / 3.0f);
-    if (out) out[0] = (unsigned)w, out[1] = (unsigned)h;
-    if (scene) scene[0] = (unsigned)(w * eff + 0.5f), scene[1] = (unsigned)(h * eff + 0.5f);
-    return sc > 0.0f || cfg_is_set("TOTK_OUTPUT_RES");
+// The sizes decided above, for DLSS (vk_dlaa.c res_sizes); 0 before the game asked.
+void ov_resolution_sizes(unsigned out[2], unsigned scene[2]) {
+    out[0] = (unsigned)out_w, out[1] = (unsigned)out_h, scene[0] = (unsigned)scene_w, scene[1] = (unsigned)scene_h;
 }
-
-int res_sizes(unsigned out[2], unsigned scene[2]) { return ov_resolution_sizes(out, scene); }

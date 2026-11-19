@@ -9,10 +9,9 @@
 //
 // Back-edge pacing: the present thread submits the blit at once, then holds the host present (vkQueuePresentKHR) until
 // the frame's display time from the pacer (nvn_api_obj.c), so present-to-present intervals stay even whatever the
-// replay took. The blit is already on the queue, so the wait blocks no submission, but the next present waits behind
-// it (TOTK_PRESENT_HOLD, off for Bananza: present_hold).
+// replay took. The blit is already on the queue, so the wait blocks no submission.
 //
-// Asynchronous replay (TOTK_REPLAY_ASYNC, default 0; 1 turns it on): nvnQueueSubmitCommands
+// Asynchronous replay (MTF_REPLAY_ASYNC, default 0; 1 turns it on): nvnQueueSubmitCommands
 // and nvnQueuePresentTexture only queue. Each item gets its timeline value at enqueue (vk_sync_reserve), in queue
 // order; the replay thread runs the synchronous submit and present bodies in that order, so every value is signalled
 // by the submission it was handed out for. The game runs at most one frame ahead: queueing present N waits until the
@@ -29,8 +28,8 @@
 #include "nvn_api.h"
 #include "vk.h"
 #include "vk_exec.h"
-#include "vk_spec.h"
 #include "platform/platform.h"
+#include "vk_dlaa.h"
 
 #define WEAK __attribute__((weak))
 
@@ -48,32 +47,6 @@ static void wait_until(uint64_t at) {
     while (kern_now_ns() < at) plat_yield();
 }
 
-// TOTK_PRESENT_HOLD: 1 holds the host present until the pacer's display time (back-edge pacing), 0 sends it once the
-// blit is submitted and leaves the pacing to nvnWindowAcquireTexture alone. Unset: 1 for TotK, 0 for Bananza. While
-// this thread holds frame N, the present of frame N+1 stays queued and every vk_present_drain waits for it. Bananza's
-// job workers drain on their reads of GPU-written storage (vk_be_guest_read), so the wait for the display landed in
-// the middle of the game's frame work; its frame-rate controller counted it as work and asked for 3 vsyncs (20 fps)
-// for about two minutes of the scripted test. Without the hold, a 200 s run of that test asked for 1 vsync on 5,770 of
-// its first 5,900 frames (29 at 3, against 2,558 with the hold) and averaged 58.8 fps.
-static int present_hold(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = cfg_get("TOTK_PRESENT_HOLD");
-        on = e && *e ? strcmp(e, "0") != 0 : rt_game_version != 0;   // 0: Bananza
-        rt_log("vk: the host present %s (TOTK_PRESENT_HOLD=%d)",
-               on ? "waits for the pacer's display time" : "goes out once its blit is submitted", on);
-    }
-    return on;
-}
-
-// Whether a present job waits (vk_fg_show gives up its wait for it).
-static int job_pending(void) {
-    plat_mutex_lock(&pl);
-    int p = pending;
-    plat_mutex_unlock(&pl);
-    return p;
-}
-
 static void present_main(void *arg) {
     (void)arg;
     uint64_t last = 0, last_queued = 0;
@@ -85,14 +58,9 @@ static void present_main(void *arg) {
         busy = 1;
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
-        // Frame generation (TOTK_FRAME_GEN, vk_framegen.c): its command buffer is the only reader of the game's texture, so
-        // `made` replaces the blit below, and busy goes down as soon as that buffer is submitted
-        int made = vk_fg_record(j.image, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
-        if (!made) {
-            if (flight_on) vk_thumbs_frame(j.frame);
-            vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
-        }
-        uint64_t f = vk_sync_submit(NULL, 0, 0); // no guest reports; this value only covers the blit
+        if (flight_on) vk_thumbs_frame(j.frame);
+        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+        uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
                      (unsigned long long)f, (unsigned long long)j.value);
@@ -101,11 +69,10 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         uint64_t t0 = kern_now_ns();
-        if (made) vk_fg_show(job_pending, flight_on ? j.frame : 0);   // paces and flips itself, and never waits on a new job
-        else if (present_hold()) wait_until(j.at);
+        wait_until(j.at);
         uint64_t t1 = kern_now_ns();
-        if (!made) vk_present_flip();
-        // TOTK_TRACE=present: one line per present: the host present's interval, the interval of the game's present
+        vk_present_flip();
+        // MTF_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
         if (rt_trace & RT_TRACE_PRESENT)
             rt_log("present: frame %llu interval %.3f ms, game %.3f ms, waited %.3f ms, %.3f ms past target",
@@ -134,9 +101,11 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
                           uint64_t value) {
     static volatile int32_t n_skipped;
     vk_exec_frame_log(t, frame);
+    vk_dlaa_frame();
+    vk_mvsurvey_frame();
+    vk_mvprev_frame();
     vk_mem_census(frame);
     if (vk_dump_armed) vk_dump_present(frame);
-    if (vk_capture_log_active()) vk_capture_log_frame(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
     if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
@@ -144,13 +113,14 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
         if (value) {   // the queued value is still signalled, in order
             vk_present_drain();
-            uint64_t f = vk_sync_submit(NULL, 0, 0);
+            uint64_t f = vk_sync_submit(NULL, 0);
             if (f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
         }
         return;
     }
     PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
                     .at = at_ns, .queued = queued, .value = value};
+    vk_hdr_present_source(img, &j.image, &j.format);   // MTF_HDR: the float picture the game copied into it, same size
     if (crop) {
         j.has_crop = 1;
         for (int i = 0; i < 4; i++) j.crop[i] = crop[i];
@@ -170,13 +140,12 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
 }
 
 // ---- Asynchronous replay
-enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE, RI_WRITE_BACK };
+enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE };
 typedef struct {
     int kind, n, has_crop, crop[4];
-    uint64_t value, submit_no, at, queued, submitted_ticks;
+    uint64_t value, submit_no, at, queued;
     uint64_t *h;
     const tex_t *tex;   // RI_RELEASE: a copy the item owns (the game may reuse the object's memory)
-                        // RI_WRITE_BACK: at is the guest address, queued the size
 } ReplayItem;
 #define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
@@ -190,18 +159,21 @@ static PlatCond rcv = PLAT_COND_INIT;   // item queued, item taken, item done
 static ReplayItem rq[RQ_CAP];
 static int rq_head, rq_n, r_busy, r_started;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
-static uint64_t r_items_queued, r_items_done;   // every item, for replay_drain
 // Under rl: calls, calls that waited and the time waited per cause, since the last replay_log line and over the run.
 static uint64_t dr_calls[DR_N], dr_waits[DR_N], dr_ns[DR_N], dr_tcalls[DR_N], dr_twaits[DR_N], dr_tns[DR_N];
-// TOTK_REPLAY_CHECK: ReadTexels compared with a read after a full drain (under rl): checked, differing, differing
+// MTF_REPLAY_CHECK: ReadTexels compared with a read after a full drain (under rl): checked, differing, differing
 // although no submission recorded a write to the texture in between, differing with the queue idle at the first read.
 static uint64_t ck_reads, ck_diff, ck_diff_unexplained, ck_diff_idle;
 
 int vk_replay_async(void) {
     static int on = -1;
     if (on < 0) {
-        on = cfg_bool("TOTK_REPLAY_ASYNC");   // off by default: no measured gain yet, one more frame of latency
-        rt_log("vk: replay %s (TOTK_REPLAY_ASYNC=%d)",
+        // Off by default. Where the game waits for the GPU it overlaps the replay with the game threads (a GTX 1650 in
+        // the Depths went from 450-686 frames over 50 ms a minute to 10-13, issue #88), the only place a gain was
+        // measured. While it was the default, a GTX 1660 Ti at the 60 fps cap with the GPU at 26 % reported uneven
+        // motion that 0.3.4 did not have (#659). It adds up to a frame of latency.
+        on = cfg_bool("MTF_REPLAY_ASYNC");
+        rt_log("vk: replay %s (MTF_REPLAY_ASYNC=%d)",
                on ? "on its own thread, at most one frame behind the game" : "on the submitting thread", on);
     }
     return on;
@@ -219,10 +191,11 @@ uint64_t gfx_replayed_submits(void) {
     return v;
 }
 
-static uint64_t submit_sync(const uint64_t *handles, int n, uint64_t submitted_ticks) {
+static uint64_t submit_sync(const uint64_t *handles, int n) {
     vk_sync_start();
     vk_present_drain();
-    return vk_sync_submit_guest(handles, n, submitted_ticks);
+    vk_texture_new_submit();
+    return vk_sync_submit(handles, n);
 }
 
 static void replay_main(void *arg) {
@@ -237,16 +210,12 @@ static void replay_main(void *arg) {
         r_busy = 1;
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
-        vk_texture_wb_poll();   // asynchronous write-backs whose copies completed
         if (it.kind == RI_SUBMIT) {
-            uint64_t f = submit_sync(it.h, it.n, it.submitted_ticks);
+            uint64_t f = submit_sync(it.h, it.n);
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
                          (unsigned long long)it.value);
             free(it.h);
-        } else if (it.kind == RI_WRITE_BACK) {
-            vk_present_drain();
-            vk_texture_write_back_async(it.at, it.queued);
         } else if (it.kind == RI_RELEASE) {
             vk_present_drain();
             vk_texture_release(it.tex);
@@ -257,8 +226,7 @@ static void replay_main(void *arg) {
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
-        else if (it.kind == RI_PRESENT) r_presents_done++;
-        r_items_done++;
+        else r_presents_done++;
         r_busy = 0;
         plat_cond_broadcast(&rcv);
     }
@@ -304,28 +272,23 @@ static uint64_t replay_enqueue(ReplayItem *it) {
         wait_counted(DR_FULL, p0);
         core_back_unlocked(&away);
     }
-    it->value = it->kind == RI_RELEASE || it->kind == RI_WRITE_BACK ? 0 : vk_sync_reserve();   // these signal nothing
+    it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
-    r_items_queued++;
     plat_cond_broadcast(&rcv);
     plat_mutex_unlock(&rl);
     return it->value;
 }
 
-// Returns once every item queued before the call was replayed and submitted. Back-end entries only: the replay thread
-// never calls them. Waiting for an empty queue instead starved: the render thread queues a submission and a present
-// every frame, so the queue was empty only between two of them, and a pool finalize on another thread waited for
-// seconds (Bananza's loading screen stayed black).
+// Returns once every queued item was replayed and submitted. Back-end entries only: the replay thread never calls them.
 static void replay_drain(int why) {
     if (!gfx_replay_async()) return;
     plat_mutex_lock(&rl);
     dr_calls[why]++, dr_tcalls[why]++;
-    uint64_t upto = r_items_queued;
-    if (r_items_done < upto) {
+    if (rq_n || r_busy) {
         uint64_t p0 = perf_begin();
         int away = core_away_unlocked();
-        while (r_items_done < upto) plat_cond_wait(&rcv, &rl);
+        while (rq_n || r_busy) plat_cond_wait(&rcv, &rl);
         wait_counted(why, p0);
         core_back_unlocked(&away);
     }
@@ -352,13 +315,6 @@ static void replay_log(uint64_t frame, int total) {
     plat_mutex_unlock(&rl);
     rt_log("vk: replay queue %s frame %llu:%s", total ? "over the run to" : "at", (unsigned long long)frame,
            k ? buf : " no waits");
-}
-
-// The run total, once: the game exits through prof_write (boot.c _exit, the window close), probes through
-// vk_backend_shutdown.
-void gfx_exit_log(void) {
-    static int32_t done;
-    if (gfx_replay_async() && r_started && !plat_xchg32(&done, 1)) replay_log(game_frames, 1);
 }
 
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
@@ -401,8 +357,8 @@ static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
     vk_present_drain();
     return vk_pool_map_virtual(v, n, requests);
 }
-static void vk_be_texture_register(const dpool_ref *pool, int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(pool, id, t, v); }
-static void vk_be_sampler_register(const dpool_ref *pool, int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(pool, id, s); }
+static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(id, t, v); }
+static void vk_be_sampler_register(int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(id, s); }
 // Asynchronous: the release is queued behind the submissions before it, so their replay still resolves the texture's
 // slots to its image (a released slot follows another live texture at the storage), and the ones after it see it
 // released, the order of the synchronous replay. vk_texture_release reads only the object's key fields: a copy.
@@ -426,10 +382,10 @@ static void vk_be_texture_release(const tex_t *t) {
 static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEASE); vk_program_release(p); }
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
-static uint64_t vk_be_submit(const uint64_t *handles, int n, uint64_t submitted_ticks) {
-    if (!gfx_replay_async()) return submit_sync(handles, n, submitted_ticks);
+static uint64_t vk_be_submit(const uint64_t *handles, int n) {
+    if (!gfx_replay_async()) return submit_sync(handles, n);
     vk_sync_start();
-    ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count(), .submitted_ticks = submitted_ticks};
+    ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
     if (n > 0) {
         it.h = malloc(sizeof *it.h * (size_t)n);
         if (!it.h) rt_fatal("vk: out of memory (replay queue)");
@@ -441,9 +397,9 @@ static void vk_be_finish(void) { vk_sync_start(); replay_drain(DR_FINISH); vk_pr
 static int replay_check(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = cfg_get("TOTK_REPLAY_CHECK");
+        const char *e = cfg_get("MTF_REPLAY_CHECK");
         on = e && strcmp(e, "0");
-        if (on) rt_log("vk: TOTK_REPLAY_CHECK: every ReadTexels is read again after a full replay drain and compared");
+        if (on) rt_log("vk: MTF_REPLAY_CHECK: every ReadTexels is read again after a full replay drain and compared");
     }
     return on;
 }
@@ -452,7 +408,7 @@ static int replay_check(void) {
 // completed), not for the whole queue. The readback copy goes through the upload batch on the same queue, after every
 // submission the replay has submitted. Submissions still queued or being recorded run after the copy, as on hardware
 // when the GPU has not reached them yet: the game only sees their texels after waiting on a sync, and every sync
-// value covers replay and GPU, so a read the game synchronised sees them. TOTK_REPLAY_CHECK compares with a full drain.
+// value covers replay and GPU, so a read the game synchronised sees them. MTF_REPLAY_CHECK compares with a full drain.
 static void vk_be_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                               uint64_t img) {
     vk_sync_start();
@@ -516,70 +472,6 @@ static void vk_be_guest_written(uint64_t addr, uint64_t size) { vk_sync_start();
 // submission recorded to write the textures there, not for the whole queue: the write-back copy then runs after their
 // renders, and clears gpu_dirty only for content that is on the queue. Submissions not replayed yet render after the
 // copy, as on hardware when the GPU has not reached them; they mark the texture dirty again for a later read.
-// A Switch 2 game's small read of a target the GPU is still rendering does not wait on the console: the CPU sees what is
-// in memory, and the GPU's write lands when it gets there. Bananza invalidates 128 bytes of a pool every frame, and
-// waiting here held it for the replay and GPU work of the whole frame, about 15 ms of every frame. The write-back goes to the replay thread instead, queued after the submissions the
-// read would have waited for. This is opt-in with TOTK_NX2_READ_NOWAIT=1: a deferred copy can overwrite a later CPU
-// write after invalidate returned. The default keeps the synchronous read-back even with TOTK_REPLAY_ASYNC=1.
-#define NOWAIT_MAX 4096
-#define NOWAIT_SEEN 8
-
-// The write-backs queued last. One covering [addr, addr+size) for a writer fence at least as new makes a new one
-// redundant: vk_texture_write_back takes every dirty target overlapping its range, so a queued smaller range is not
-// enough. Returns 1 when covered, else records the range and returns 0.
-typedef struct { uint64_t addr, size, fence; } NowaitSeen;
-static int nowait_covered(NowaitSeen *seen, unsigned *next, uint64_t addr, uint64_t size, uint64_t f) {
-    for (int i = 0; i < NOWAIT_SEEN; i++)
-        if (seen[i].size && seen[i].fence >= f && seen[i].addr <= addr && addr + size <= seen[i].addr + seen[i].size)
-            return 1;
-    seen[*next % NOWAIT_SEEN] = (NowaitSeen){addr, size, f};
-    ++*next;
-    return 0;
-}
-
-int vk_backend_selftest(void) {
-    NowaitSeen seen[NOWAIT_SEEN] = {0};
-    unsigned next = 0;
-    static const struct { uint64_t addr, size, fence; int covered; } steps[] = {
-        {0x1000, 0x80, 5, 0},     // first read
-        {0x1000, 0x80, 5, 1},     // the same range again
-        {0x1000, 0x1000, 5, 0},   // a larger range at the same address and fence is not covered by the smaller one
-        {0x1800, 0x80, 5, 1},     // inside the larger one
-        {0x1000, 0x1000, 4, 1},   // an older writer fence
-        {0x1000, 0x1000, 6, 0},   // a newer writer fence
-        {0x1f80, 0x100, 6, 0},    // past the end of every queued range
-    };
-    int failures = 0;
-    for (unsigned i = 0; i < sizeof steps / sizeof *steps; i++)
-        if (nowait_covered(seen, &next, steps[i].addr, steps[i].size, steps[i].fence) != steps[i].covered) {
-            printf("vk_backend selftest: write-back dedup step %u gave %d, want %d\n", i, !steps[i].covered,
-                   steps[i].covered);
-            failures++;
-        }
-    return failures;
-}
-
-static int read_nowait(uint64_t addr, uint64_t size, uint64_t f) {
-    static int on = -1;
-    int enabled = __atomic_load_n(&on, __ATOMIC_ACQUIRE);
-    if (enabled < 0) {
-        enabled = !rt_game_version && cfg_bool("TOTK_NX2_READ_NOWAIT");
-        __atomic_store_n(&on, enabled, __ATOMIC_RELEASE);
-    }
-    if (!enabled || size > NOWAIT_MAX) return 0;
-    static PlatMutex m = PLAT_MUTEX_INIT;
-    static NowaitSeen seen[NOWAIT_SEEN];
-    static unsigned next;
-    plat_mutex_lock(&m);
-    int queued = nowait_covered(seen, &next, addr, size, f);
-    plat_mutex_unlock(&m);
-    if (!queued) {
-        ReplayItem it = {.kind = RI_WRITE_BACK, .at = addr, .queued = size};
-        replay_enqueue(&it);
-    }
-    return 1;
-}
-
 static void vk_be_guest_read(uint64_t addr, uint64_t size) {
     if (!vk_texture_cpu_stale(addr, size)) return;
     vk_sync_start();
@@ -588,7 +480,6 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
         plat_mutex_lock(&rl);
         dr_calls[DR_GUEST_READ]++, dr_tcalls[DR_GUEST_READ]++;
         plat_mutex_unlock(&rl);
-        if (f && vk_sync_fence_done() < f && read_nowait(addr, size, f)) return;
         if (f && vk_sync_fence_done() < f) {
             uint64_t t0 = kern_now_ns();
             NVN_BLOCKING();
@@ -612,35 +503,6 @@ static void vk_be_cpu_synced(uint64_t fence) {
     vk_texture_write_back_small(fence);
 }
 
-// ---- host side of GfxBackend
-static int vk_be_shader_tool(int tool) {
-    return tool == GFX_TOOL_PREPARE_SHADERS ? vk_pipeline_prepare_shaders()
-         : tool == GFX_TOOL_TRANSLATE_SHADERS ? vk_pipeline_translate_shaders() : vk_pipeline_warm_shaders();
-}
-
-static const GfxExecFrame *vk_be_exec_frame(void) { return &vk_exec_frame; }
-
-// The system info's GPU and driver lines (sysinfo.c); 0 before vk_init.
-static int vk_be_device_text(char *buf, size_t n) {
-    VkCtx *c = vk_ctx();
-    if (!c || !n) return 0;
-    VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
-    vkGetPhysicalDeviceProperties2(c->phys, &p2);
-    const VkPhysicalDeviceProperties *p = &p2.properties;
-    uint64_t vram = 0;
-    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount; h++)
-        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += c->mem_props.memoryHeaps[h].size;
-    int k = snprintf(buf, n, "GPU: %s (vendor 0x%04x, device 0x%04x), %.1f GB device-local memory\n"
-                             "Driver: %s %s, driver version 0x%08x, Vulkan %u.%u.%u\n",
-                     p->deviceName, p->vendorID, p->deviceID, vram / 1073741824.0, dp.driverName, dp.driverInfo,
-                     p->driverVersion, VK_API_VERSION_MAJOR(p->apiVersion), VK_API_VERSION_MINOR(p->apiVersion),
-                     VK_API_VERSION_PATCH(p->apiVersion));
-    return k < 0 ? 0 : (size_t)k < n ? k : (int)n - 1;
-}
-
-static void vk_be_noop(void) {}
-
 const GfxBackend gfx_vulkan_backend = {
     .name = "vulkan",
     .pool_init = vk_be_pool_init,
@@ -660,30 +522,5 @@ const GfxBackend gfx_vulkan_backend = {
     .guest_written = vk_be_guest_written,
     .guest_read = vk_be_guest_read,
     .cpu_synced = vk_be_cpu_synced,
-    .window_start = vk_present_window_start,
-    .window_resize = vk_present_window_resize,
-    .present_mode = vk_present_mode,
-    .window_hdr10 = vk_present_hdr10,
-    .boot_async = vk_be_noop,
-    .boot_prewarm = vk_be_noop,
-    .save = vk_pipeline_save,
-    .exit_wait = vk_present_exit_wait,
-    .exit_release = vk_present_exit_release,
-    .shader_tool = vk_be_shader_tool,
-    .thumbs_enable = vk_thumbs_enable,
-    .thumbs_read = vk_thumbs_read,
-    .exec_frame = vk_be_exec_frame,
-    .device_text = vk_be_device_text,
-    .dump_request = vk_dump_request,
-    .capture_log_toggle = vk_capture_log_toggle,
 };
 
-void vk_backend_shutdown(void) {
-    replay_drain(DR_FINISH);
-    gfx_exit_log();
-    vk_present_drain();
-    vk_sync_shutdown();
-    vk_spec_shutdown();   // after the last submission is done: its parts may be the helper thread's command buffers
-    vk_mem_shutdown();
-    vk_shutdown();
-}

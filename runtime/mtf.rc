@@ -1,0 +1,4 @@
+/* mtf-recomp.exe's resources: its icon (mtf.ico, drawn by tools/make_icon.py; gfx_window_win.c gives it to the window)
+   and its application manifest (mtf.manifest). */
+1 24 "mtf.manifest"
+1 ICON "mtf.ico"

@@ -1,4 +1,4 @@
-# Adapted from LAS Recomp tools/simd_c.py @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
+# Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 """Portable C lowering of AArch64 FP / AdvSIMD / crypto / CRC32 instructions (lifter --simd=c).
 
 Every encoding is decoded here at lift time and turned into C over the Cpu struct, calling the static

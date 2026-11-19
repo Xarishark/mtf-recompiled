@@ -1,8 +1,5 @@
-// Adapted from MacNativeGames games/totk/runtime/audio_effects.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames contributors).
-// Algorithms from Ryujinx.Audio (MIT, Copyright (c) Ryujinx Team and Contributors).
-/* Delay, standard reverb and compressor DSP, ported from Ryujinx.Audio.
-   Copyright (c) Ryujinx Team and Contributors. MIT license:
-   third_party/licenses/Ryujinx-Audio.txt. Runtime samples are normalized floats. */
+// Delay, standard reverb and compressor DSP of the audio renderer's effects; samples are normalized floats.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include "audio_effects.h"
 #include "host.h"
 #include <math.h>
@@ -22,8 +19,11 @@ struct AudioEffectDsp {
 };
 static int channel_ok(unsigned n) { return n==1 || n==2 || n==4 || n==6; }
 static unsigned sample_count(unsigned rate, float ms) { return (unsigned)nearbyintf(rate*ms); }
-/* The reference DelayLine wraps at CurrentSampleCount-1, including when its
-   backing allocation is larger. Preserve this timing for sample comparisons. */
+/* The ring has `count` slots. The reference DelayLine wraps its cursor at
+   CurrentSampleCount-1 while its taps index modulo CurrentSampleCount, so once
+   per turn every tap reads a slot that is never written (a one-sample dropout
+   per tap, audible as grain). The cursor and the taps share one ring length here;
+   each delay is one sample longer than the reference. */
 static void line_set(DelayLine *d, unsigned n) { d->count=n<d->max?n:d->max; d->at=0; }
 static void line_init(DelayLine *d, unsigned rate, float ms) {
     d->max=sample_count(rate,ms); d->data=calloc((size_t)d->max+1,sizeof(float));
@@ -32,20 +32,20 @@ static void line_init(DelayLine *d, unsigned rate, float ms) {
 static float line_read(const DelayLine *d) { return d->data[d->at]; }
 static float line_update(DelayLine *d,float v) {
     float old=line_read(d);d->data[d->at++]=v;
-    if(d->at >= (d->count?d->count-1:0))d->at=0;
+    if(d->at >= d->count)d->at=0;
     return old;
 }
 static float line_tap(const DelayLine *d,unsigned sample,int offset) {
     int at=(int)d->at-(int)sample-offset;
-    if(at<0)at+=(int)d->count;
+    if(d->count){at%=(int)d->count;if(at<0)at+=(int)d->count;}
     if(at<0 || (unsigned)at>d->max)rt_fatal("audio effect delay tap bounds");
     return d->data[at];
 }
 static float gain10(float x) { return x>=0?1:x<=-5.3f?0:powf(10,x); }
 static const float fdn_time[4][4]={{53.953247f,79.192566f,116.238770f,130.615295f},{53.953247f,79.192566f,116.238770f,170.615295f},{5,10,5,10},{47.03f,71,103,170}};
 static const float decay_time[4][4]={{7,9,13,17},{7,9,13,17},{1,1,1,1},{7,7,13,9}};
-/* Early reflections are indexed by EarlyMode. These are Ryujinx.Audio's five
-   tables; its own version reads the first row for every mode. */
+/* Early reflections are indexed by EarlyMode. These are the reference renderer's five
+   tables; that renderer reads the first row for every mode. */
 static const float early_time[5][10]={
     {0,3.5f,2.8f,3.9f,2.7f,13.4f,7.9f,8.4f,9.9f,12},
     {0,11.8f,5.5f,11.2f,10.4f,38.1f,22.2f,29.6f,21.2f,24.8f},

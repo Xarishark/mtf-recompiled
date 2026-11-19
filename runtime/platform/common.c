@@ -15,34 +15,10 @@ void plat_rmutex_lock(PlatRMutex *m) {
     m->depth = 1;
 }
 
-int plat_rmutex_trylock(PlatRMutex *m) {
-    uint32_t me = plat_thread_id();
-    if (__atomic_load_n(&m->owner, __ATOMIC_RELAXED) == me) {
-        m->depth++;
-        return 1;
-    }
-    if (!plat_mutex_trylock(&m->m)) return 0;
-    __atomic_store_n(&m->owner, me, __ATOMIC_RELAXED);
-    m->depth = 1;
-    return 1;
-}
-
 void plat_rmutex_unlock(PlatRMutex *m) {
     if (--m->depth) return;
     __atomic_store_n(&m->owner, 0, __ATOMIC_RELAXED);
     plat_mutex_unlock(&m->m);
-}
-
-uint32_t plat_rmutex_release(PlatRMutex *m) {
-    uint32_t depth = m->depth;
-    m->depth = 1;
-    plat_rmutex_unlock(m);
-    return depth;
-}
-
-void plat_rmutex_retake(PlatRMutex *m, uint32_t depth) {
-    plat_rmutex_lock(m);
-    m->depth = depth;
 }
 
 // ---- once: state 0 not run, 1 running, 2 done. Waiters for a running initialiser sleep on one process-wide
@@ -81,12 +57,6 @@ void plat_event_set(PlatEvent *e) {
     e->set = 1;
     if (e->manual) plat_cond_broadcast(&e->c);
     else plat_cond_signal(&e->c);
-    plat_mutex_unlock(&e->m);
-}
-
-void plat_event_reset(PlatEvent *e) {
-    plat_mutex_lock(&e->m);
-    e->set = 0;
     plat_mutex_unlock(&e->m);
 }
 

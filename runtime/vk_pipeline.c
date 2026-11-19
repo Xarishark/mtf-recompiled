@@ -2,29 +2,28 @@
 // collects NVN state into a VkPipeState and asks for the pipeline of each draw; this file maps that state to Vulkan,
 // numbers the descriptor bindings and keeps the caches.
 //
-// Binding model. The translator (tools/xlate/Program.cs, Ryujinx 1.3.2's SPIR-V back end) decorates every resource of a
+// Binding model. The translator (tools/xlate/Program.cs and its shader library's SPIR-V back end) decorates every resource of a
 // shader with DescriptorSet 0 and numbers the bindings of each shader from 1 in the order it meets them (Accessor
-// Create*Binding); binding 0 is Ryujinx's support buffer (ResourceManager: SupportBuffer.Binding, a std140 uniform
+// Create*Binding); binding 0 is the translator's support buffer (ResourceManager: SupportBuffer.Binding, a std140 uniform
 // buffer every shader declares). The numbering is per shader, so the vertex and fragment stages of one program collide.
 // The scheme here:
-//   - one descriptor set, set 0, per pipeline; no push constants (Ryujinx's SPIR-V uses none);
+//   - one descriptor set, set 0, per pipeline; no push constants (the translator's SPIR-V uses none);
 //   - binding 0: the support buffer, one uniform buffer shared by all stages of the pipeline;
 //   - vertex stage: its own bindings 1..n unchanged; fragment stage: its bindings b >= 1 move to b + n (the SPIR-V
 //     Binding decorations are rewritten when the module is created); compute: its own bindings;
 //   - descriptor types from the reflection: constant buffers UNIFORM_BUFFER, storage buffers STORAGE_BUFFER, textures
 //     COMBINED_IMAGE_SAMPLER (UNIFORM_TEXEL_BUFFER for buffer textures, SAMPLED_IMAGE for separate ones), images
 //     STORAGE_IMAGE (STORAGE_TEXEL_BUFFER for buffer images), array lengths as descriptor counts;
-//   - set 0 is a push-descriptor set (VK_KHR_push_descriptor) when its descriptors fit maxPushDescriptors (32 on the RX
-//     9070; a pipeline layout may hold one push set only, which rules out a set per stage); larger ones (a vertex and a
+//   - set 0 is a push-descriptor set (VK_KHR_push_descriptor) when its descriptors fit maxPushDescriptors (32 on AMD; a pipeline layout may hold one push set only, which rules out a set per stage); larger ones (a vertex and a
 //     fragment stage near the census maxima of 15 and 27) are ordinary sets the replay allocates (VkPipeInfo.push 0).
-// A fixed layout per stage combination (Ryujinx's own back end: a binding per constant buffer, storage buffer, texture
-// and image slot per stage) would hold about 150 descriptors and could never be pushed, so layouts are made per distinct
+// A fixed layout per stage combination (a binding per constant buffer, storage buffer, texture and image
+// slot per stage) would hold about 150 descriptors and could never be pushed, so layouts are made per distinct
 // binding list and shared by every pipeline with that list; VkPipeInfo.bindings tells the replay which NVN slot feeds
 // each binding.
 //
-// Fragment inputs the vertex stage does not write (stages are translated separately; MNG nvn_mtl.m msl_varyings) get
+// Fragment inputs the vertex stage does not write (stages are translated separately) get
 // outputs added to the vertex module, as Vulkan rejects such pairs, initialised to (0, 0, 0, 1) as Maxwell reads an
-// unwritten output (docs/maxwell.md 1.2). The unwritten components of an output the vertex stage does write
+// unwritten output. The unwritten components of an output the vertex stage does write
 // start at (0, 0, 0, 1) in the translator (tools/xlate/patches/0006).
 //
 // Pipeline key. Everything Vulkan 1.3 can take as dynamic state is dynamic: viewports and scissors with count, depth
@@ -33,29 +32,26 @@
 // binding strides only); and, where VK_EXT_extended_dynamic_state3 offers them, depth clamp, polygon mode, blend enables,
 // equations, write masks and alpha to coverage. The key holds the rest: shaders, target formats, sample count, topology
 // class, depth clip mode, logic op and what is not dynamic on the GPU. The VkPipelineCache persists to
-// pipeline-cache.bin next to totk.exe (TOTK_PIPELINE_CACHE overrides the path).
-//
-// Provenance: the NVN -> Vulkan enum mappings (blend factors and equations, compare functions, stencil ops), the vertex
-// format table with its 3-component fallback and the pipeline cache file handling follow LAS Recomp
-// runtime/nvn/vulkan/exec.c and device.c @ da35b83a (MIT, Copyright (c) 2026 Peiikai); the pipeline state the key holds
-// (program, target formats, blend and write masks, vertex layout, sample count) and the varying fix-up follow
-// MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m pso_key_fill / pso_desc / msl_varyings and its vfmt
-// table @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the binding conventions are those of Ryujinx's shader translator
-// (MIT, tools/vendor/ryujinx).
+// pipeline-cache.bin next to mtf-recomp.exe (MTF_PIPELINE_CACHE overrides the path).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
 #include "gfx.h"
-#include "gfx_spirv.h"
 #include "host.h"
 #include "nvn_hmap.h"
 #include "platform/platform.h"
-#include "spirv_rewrite.h"
 #include "tex.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
+
+enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SPV_OP_TYPE_VECTOR = 23,
+       SPV_OP_TYPE_POINTER = 32, SPV_OP_CONSTANT = 43, SPV_OP_CONSTANT_COMPOSITE = 44,
+       SPV_OP_CONSTANT_NULL = 46, SPV_OP_FUNCTION = 54, SPV_OP_VARIABLE = 59,
+       SPV_OP_DECORATE = 71, SPV_DEC_BUILTIN = 11, SPV_DEC_LOCATION = 30, SPV_DEC_INDEX = 32, SPV_DEC_BINDING = 33, SPV_DEC_DESCRIPTOR_SET = 34,
+       SPV_SC_OUTPUT = 3 };
 
 #define MAX_BINDINGS 128
 #define PIPE_BUCKETS 4096
@@ -69,20 +65,15 @@ static struct {
     VkDevice device;
     VkPipelineCache cache;
     uint32_t max_push;
-    uint32_t max_stage_samplers;       // maxPerStageDescriptorSamplers: a push set stays within it (push_fits)
-    uint32_t dyn_ubo;                  // TOTK_DYN_UBO: uniform buffers of an allocated fragment set made dynamic, at most this many
     int indep;                         // stage-independent layouts (vk_caps.gpl): vertex set 0, fragment set 1
     int push_stage;                    // GFX_STAGE_* whose set is pushed with independent layouts
     int gpl;                           // draws whose pipeline is building get a fast-linked one (vk_caps.gpl)
     struct { uint64_t links, wlinks, dlinks, requeued, link_fail, defer, lib_n[4], lib_fail, swaps, slow, pre_used[4]; double link_ms, link_max, lib_ms[4], lib_max[4], dlink_ms, dlink_max; } g;
-    int vs_outs_all;                   // TOTK_VS_OUTS: 0 union of paired fragment inputs, 1 (all) all 32 output locations
+    int vs_outs_all;                   // MTF_VS_OUTS: 0 union of paired fragment inputs, 1 (all) all 32 output locations
     int dyn_vi, dyn_clamp, dyn_poly, dyn_blend_en, dyn_blend_eq, dyn_wmask, dyn_a2c;
     int f_logic_op, f_depth_clamp, f_fill_non_solid, f_dual_src;
-    int f_geometry, f_vertex_stores, f_gs_point_size, f_clip, f_cull;
     int pv_last;                       // provokingVertexLast enabled: NVN's default is the last vertex
     VkShaderStageFlags sg32_stages;    // stages that accept requiredSubgroupSize = 32 (0: not available)
-    VkShaderStageFlags subgroup_stages;
-    VkSubgroupFeatureFlags subgroup_operations;
     VkDynamicState dyn[32];
     uint32_t n_dyn;
     PFN_vkCmdPushDescriptorSetKHR push;
@@ -145,10 +136,10 @@ static uint64_t fnv(uint64_t h, const void *p, size_t n) {
 // than the lookup. Only the in-memory table uses it; the key file keeps fnv.
 static uint64_t key_hash(const void *k, size_t n) { return nvn_hm_hash(k, (uint32_t)n); }
 
-// The cache file lives next to totk.exe, so every build dir (the main build and each private fork) has its own:
+// The cache file lives next to mtf-recomp.exe, so every build dir (the main build and each private fork) has its own:
 // forks that shared build\v121's cache broke each other's runs (2026-10-22).
 static void cache_path_init(void) {
-    const char *cfg_path = cfg_get("TOTK_PIPELINE_CACHE");
+    const char *cfg_path = cfg_get("MTF_PIPELINE_CACHE");
     if (cfg_path && *cfg_path && strlen(cfg_path) < sizeof P.cache_path) {
         strcpy(P.cache_path, cfg_path);
         return;
@@ -211,21 +202,12 @@ static int ensure_init(void) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pd};
     vkGetPhysicalDeviceProperties2(c->phys, &p2);
     P.max_push = pd.maxPushDescriptors;
-    P.max_stage_samplers = p2.properties.limits.maxPerStageDescriptorSamplers;
-    {   // TOTK_DYN_UBO (0 off, 1 on, ab as 1 here; bind_resources reads the same knob): see dyn_ubo_convert.
-        // On by default except on Intel, where nobody has measured it: the -101 scene ran clean under the validation
-        // layer, and players measured gains on NVIDIA and AMD (docs/dkb-testing.md).
-        uint32_t lim = p2.properties.limits.maxDescriptorSetUniformBuffersDynamic;
-        P.dyn_ubo = !rt_knob("DYN_UBO", vk_caps.intel ? "0" : "1") ? 0 : lim < VK_DYN_UBO_MAX ? lim : VK_DYN_UBO_MAX;
-        rt_log("vk_pipeline: dynamic uniform buffers in the allocated fragment set: %s (up to %u, device limit %u)",
-               P.dyn_ubo ? "on" : "off", P.dyn_ubo, lim);
-    }
     P.indep = vk_caps.gpl;
     P.gpl = vk_caps.gpl;
     rt_log(P.gpl ? "vk_pipeline: graphics pipeline library on: a draw whose pipeline is building gets a fast-linked one, "
                    "the optimised build replaces it when done"
                  : "vk_pipeline: graphics pipeline library off: draws wait for or skip pipelines that are building");
-    const char *ps = cfg_get("TOTK_PUSH_STAGE"), *vo = cfg_get("TOTK_VS_OUTS");
+    const char *ps = cfg_get("MTF_PUSH_STAGE"), *vo = cfg_get("MTF_VS_OUTS");
     P.push_stage = ps && !strcmp(ps, "fs") ? GFX_STAGE_FS : GFX_STAGE_VS;
     P.vs_outs_all = vo && !strcmp(vo, "all");
     if (P.indep) rt_log("vk_pipeline: stage-independent layouts: vertex set 0, fragment set 1, %s set pushed; vertex outputs: %s",
@@ -238,11 +220,6 @@ static int ensure_init(void) {
                                             .pNext = c->has_provoking_vertex ? (void *)&pvf : (c->has_eds3 ? (void *)&e3 : NULL)};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v13};
     vkGetPhysicalDeviceFeatures2(c->phys, &f2);
-    VkPhysicalDeviceSubgroupProperties subgroup = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
-    VkPhysicalDeviceProperties2 subgroup_properties = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &subgroup};
-    vkGetPhysicalDeviceProperties2(c->phys, &subgroup_properties);
-    P.subgroup_stages = subgroup.supportedStages;
-    P.subgroup_operations = subgroup.supportedOperations;
     P.pv_last = c->has_provoking_vertex && pvf.provokingVertexLast;
     if (!P.pv_last) rt_log("vk_pipeline: provokingVertexLast unavailable: flat outputs come from the first vertex (NVN: last)");
     // Maxwell warps have 32 lanes; the translator assumes it (maxwell.md 3.4). Pin 32 where the driver allows it.
@@ -250,7 +227,7 @@ static int ensure_init(void) {
         VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
         VkPhysicalDeviceProperties2 q2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p13};
         vkGetPhysicalDeviceProperties2(c->phys, &q2);
-        P.sg32_stages = vk_caps.sg_pin_stages;   // vk_caps.c: 32 unless TOTK_VK_SUBGROUP; 0 without the pin
+        P.sg32_stages = vk_caps.sg_pin_stages;   // vk_caps.c: 32 unless MTF_VK_SUBGROUP; 0 without the pin
         rt_log("vk_pipeline: subgroup size %u-%u, requiredSubgroupSizeStages %#x, pinning %u on %#x", p13.minSubgroupSize,
                p13.maxSubgroupSize, (unsigned)p13.requiredSubgroupSizeStages, vk_caps.sg_size, (unsigned)P.sg32_stages);
     }
@@ -258,18 +235,13 @@ static int ensure_init(void) {
     P.f_depth_clamp = f2.features.depthClamp;
     P.f_fill_non_solid = f2.features.fillModeNonSolid;
     P.f_dual_src = f2.features.dualSrcBlend;
-    P.f_geometry = f2.features.geometryShader;
-    P.f_vertex_stores = f2.features.vertexPipelineStoresAndAtomics;
-    P.f_gs_point_size = f2.features.shaderTessellationAndGeometryPointSize;
-    P.f_clip = f2.features.shaderClipDistance;
-    P.f_cull = f2.features.shaderCullDistance;
 #define PROC(field, name) (P.field = (void *)vkGetDeviceProcAddr(c->device, name))
     PROC(push, "vkCmdPushDescriptorSetKHR");
     // Descriptor update templates (core 1.1; the push variant comes with VK_KHR_push_descriptor on 1.1): the driver
     // walks a layout prepared when the layout is made instead of parsing write structs every draw (DXVK does so for the
-    // same reason). TOTK_DESC_TEMPLATE=0 keeps the write structs.
-    if (!cfg_bool("TOTK_DESC_TEMPLATE")) {
-        rt_log("vk_pipeline: descriptor update templates off (TOTK_DESC_TEMPLATE=0)");
+    // same reason). MTF_DESC_TEMPLATE=0 keeps the write structs.
+    if (!cfg_bool("MTF_DESC_TEMPLATE")) {
+        rt_log("vk_pipeline: descriptor update templates off (MTF_DESC_TEMPLATE=0)");
     } else if (c->props.apiVersion >= VK_API_VERSION_1_1 && PROC(tpl_create, "vkCreateDescriptorUpdateTemplate") &&
                PROC(tpl_destroy, "vkDestroyDescriptorUpdateTemplate") && PROC(tpl_update, "vkUpdateDescriptorSetWithTemplate")) {
         P.tpl = 1;
@@ -278,15 +250,14 @@ static int ensure_init(void) {
     } else {
         rt_log("vk_pipeline: descriptor update templates unavailable: sets are written with write structs");
     }
-    // TOTK_VK_DYN_VERTEX=0/1 forces dynamic vertex input off or on. Default off on Intel's frozen Windows driver for its
-    // older integrated GPUs (UHD 630, Ice Lake: Vulkan 1.3.215 and older), which draws nothing with it; LAS Recomp
-    // turns it off there for the same reason.
-    const char *dv = cfg_get("TOTK_VK_DYN_VERTEX");   // no fixed default: it depends on the GPU, see above
+    // MTF_VK_DYN_VERTEX=0/1 forces dynamic vertex input off or on. Default off on Intel's frozen Windows driver for its
+    // older integrated GPUs (UHD 630, Ice Lake: Vulkan 1.3.215 and older), which draws nothing with it.
+    const char *dv = cfg_get("MTF_VK_DYN_VERTEX");   // no fixed default: it depends on the GPU, see above
     int intel_legacy = c->props.vendorID == 0x8086 && c->props.apiVersion <= VK_MAKE_API_VERSION(0, 1, 3, 215);
     int dv_on = dv && *dv ? strcmp(dv, "0") != 0 : !intel_legacy;
     P.dyn_vi = dv_on && c->has_vertex_input_dynamic_state && PROC(set_vi, "vkCmdSetVertexInputEXT");
     if (!dv_on && c->has_vertex_input_dynamic_state)
-        rt_log("vk_pipeline: dynamic vertex input off (%s)", dv && *dv ? "TOTK_VK_DYN_VERTEX=0" : "Intel's older Windows driver draws nothing with it");
+        rt_log("vk_pipeline: dynamic vertex input off (%s)", dv && *dv ? "MTF_VK_DYN_VERTEX=0" : "Intel's older Windows driver draws nothing with it");
     if (c->has_eds3) {
         P.dyn_clamp = e3.extendedDynamicState3DepthClampEnable && P.f_depth_clamp && PROC(set_clamp, "vkCmdSetDepthClampEnableEXT");
         P.dyn_poly = e3.extendedDynamicState3PolygonMode && PROC(set_poly, "vkCmdSetPolygonModeEXT");
@@ -295,16 +266,16 @@ static int ensure_init(void) {
         P.dyn_wmask = e3.extendedDynamicState3ColorWriteMask && PROC(set_wmask, "vkCmdSetColorWriteMaskEXT");
         P.dyn_a2c = e3.extendedDynamicState3AlphaToCoverageEnable && PROC(set_a2c, "vkCmdSetAlphaToCoverageEnableEXT");
     }
-    // TOTK_VK_DYN_A2C=0/1 forces dynamic alpha to coverage off or on. Default off on AMD's Windows driver branch for
+    // MTF_VK_DYN_A2C=0/1 forces dynamic alpha to coverage off or on. Default off on AMD's Windows driver branch for
     // RDNA 2 and older (vk_caps.amd_sc), which applies alpha to coverage while the dynamic state says off: on an RX 590
-    // (24.9.1) TotK, which never turns it on, drew Link and the NPCs with depth but no colour (black silhouettes) and
-    // dithered other surfaces into checkerboards (issue #67, RX 470/570/580). Taken out of the dynamic state, it goes
+    // (24.9.1) a game that never turns it on drew its characters with depth but no colour (black silhouettes) and
+    // dithered other surfaces into checkerboards (RX 470/570/580). Taken out of the dynamic state, it goes
     // into the pipeline key and the characters draw.
-    const char *da = cfg_get("TOTK_VK_DYN_A2C");   // no fixed default: it depends on the driver, see above
+    const char *da = cfg_get("MTF_VK_DYN_A2C");   // no fixed default: it depends on the driver, see above
     int da_on = da && *da ? strcmp(da, "0") != 0 : !vk_caps.amd_sc;
     if (!da_on && P.dyn_a2c) {
         P.dyn_a2c = 0;
-        rt_log("vk_pipeline: dynamic alpha to coverage off (%s)", da && *da ? "TOTK_VK_DYN_A2C=0" : "AMD's driver for RDNA 2 and older");
+        rt_log("vk_pipeline: dynamic alpha to coverage off (%s)", da && *da ? "MTF_VK_DYN_A2C=0" : "AMD's driver for RDNA 2 and older");
     }
 #undef PROC
     static const VkDynamicState core[] = {
@@ -325,9 +296,9 @@ static int ensure_init(void) {
     if (P.dyn_wmask) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT;
     if (P.dyn_a2c) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT;
     cache_load(c);
-    rt_log("vk_pipeline: max push descriptors %u, samplers per stage %u; dynamic vertex input %d, depth clamp %d, polygon mode %d, blend enable %d, "
+    rt_log("vk_pipeline: max push descriptors %u; dynamic vertex input %d, depth clamp %d, polygon mode %d, blend enable %d, "
            "blend equation %d, write mask %d, alpha to coverage %d; cache %s",
-           P.max_push, P.max_stage_samplers, P.dyn_vi, P.dyn_clamp, P.dyn_poly, P.dyn_blend_en, P.dyn_blend_eq, P.dyn_wmask, P.dyn_a2c,
+           P.max_push, P.dyn_vi, P.dyn_clamp, P.dyn_poly, P.dyn_blend_en, P.dyn_blend_eq, P.dyn_wmask, P.dyn_a2c,
            P.cache_path[0] ? P.cache_path : "<memory only>");
     keys_open();
     plat_xchg32(&P.ready, 1);
@@ -336,7 +307,7 @@ static int ensure_init(void) {
     return 1;
 }
 
-// ---- NVN -> Vulkan mappings (LAS Recomp exec.c blend_factor, blend_op, compare_fn, stencil_op)
+// ---- NVN -> Vulkan mappings (blend factors and equations, compare functions, stencil ops)
 
 static VkBlendFactor blend_factor(unsigned f) {
     switch (f) {
@@ -402,27 +373,7 @@ VkPrimitiveTopology vk_pipeline_topology(int prim) {
     }
 }
 
-int vk_geometry_supported(void) { return P.f_geometry; }
-
 // Topology class (a pipeline's static topology only fixes the class): 0 point, 1 line, 2 triangle, 3 patch.
-uint8_t vk_geometry_input(uint32_t primitive) {
-    // Vulkan Geometry Shading: these list/strip forms have the same GS input
-    // primitive, including adjacency. Rewritten NVN forms have no proven GS ABI.
-    switch (primitive) {
-    case NVN_DRAW_PRIMITIVE_POINTS: return GFX_GEOMETRY_POINTS;
-    case NVN_DRAW_PRIMITIVE_LINES:
-    case NVN_DRAW_PRIMITIVE_LINE_STRIP: return GFX_GEOMETRY_LINES;
-    case NVN_DRAW_PRIMITIVE_LINES_ADJACENCY:
-    case NVN_DRAW_PRIMITIVE_LINE_STRIP_ADJACENCY: return GFX_GEOMETRY_LINES_ADJACENCY;
-    case NVN_DRAW_PRIMITIVE_TRIANGLES:
-    case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP:
-    case NVN_DRAW_PRIMITIVE_TRIANGLE_FAN: return GFX_GEOMETRY_TRIANGLES;
-    case NVN_DRAW_PRIMITIVE_TRIANGLES_ADJACENCY:
-    case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP_ADJACENCY: return GFX_GEOMETRY_TRIANGLES_ADJACENCY;
-    default: return GFX_GEOMETRY_NONE;
-    }
-}
-
 static int topology_class(VkPrimitiveTopology t) {
     switch (t) {
     case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return 0;
@@ -481,7 +432,7 @@ static VkFormatFeatureFlags format_features(VkFormat f, int optimal) {
     return r;
 }
 
-// Vertex attribute formats by NVNformat (LAS Recomp exec.c vertex_format; MNG nvn_mtl.m vfmt for the TotK additions).
+// Vertex attribute formats by NVNformat.
 typedef struct { VkFormat vk; uint8_t type; } VtxFmt;
 #define F(v) {VK_FORMAT_##v, GFX_TYPE_FLOAT}
 #define U(v) {VK_FORMAT_##v, GFX_TYPE_UINT}
@@ -516,7 +467,7 @@ static const VtxFmt vtx_formats[0x9B] = {
 #undef U
 #undef I
 
-// 3-component 8/16-bit formats are not vertex formats on every GPU: read 4 components (LAS vertex_format_supported).
+// 3-component 8/16-bit formats are not vertex formats on every GPU: read 4 components.
 static VkFormat widen(VkFormat f) {
     switch (f) {
     case VK_FORMAT_R8G8B8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
@@ -608,10 +559,10 @@ typedef struct {
     VkVertexInputBindingDescription2EXT b[17];
 } VtxInput;
 
-// An attribute the game left without a format is a fixed one on Maxwell, a single 32-bit component of 0 (deko3d
-// gpu_3d_vbo.cpp binds unused attributes as IsFixed 1x32 float): it reads (0, 0, 0, 1), as Vulkan expands a
-// one-component format. TOTK's foliage shaders scale wind sway by 1 - colour.w; shapes without a vertex colour
-// (Brightbloom stem and leaves) must not sway, or they bend away from the parts that have one (the bulb).
+// An attribute the game left without a format is a fixed one on Maxwell, a single 32-bit component of 0 (an unused
+// attribute is bound as a fixed 1x32 float): it reads (0, 0, 0, 1), as Vulkan expands a
+// one-component format. Foliage shaders may scale wind sway by 1 - colour.w; shapes without a vertex colour
+// must not sway, or they bend away from the parts that have one.
 static VkFormat zero_format(int type) {
     return type == GFX_TYPE_UINT ? VK_FORMAT_R32_UINT : type == GFX_TYPE_SINT ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_SFLOAT;
 }
@@ -629,7 +580,23 @@ static void vertex_input(const VkPipeState *s, VtxInput *v) {
                                                      .location = (uint32_t)l};
         va_st va = {0};
         if (l < 16) memcpy(&va, &s->vattr[l], sizeof va);
-        VkFormat f = va.fmt ? vk_vertex_format((int)va.fmt, NULL) : VK_FORMAT_UNDEFINED;
+        int vtype = GFX_TYPE_FLOAT;
+        VkFormat f = va.fmt ? vk_vertex_format((int)va.fmt, &vtype) : VK_FORMAT_UNDEFINED;
+        if (f != VK_FORMAT_UNDEFINED && vtype != io[l].type) gfx_shader_answer_note(s->vs, 0, l, vtype);
+        {   // (MTF_VATTR_LOG=1) each distinct location / NVN format / Vulkan format / shader type, once
+            static int on = -1;
+            if (on < 0) on = cfg_bool("MTF_VATTR_LOG");
+            static uint32_t seen[256];
+            static int nseen;
+            uint32_t k = (uint32_t)l << 24 ^ (uint32_t)va.fmt << 8 ^ (uint32_t)io[l].type << 4 ^ (uint32_t)vtype;
+            int have = 0;
+            for (int i = 0; i < nseen; i++) have |= seen[i] == k;
+            if (on && !have && nseen < 256) {
+                seen[nseen++] = k;
+                rt_log("vattr: location %d nvn format %#x -> vk %d (type %d), shader type %d, stream %u offset %u", l,
+                       (unsigned)va.fmt, (int)f, vtype, io[l].type, (unsigned)va.stream, (unsigned)va.offset);
+            }
+        }
         if (f != VK_FORMAT_UNDEFINED && va.stream < 16) {
             a->binding = va.stream, a->format = f, a->offset = va.offset;
             streams |= 1u << va.stream;
@@ -658,27 +625,251 @@ PFN_vkCmdPushDescriptorSetKHR vk_pipeline_push_fn(void) { return ensure_init() ?
 PFN_vkCmdPushDescriptorSetWithTemplateKHR vk_pipeline_push_tpl_fn(void) { return ensure_init() && P.tpl ? P.tpl_push : NULL; }
 PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void) { return ensure_init() && P.tpl ? P.tpl_update : NULL; }
 
-int vk_pipeline_set_indep(int on) {
-    if (!ensure_init()) return 0;
-    plat_mutex_lock(&P.lock);
-    int was = P.indep;
-    P.indep = on && vk_caps.gpl;
-    plat_mutex_unlock(&P.lock);
-    return was;
+// ---- SPIR-V rewrites
+
+// Binding decorations b >= 1 become b + off (the fragment stage's share of set 0).
+static uint32_t *spirv_rebind(const uint32_t *w, uint64_t n, uint32_t off) {
+    uint32_t *o = malloc(n * 4);
+    if (!o) return NULL;
+    memcpy(o, w, n * 4);
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = o[i] & 0xffff, len = o[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == SPV_OP_DECORATE && len >= 4 && o[i + 2] == SPV_DEC_BINDING && o[i + 3] >= 1) o[i + 3] += off;
+        i += len;
+    }
+    return o;
 }
 
-// ---- SPIR-V modules. The rewrites are spirv_rewrite.c's; gfx_spirv.c applies the ones every module gets.
+// DescriptorSet decorations become set (the fragment stage's resources move to set 1 with independent layouts).
+static uint32_t *spirv_set(const uint32_t *w, uint64_t n, uint32_t set) {
+    uint32_t *o = malloc(n * 4);
+    if (!o) return NULL;
+    memcpy(o, w, n * 4);
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = o[i] & 0xffff, len = o[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == SPV_OP_DECORATE && len >= 4 && o[i + 2] == SPV_DEC_DESCRIPTOR_SET) o[i + 3] = set;
+        i += len;
+    }
+    return o;
+}
 
-// The device limit spirv_fixup_linked trims per-vertex blocks to; 8 before there is a device.
-static uint32_t clip_cull_limit(void) {
+// Dual-source blending: SRC1 blend factors read the fragment shader's colour output 1,
+// which Vulkan takes from Location 0, Index 1. The Output variable at Location 1 moves there, as the translator declares it
+// with DualSourceBlendEnable (CodeGen/Spirv/Declarations.cs); the pipeline is keyed by GKey.dsb, so only pipelines
+// that blend with SRC1 get this module. NULL when the module has no Output at Location 1.
+static uint32_t *spirv_dual_source(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    uint32_t outs[64];
+    int nout = 0;
+    uint64_t at = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) return NULL;
+        if (op == SPV_OP_VARIABLE && len >= 4 && w[i + 3] == SPV_SC_OUTPUT && nout < 64) outs[nout++] = w[i + 2];
+        i += len;
+    }
+    for (uint64_t i = 5; i < n && !at;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == SPV_OP_DECORATE && len == 4 && w[i + 2] == SPV_DEC_LOCATION && w[i + 3] == 1)
+            for (int k = 0; k < nout; k++)
+                if (outs[k] == w[i + 1]) at = i;
+        i += len;
+    }
+    if (!at) return NULL;
+    uint32_t *o = malloc((n + 4) * 4);
+    if (!o) return NULL;
+    memcpy(o, w, (at + 4) * 4);
+    o[at + 3] = 0;
+    o[at + 4] = 4u << 16 | SPV_OP_DECORATE, o[at + 5] = w[at + 1], o[at + 6] = SPV_DEC_INDEX, o[at + 7] = 1;
+    memcpy(o + at + 8, w + at + 4, (n - at - 4) * 4);
+    *out_n = n + 4;
+    return o;
+}
+
+// Adds an Output variable for each Location of `missing` (type and width from io) to a module, declared in the entry
+// point interface and initialised as Maxwell reads an unwritten output: (0, 0, 0, 1), the w as the bits of 1.0f whatever
+// the type (attribute memory is untyped); fewer than 4 components are all zero. Existing scalar, vector and pointer types
+// are reused. NULL when the module does not have the expected layout.
+static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missing, const GfxShaderIo io[32],
+                                   uint64_t *out_n) {
+    uint64_t ep_at = 0, ann_end = 0, fn_at = 0;
+    uint32_t bound = w[3], scalar[3] = {0, 0, 0};          // GFX_TYPE_FLOAT, SINT, UINT
+    struct { uint32_t id, comp, count; } vec[64];
+    struct { uint32_t id, type; } ptr[64];
+    int nvec = 0, nptr = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) return NULL;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_ENTRY_POINT && !ep_at) ep_at = i;
+        else if (op == SPV_OP_DECORATE || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632 || op == 5633)
+            ann_end = i + len;
+        else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[1] == 32) scalar[GFX_TYPE_FLOAT] = a[0];
+        else if (op == SPV_OP_TYPE_INT && len >= 4 && a[1] == 32) scalar[a[2] ? GFX_TYPE_SINT : GFX_TYPE_UINT] = a[0];
+        else if (op == SPV_OP_TYPE_VECTOR && len >= 4 && nvec < 64) vec[nvec].id = a[0], vec[nvec].comp = a[1], vec[nvec++].count = a[2];
+        else if (op == SPV_OP_TYPE_POINTER && len >= 4 && a[1] == SPV_SC_OUTPUT && nptr < 64) ptr[nptr].id = a[0], ptr[nptr++].type = a[2];
+        else if (op == SPV_OP_FUNCTION) { fn_at = i; break; }
+        i += len;
+    }
+    if (!ep_at || !ann_end || !fn_at || ann_end < ep_at || fn_at < ann_end) return NULL;
+    uint32_t types[32 * 40], decs[32 * 4], vars[32], zero[3] = {0, 0, 0}, one[3] = {0, 0, 0};
+    int nt = 0, nd = 0, nv = 0;
+    for (int l = 0; l < 32; l++) {
+        if (!(missing >> l & 1)) continue;
+        int t = io[l].type <= GFX_TYPE_UINT ? io[l].type : GFX_TYPE_FLOAT;
+        uint32_t comps = io[l].comps ? io[l].comps : 4;
+        if (!scalar[t]) {
+            scalar[t] = bound++;
+            if (t == GFX_TYPE_FLOAT) types[nt++] = 3u << 16 | SPV_OP_TYPE_FLOAT, types[nt++] = scalar[t], types[nt++] = 32;
+            else types[nt++] = 4u << 16 | SPV_OP_TYPE_INT, types[nt++] = scalar[t], types[nt++] = 32, types[nt++] = t == GFX_TYPE_SINT;
+        }
+        uint32_t type = scalar[t];
+        if (comps > 1) {
+            int k = 0;
+            while (k < nvec && !(vec[k].comp == type && vec[k].count == comps)) k++;
+            if (k == nvec) {
+                if (nvec == 64) return NULL;
+                vec[nvec].id = bound++, vec[nvec].comp = type, vec[nvec++].count = comps;
+                types[nt++] = 4u << 16 | SPV_OP_TYPE_VECTOR, types[nt++] = vec[k].id, types[nt++] = type, types[nt++] = comps;
+            }
+            type = vec[k].id;
+        }
+        int k = 0;
+        while (k < nptr && ptr[k].type != type) k++;
+        if (k == nptr) {
+            if (nptr == 64) return NULL;
+            ptr[nptr].id = bound++, ptr[nptr++].type = type;
+            types[nt++] = 4u << 16 | SPV_OP_TYPE_POINTER, types[nt++] = ptr[k].id, types[nt++] = SPV_SC_OUTPUT, types[nt++] = type;
+        }
+        uint32_t init = bound++, var = bound++;
+        if (comps == 4) {
+            if (!zero[t]) {
+                zero[t] = bound++, one[t] = bound++;
+                types[nt++] = 4u << 16 | SPV_OP_CONSTANT, types[nt++] = scalar[t], types[nt++] = zero[t], types[nt++] = 0;
+                types[nt++] = 4u << 16 | SPV_OP_CONSTANT, types[nt++] = scalar[t], types[nt++] = one[t], types[nt++] = 0x3f800000;
+            }
+            types[nt++] = 7u << 16 | SPV_OP_CONSTANT_COMPOSITE, types[nt++] = type, types[nt++] = init;
+            types[nt++] = zero[t], types[nt++] = zero[t], types[nt++] = zero[t], types[nt++] = one[t];
+        } else {
+            types[nt++] = 3u << 16 | SPV_OP_CONSTANT_NULL, types[nt++] = type, types[nt++] = init;
+        }
+        types[nt++] = 5u << 16 | SPV_OP_VARIABLE, types[nt++] = ptr[k].id, types[nt++] = var, types[nt++] = SPV_SC_OUTPUT,
+        types[nt++] = init;
+        decs[nd++] = 4u << 16 | SPV_OP_DECORATE, decs[nd++] = var, decs[nd++] = SPV_DEC_LOCATION, decs[nd++] = (uint32_t)l;
+        vars[nv++] = var;
+    }
+    uint64_t total = n + (uint64_t)(nt + nd + nv);
+    uint32_t *o = malloc(total * 4), *p = o;
+    if (!o) return NULL;
+    uint32_t ep_len = w[ep_at] >> 16;
+    memcpy(p, w, 5 * 4), p[3] = bound, p += 5;
+    memcpy(p, w + 5, (ep_at - 5) * 4), p += ep_at - 5;
+    *p++ = (ep_len + (uint32_t)nv) << 16 | SPV_OP_ENTRY_POINT;
+    memcpy(p, w + ep_at + 1, (ep_len - 1) * 4), p += ep_len - 1;
+    memcpy(p, vars, (size_t)nv * 4), p += nv;
+    memcpy(p, w + ep_at + ep_len, (ann_end - ep_at - ep_len) * 4), p += ann_end - ep_at - ep_len;
+    memcpy(p, decs, (size_t)nd * 4), p += nd;
+    memcpy(p, w + ann_end, (fn_at - ann_end) * 4), p += fn_at - ann_end;
+    memcpy(p, types, (size_t)nt * 4), p += nt;
+    memcpy(p, w + fn_at, (n - fn_at) * 4), p += n - fn_at;
+    *out_n = (uint64_t)(p - o);
+    return o;
+}
+
+// Two fixes for what the translator declares but a shader does not use (NULL: nothing to change):
+//  - the fragment shader interlock capability and extension, which the translator adds to every fragment shader when the host
+//    reports interlock support (SpirvGenerator.cs) and vk_device.c does not enable; kept when the shader interlocks;
+//  - the CullDistance[1] member of gl_PerVertex next to ClipDistance[8] (Declarations.cs CreatePerVertexStructType):
+//    9 distances exceed maxCombinedClipAndCullDistances (8 on AMD). The translator never accesses CullDistance; the
+//    member goes when it is the struct's last and no access chain selects it.
+static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    enum { OP_EXTENSION = 10, OP_CAPABILITY = 17, OP_MEMBER_NAME = 6, OP_EXECUTION_MODE = 16, OP_TYPE_ARRAY = 28,
+           OP_TYPE_STRUCT = 30, OP_CONSTANT = 43, OP_MEMBER_DECORATE = 72, OP_ACCESS_CHAIN = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66,
+           OP_BEGIN_INTERLOCK = 5364, OP_END_INTERLOCK = 5365, CAP_SAMPLE_INTERLOCK = 5363, CAP_PIXEL_INTERLOCK = 5378,
+           CAP_RATE_INTERLOCK = 5372, BUILTIN_CLIP = 3, BUILTIN_CULL = 4 };
+    if (n < 5) return NULL;
+    uint32_t bound = w[3] < (1u << 22) ? w[3] : (1u << 22);
+    uint32_t *val = calloc(bound, sizeof *val), *elem = calloc(bound, sizeof *elem), *len = calloc(bound, sizeof *len),
+             *pointee = calloc(bound, sizeof *pointee), *var_type = calloc(bound, sizeof *var_type);
+    uint32_t *o = NULL;
+    int interlock_used = 0, interlock_declared = 0, cull_ok = 0;
+    uint32_t cull_struct = 0, cull_member = 0, clip_member = ~0u, members = 0, member_types[8] = {0};
+    if (!val || !elem || !len || !pointee || !var_type) goto out;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        if (!l || i + l > n) goto out;
+        const uint32_t *a = w + i + 1;
+        if (op == OP_BEGIN_INTERLOCK || op == OP_END_INTERLOCK) interlock_used = 1;
+        else if (op == OP_EXECUTION_MODE && l >= 3 && a[1] >= 5366 && a[1] <= 5371) interlock_used = 1;
+        else if (op == OP_CAPABILITY && l >= 2 && (a[0] == CAP_PIXEL_INTERLOCK || a[0] == CAP_SAMPLE_INTERLOCK || a[0] == CAP_RATE_INTERLOCK))
+            interlock_declared = 1;
+        else if (op == OP_CONSTANT && l == 4 && a[1] < bound) val[a[1]] = a[2];
+        else if (op == OP_TYPE_ARRAY && l >= 4 && a[0] < bound) elem[a[0]] = a[1], len[a[0]] = a[2] < bound ? val[a[2]] : 0;
+        else if (op == SPV_OP_TYPE_POINTER && l >= 4 && a[0] < bound) pointee[a[0]] = a[2];
+        else if (op == SPV_OP_VARIABLE && l >= 4 && a[1] < bound) var_type[a[1]] = a[0] < bound ? pointee[a[0]] : 0;
+        else if (op == OP_MEMBER_DECORATE && l >= 5 && a[2] == SPV_DEC_BUILTIN && a[3] == BUILTIN_CULL) cull_struct = a[0], cull_member = a[1];
+        else if (op == OP_MEMBER_DECORATE && l >= 5 && a[2] == SPV_DEC_BUILTIN && a[3] == BUILTIN_CLIP) clip_member = a[1];
+        else if (op == OP_TYPE_STRUCT && cull_struct && a[0] == cull_struct && l >= 2) {
+            members = l - 2;
+            for (uint32_t m = 0; m < members && m < 8; m++) member_types[m] = a[1 + m];
+        } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && l >= 5 && cull_struct && a[2] < bound) {
+            uint32_t t = var_type[a[2]], k = 3;
+            if (t < bound && t && elem[t] == cull_struct) k = 4;   // arrayed per-vertex block
+            if ((t == cull_struct || k == 4) && k + 1 < l && a[k] < bound && val[a[k]] == cull_member) cull_struct = 0;
+        }
+        i += l;
+    }
     VkCtx *c = vk_ctx();
-    return c ? c->props.limits.maxCombinedClipAndCullDistances : 8;
+    uint32_t limit = c ? c->props.limits.maxCombinedClipAndCullDistances : 8;
+    if (cull_struct && members && members <= 8 && cull_member == members - 1 && clip_member < members) {
+        uint32_t clip_t = member_types[clip_member], cull_t = member_types[cull_member];
+        uint32_t clip_n = clip_t < bound ? len[clip_t] : 0, cull_n = cull_t < bound ? len[cull_t] : 0;
+        cull_ok = clip_n + cull_n > limit && clip_n <= limit;
+    }
+    int strip = interlock_declared && !interlock_used;
+    if (!strip && !cull_ok) goto out;
+    o = malloc(n * 4);
+    if (!o) goto out;
+    uint64_t on = 5;
+    memcpy(o, w, 5 * 4);
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        int drop = 0;
+        if (strip && op == OP_CAPABILITY && (a[0] == CAP_PIXEL_INTERLOCK || a[0] == CAP_SAMPLE_INTERLOCK || a[0] == CAP_RATE_INTERLOCK)) drop = 1;
+        if (strip && op == OP_EXTENSION && l >= 2 && !strncmp((const char *)a, "SPV_EXT_fragment_shader_interlock", (l - 1) * 4)) drop = 1;
+        if (cull_ok && (op == OP_MEMBER_DECORATE || op == OP_MEMBER_NAME) && l >= 3 && a[0] == cull_struct && a[1] == cull_member) drop = 1;
+        if (!drop) {
+            memcpy(o + on, w + i, l * 4);
+            if (cull_ok && op == OP_TYPE_STRUCT && a[0] == cull_struct) o[on] = (l - 1) << 16 | op;   // last member gone
+            on += op == OP_TYPE_STRUCT && cull_ok && a[0] == cull_struct ? l - 1 : l;
+        }
+        i += l;
+    }
+    *out_n = on;
+out:
+    free(val), free(elem), free(len), free(pointee), free(var_type);
+    return o;
+}
+
+// True when the module declares a GroupNonUniform* or SubgroupBallot-style capability (lane masks assume 32 lanes).
+static int uses_subgroup_ops(const uint32_t *w, uint64_t words) {
+    for (uint64_t i = 5; i < words;) {
+        uint32_t op = w[i] & 0xffff, n = w[i] >> 16;
+        if (!n || i + n > words) return 0;
+        if (op != 17) return 0;   // OpCapability; capabilities come first, stop at the first other instruction
+        uint32_t cap = w[i + 1];
+        if ((cap >= 61 && cap <= 68) || cap == 4423 || cap == 4431) return 1;   // NonUniform*, SubgroupBallotKHR, SubgroupVoteKHR
+        i += n;
+    }
+    return 0;
 }
 
 // Chain {size 32} into a stage create info when the stage uses subgroup ops and the driver allows the pin.
 static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *rq,
                            const uint32_t *w, uint64_t words) {
-    if (!(P.sg32_stages & st->stage) || !w || !spirv_uses_subgroup_ops(w, words)) return;
+    if (!(P.sg32_stages & st->stage) || !w || !uses_subgroup_ops(w, words)) return;
     *rq = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo){
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = vk_caps.sg_size};
     st->pNext = rq;
@@ -737,439 +928,17 @@ static uint32_t *viewport_relative_layer(const uint32_t *w, uint64_t n, uint64_t
     return o;
 }
 
-static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w, uint64_t words, int geometry_chain) {
-    uint64_t final_n = words, layer_n = 0;
-    uint32_t *final = gfx_spirv_final(src, w, words, geometry_chain, clip_cull_limit(), &final_n);
-    if (final) w = final, words = final_n;
+static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
+    uint64_t fixed_n = 0, layer_n = 0;
+    uint32_t *fixed = spirv_fixup(w, words, &fixed_n);
+    if (fixed) w = fixed, words = fixed_n;
     uint32_t *layer = vk_ctx()->has_viewport_array2 ? viewport_relative_layer(w, words, &layer_n) : NULL;
-    if (layer) free(final), final = layer, w = layer, words = layer_n;
+    if (layer) free(fixed), fixed = layer, w = layer, words = layer_n;
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
-    free(final);
+    free(fixed);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
-}
-
-static VkShaderModule make_module(const GfxShader *src, const uint32_t *w, uint64_t words) {
-    return make_module_linked(src, w, words, 0);
-}
-
-// Experimental GS accepts a deliberately bounded interface: unpacked 32-bit
-// scalar/vectors, the GS outer vertex array, and numeric built-in blocks. Parse
-// the same fixup used at upload, rather than infer widths/counts from Locations.
-// Vulkan Shader Interfaces: the outer GS array is disregarded for matching and
-// component limits include built-ins. Device checks use VkPhysicalDeviceLimits.
-typedef struct {
-    uint32_t op, x, y, type, storage, location, builtin;
-    uint8_t component, listed, block, flat, invariant, interpolation, unsupported;
-} GeometryId;
-typedef struct {
-    uint32_t mask, components;
-    GfxShaderIo io[32];
-    uint8_t invariant[32];
-    uint64_t builtin_mask, builtin[64];
-    uint64_t standalone_builtins;
-    uint8_t block_members, block_invariant, block_builtin[16];
-    uint8_t system_inputs; // bit 0: subgroup lane ID, bit 1: subgroup less-than mask; neither is VS-linked
-} GeometryInterface;
-
-// These standalone GS inputs are supplied by the implementation, not the VS.
-// Match the exact U32 forms emitted by Ryujinx IoMap, without putting large
-// BuiltIn IDs into the per-vertex 64-bit mask or consuming vertex components.
-static int geometry_system_input(const GeometryId *id, uint32_t bound, const GeometryId *var,
-                                 uint32_t type, uint8_t *seen) {
-    uint32_t builtin = var->builtin - 1;
-    uint8_t bit = builtin == 41 ? 1 : builtin == 4420 ? 2 : 0;
-    if (!bit || (*seen & bit) || var->location || var->component || var->invariant ||
-        var->interpolation || var->unsupported || var->block || !type || type >= bound) return 0;
-    if (bit == 2) {
-        if (id[type].op != 23 || id[type].y != 4) return 0;
-        type = id[type].x;
-        if (!type || type >= bound) return 0;
-    }
-    if (id[type].op != 21 || id[type].x != 32 || id[type].y) return 0;
-    *seen |= bit;
-    return 1;
-}
-
-// Reject known subgroup extension families without rejecting unrelated shader
-// extensions. The literal must terminate within its instruction, with zero pad.
-static int geometry_subgroup_extension(const uint32_t *words, uint32_t count) {
-    if (!count) return 0;
-    const char *name = (const char *)words;
-    size_t bytes = (size_t)count * 4;
-    const char *end = memchr(name, 0, bytes);
-    if (!end || end == name) return 0;
-    for (const char *p = end + 1; p < name + bytes; p++) if (*p) return 0;
-    static const char *tokens[] = {"subgroup", "sub_group", "group_non_uniform", "shader_ballot"};
-    for (unsigned t = 0; t < sizeof tokens / sizeof *tokens; t++) {
-        size_t length = strlen(tokens[t]);
-        for (const char *p = name; (size_t)(end - p) >= length; p++) {
-            size_t i;
-            for (i = 0; i < length; i++) {
-                unsigned char c = (unsigned char)p[i];
-                if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
-                if (c != (unsigned char)tokens[t][i]) break;
-            }
-            if (i == length) return 0;
-        }
-    }
-    return 1;
-}
-
-// Capability support applies even without an instruction; stage support is a
-// separate requirement for actual subgroup-scoped group operations (Vulkan
-// SPIR-V appendix, VUID-RuntimeSpirv-None-06343). The required-size pin is not
-// evidence for either. Admit only the group families currently emitted here.
-static int geometry_subgroups(const GfxShader *s, uint8_t system_inputs) {
-    uint64_t words = 0;
-    const uint32_t *w = gfx_shader_spirv(s, &words);
-    if (!w || words < 5 || !w[3] || w[3] > (1u << 16)) return 0;
-    uint32_t bound = w[3], declared = 0, operations = 0;
-    GeometryId *id = calloc(bound, sizeof *id);
-    int ok = 0;
-    if (!id) return 0;
-    for (uint64_t i = 5; i < words;) {
-        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
-        if (!n || n > words - i) goto done;
-        const uint32_t *a = w + i + 1;
-        if (op == 17) {
-            if (n != 2) goto done;
-            if (a[0] >= 61 && a[0] <= 68) declared |= 1u << (a[0] - 61);
-            else if (a[0] == 58 || a[0] == 4423 || a[0] == 4431 || a[0] == 5297 ||
-                     (a[0] >= 5568 && a[0] <= 5570) || a[0] == 5579 ||
-                     (a[0] >= 5696 && a[0] <= 5698)) goto done;
-        } else if (op == 10) {
-            if (!geometry_subgroup_extension(a, n - 1)) goto done;
-        } else if (op == 21 && n == 4 && a[0] < bound) {
-            id[a[0]].op = op; id[a[0]].x = a[1]; id[a[0]].y = a[2];
-        } else if (op == 43 && n == 4 && a[1] < bound) {
-            id[a[1]].op = op; id[a[1]].type = a[0]; id[a[1]].x = a[2];
-        } else if (op >= 333 && op <= 366) {
-            if (n < 5 || op == 333 || op > 348 || !a[2] || a[2] >= bound) goto done;
-            uint32_t expected = (op <= 336 || op == 338 || op == 339 || op == 340 || op == 343 || op == 344) ? 5 : 6;
-            if (n != expected) goto done;
-            const GeometryId *scope = &id[a[2]];
-            if (scope->op != 43 || scope->x != 3 || !scope->type || scope->type >= bound ||
-                id[scope->type].op != 21 || id[scope->type].x != 32 || id[scope->type].y) goto done;
-            operations |= op <= 336 ? VK_SUBGROUP_FEATURE_VOTE_BIT :
-                op <= 344 ? VK_SUBGROUP_FEATURE_BALLOT_BIT : op <= 346 ? VK_SUBGROUP_FEATURE_SHUFFLE_BIT :
-                VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;
-        } else if ((op >= 259 && op <= 271) || op == 5296 || op == 224 ||
-                   (op >= 4421 && op <= 4422) || (op >= 4428 && op <= 4430) || op == 4432 ||
-                   (op >= 5000 && op <= 5007) || (op >= 5571 && op <= 5578) ||
-                   (op >= 5580 && op <= 5581) || (op >= 5713 && op <= 5816)) goto done;
-        i += n;
-    }
-    // The specialized GroupNonUniform capabilities imply GroupNonUniform;
-    // Ryujinx does not repeat that base declaration in generated modules.
-    if (declared) declared |= VK_SUBGROUP_FEATURE_BASIC_BIT;
-    uint32_t required = (system_inputs & 1 ? VK_SUBGROUP_FEATURE_BASIC_BIT : 0) |
-                        (system_inputs & 2 ? VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT : 0);
-    if ((required | operations) & ~declared) goto done;
-    // The selected system-input subset also requires reported GS support.
-    // This is a conservative admission policy, not a claim that a builtin load
-    // itself is a group operation covered by VUID 06343.
-    if ((declared & ~P.subgroup_operations) ||
-        ((system_inputs || operations) && !(P.subgroup_stages & VK_SHADER_STAGE_GEOMETRY_BIT))) goto done;
-    ok = 1;
-done:
-    free(id);
-    return ok;
-}
-
-static int geometry_numeric(const GeometryId *id, uint32_t bound, uint32_t type, int array,
-                            uint32_t *components, uint64_t *signature, GfxShaderIo *io) {
-    if (!type || type >= bound) return 0;
-    const GeometryId *t = &id[type];
-    if (array && t->op == 28) {
-        if (!t->y || t->y >= bound || id[t->y].op != 43 || !id[t->y].type || id[t->y].type >= bound ||
-            id[id[t->y].type].op != 21 || id[id[t->y].type].x != 32 || !id[t->y].x || id[t->y].x > 4096) return 0;
-        uint32_t count;
-        uint64_t element;
-        GfxShaderIo ignored;
-        if (!geometry_numeric(id, bound, t->x, 0, &count, &element, &ignored)) return 0;
-        *components = count * id[t->y].x;
-        *signature = element | (uint64_t)id[t->y].x << 32 | UINT64_C(1) << 63;
-        return 1;
-    }
-    uint32_t count = 1;
-    if (t->op == 23) {
-        count = t->y;
-        if (count < 2 || count > 4 || !t->x || t->x >= bound) return 0;
-        t = &id[t->x];
-    }
-    if (t->op == 21 && t->y > 1) return 0;
-    uint32_t kind = t->op == 22 ? 1 : t->op == 21 ? (t->y ? 2 : 3) : t->op == 20 ? 4 : 0;
-    if (!kind || (kind != 4 && t->x != 32) || (kind == 4 && count != 1)) return 0;
-    *components = count;
-    *signature = kind | (uint64_t)(kind == 4 ? 1 : 32) << 8 | (uint64_t)count << 16;
-    *io = (GfxShaderIo){(uint8_t)(kind - 1), (uint8_t)count, 0, (uint8_t)(kind == 4 ? 1 : 32)};
-    return 1;
-}
-
-static int geometry_member(const uint32_t *w, uint64_t words, uint32_t type, uint32_t member,
-                           uint32_t *builtin, uint32_t *invariant) {
-    int found = 0;
-    *invariant = 0;
-    for (uint64_t i = 5; i < words;) {
-        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
-        if (!n || n > words - i) return 0;
-        if (op == 72 && n >= 4 && w[i + 1] == type && w[i + 2] == member) {
-            if (w[i + 3] == 11) {
-                if (n != 5 || found++ || w[i + 4] >= 64) return 0;
-                *builtin = w[i + 4];
-            } else if (w[i + 3] == 18 && n == 4) *invariant = 1;
-            else if (w[i + 3] != 0 || n != 4) return 0;
-        }
-        i += n;
-    }
-    return found == 1;
-}
-
-static int geometry_interface(const GfxShader *s, uint32_t storage, uint32_t vertices, GeometryInterface *out) {
-    memset(out, 0, sizeof *out);
-    uint64_t words = 0, fixed_words = 0;
-    const uint32_t *w = gfx_shader_spirv(s, &words);
-    if (!w || words < 5 || words > (1u << 20) || !w[3] || w[3] > (1u << 16)) return 0;
-    int stage = gfx_shader_stage(s);
-    uint32_t *fixed = spirv_fixup_linked(w, words, &fixed_words, stage == GFX_STAGE_VS, clip_cull_limit());
-    if (fixed) w = fixed, words = fixed_words;
-    uint32_t bound = w[3], entries = 0;
-    GeometryId *id = calloc(bound, sizeof *id);
-    int ok = 0;
-    if (!id) goto done;
-    for (uint64_t i = 5; i < words;) {
-        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
-        if (!n || n > words - i) goto done;
-        const uint32_t *a = w + i + 1;
-        if (op == 15) {
-            if (n < 4 || entries++ || a[0] != (stage == GFX_STAGE_VS ? 0u : stage == GFX_STAGE_GS ? 3u : 4u)) goto done;
-            const char *name = (const char *)(a + 2), *end = memchr(name, 0, (n - 3) * 4);
-            if (!end || end - name != 4 || memcmp(name, "main", 4)) goto done;
-            uint32_t start = 2 + ((uint32_t)(end - name) + 4) / 4;
-            for (uint32_t j = start; j < n - 1; j++) {
-                if (!a[j] || a[j] >= bound || id[a[j]].listed) goto done;
-                id[a[j]].listed = 1;
-            }
-        } else if (op == 17 && n == 2) {
-            if ((a[0] == 24 && !P.f_gs_point_size) || (a[0] == 32 && !P.f_clip) || (a[0] == 33 && !P.f_cull) ||
-                a[0] == 53 || a[0] == 54) goto done;       // transform feedback / geometry streams not supported here
-        } else if (op == 220 || op == 221) goto done;    // stream emission needs a different contract
-        else if (op == 73 || op == 74 || op == 75 || op == 332) goto done; // indirect decorations are not modeled
-        else if (op == 71 && n >= 3 && a[0] < bound) {
-            GeometryId *d = &id[a[0]];
-            if (a[1] == 30) { if (n != 4 || a[2] >= 32 || d->location) goto done; d->location = a[2] + 1; }
-            else if (a[1] == 11) { if (n != 4 || (a[2] >= 64 && a[2] != 4420) || d->builtin) goto done; d->builtin = a[2] + 1; }
-            else if (a[1] == 31) d->component = 1;
-            else if (a[1] == 2) d->block = 1;
-            else if (a[1] == 14) d->flat = d->interpolation = 1;
-            else if (a[1] == 13 || a[1] == 16 || a[1] == 17) d->interpolation = 1;
-            else if (a[1] == 18) d->invariant = 1;
-            else if (a[1] == 15 || a[1] == 5271 || a[1] == 5285) goto done;
-            else if (a[1] != 0) d->unsupported = 1;
-        } else if ((op == 20 || op == 21 || op == 22 || op == 23 || op == 28 || op == 30 || op == 32) && n >= 2 && a[0] < bound) {
-            GeometryId *t = &id[a[0]];
-            t->op = op;
-            if (op == 30) t->x = (uint32_t)i + 2, t->y = n - 2;
-            else if (op == 32) { if (n != 4) goto done; t->x = a[2]; t->y = a[1]; }
-            else { if (n >= 3) t->x = a[1]; if (n >= 4) t->y = a[2]; }
-        } else if (op == 43 && n == 4 && a[1] < bound) id[a[1]].op = op, id[a[1]].x = a[2], id[a[1]].type = a[0];
-        else if (op == 59 && n >= 4 && a[1] < bound) id[a[1]].type = a[0], id[a[1]].storage = a[2];
-        i += n;
-    }
-    if (entries != 1) goto done;
-    for (uint32_t v = 1; v < bound; v++) {
-        GeometryId *var = &id[v];
-        if (!var->listed) continue;
-        if (!var->type || var->type >= bound || id[var->type].op != 32 || id[var->type].y != var->storage) goto done;
-        if (var->storage != storage) continue;
-        uint32_t type = id[var->type].x;
-        if (!type || type >= bound || var->component || var->unsupported ||
-            (var->builtin && var->interpolation)) goto done;
-        if (var->builtin == 42 || var->builtin == 4421) {
-            if (stage != GFX_STAGE_GS || storage != 1 ||
-                !geometry_system_input(id, bound, var, type, &out->system_inputs)) goto done;
-            continue;
-        }
-        if (stage == GFX_STAGE_GS && storage == 1 && id[type].op == 28) {
-            uint32_t length = id[type].y;
-            if (!length || length >= bound || id[length].op != 43 || id[length].x != vertices ||
-                !id[length].type || id[length].type >= bound || id[id[length].type].op != 21 ||
-                id[id[length].type].x != 32) goto done;
-            type = id[type].x;
-            if (!type || type >= bound) goto done;
-        } else if (stage == GFX_STAGE_GS && storage == 1 && var->builtin != 8 && var->builtin != 9) goto done;
-        if (id[type].op == 30) {
-            if (!id[type].block || id[type].unsupported || id[type].invariant || id[type].interpolation ||
-                var->interpolation || var->location || var->builtin ||
-                !id[type].y || id[type].y > 16 || out->block_members) goto done;
-            out->block_members = (uint8_t)id[type].y;
-            out->block_invariant = var->invariant;
-            for (uint32_t member = 0; member < id[type].y; member++) {
-                uint32_t builtin = 0, invariant = 0, components;
-                uint64_t signature;
-                GfxShaderIo ignored;
-                if (!geometry_member(w, words, type, member, &builtin, &invariant) ||
-                    !geometry_numeric(id, bound, w[id[type].x + member], 1, &components, &signature, &ignored) ||
-                    (out->builtin_mask & (UINT64_C(1) << builtin))) goto done;
-                out->builtin_mask |= UINT64_C(1) << builtin;
-                out->block_builtin[member] = (uint8_t)builtin;
-                out->builtin[builtin] = signature | (uint64_t)invariant << 62;
-                out->components += components;
-            }
-        } else {
-            uint32_t components;
-            uint64_t signature;
-            GfxShaderIo io;
-            if (!geometry_numeric(id, bound, type, var->builtin != 0, &components, &signature, &io)) goto done;
-            if (var->location && !var->builtin) {
-                uint32_t location = var->location - 1;
-                if (io.scalar_bits != 32 || io.type > GFX_TYPE_UINT || (out->mask >> location & 1) ||
-                    (stage == GFX_STAGE_FS && io.type != GFX_TYPE_FLOAT && !var->flat)) goto done;
-                out->mask |= 1u << location;
-                out->io[location] = io;
-                out->invariant[location] = var->invariant;
-            } else if (var->builtin && !var->location) {
-                uint32_t builtin = var->builtin - 1;
-                if (out->builtin_mask & (UINT64_C(1) << builtin)) goto done;
-                out->builtin_mask |= UINT64_C(1) << builtin;
-                out->standalone_builtins |= UINT64_C(1) << builtin;
-                out->builtin[builtin] = signature | (uint64_t)var->invariant << 62;
-            } else goto done;
-            out->components += components;
-        }
-    }
-    GfxShaderIo reflected[32];
-    uint32_t mask = storage == 1 ? gfx_shader_inputs(s, reflected) : gfx_shader_outputs(s, reflected);
-    if (mask != out->mask) goto done;
-    for (unsigned i = 0; i < 32; i++) if (mask >> i & 1)
-        if (reflected[i].packed || reflected[i].scalar_bits != 32 || reflected[i].type != out->io[i].type ||
-            reflected[i].comps != out->io[i].comps) goto done;
-    ok = 1;
-done:
-    free(id), free(fixed);
-    return ok;
-}
-
-static int geometry_link(const GeometryInterface *producer, const GeometryInterface *consumer) {
-    if (consumer->mask & ~producer->mask) return 0;
-    for (unsigned i = 0; i < 32; i++) if (consumer->mask >> i & 1)
-        if (memcmp(&producer->io[i], &consumer->io[i], sizeof producer->io[i]) ||
-            producer->invariant[i] != consumer->invariant[i]) return 0;
-    return 1;
-}
-
-static int geometry_locations(uint32_t mask, uint32_t limit) {
-    for (unsigned i = 0; i < 32; i++) if ((mask >> i & 1) && i >= limit / 4) return 0;
-    return 1;
-}
-
-static int geometry_builtin_link(const GeometryInterface *producer, const GeometryInterface *consumer) {
-    // Built-in blocks match as structures, not as an unordered subset of their
-    // BuiltIn IDs (VUID-RuntimeSpirv-OpVariable-08746). GS outer vertex arrays have
-    // already been removed by geometry_interface. Unsupported blocks fail there.
-    if (consumer->block_members) {
-        if (producer->block_members != consumer->block_members ||
-            producer->block_invariant != consumer->block_invariant) return 0;
-        for (unsigned i = 0; i < consumer->block_members; i++) {
-            unsigned builtin = consumer->block_builtin[i];
-            if (producer->block_builtin[i] != builtin || producer->builtin[builtin] != consumer->builtin[builtin]) return 0;
-        }
-    }
-    const uint64_t per_vertex = UINT64_C(1) | UINT64_C(1) << 1 | UINT64_C(1) << 3 | UINT64_C(1) << 4;
-    return !(consumer->standalone_builtins & per_vertex & ~producer->standalone_builtins);
-}
-
-static int geometry_per_vertex(const GeometryInterface *io, const VkPhysicalDeviceLimits *limits) {
-    uint32_t distances = 0;
-    const uint64_t scalar = 1 | UINT64_C(32) << 8 | UINT64_C(1) << 16;
-    for (unsigned i = 0; i < 5; i++) if (io->builtin_mask >> i & 1) {
-        uint64_t signature = io->builtin[i] & ~(UINT64_C(1) << 62); // Invariant does not change the type
-        if (i == 0) { if (signature != (1 | UINT64_C(32) << 8 | UINT64_C(4) << 16)) return 0; }
-        else if (i == 1) { if (signature != scalar) return 0; }
-        else if (i == 3 || i == 4) {
-            uint32_t n = (uint32_t)(signature >> 32) & 0x3fffffff;
-            if (!(signature >> 63) || (uint32_t)signature != scalar || !n ||
-                n > (i == 3 ? limits->maxClipDistances : limits->maxCullDistances)) return 0;
-            distances += n;
-        } else return 0;
-    }
-    return distances <= limits->maxCombinedClipAndCullDistances;
-}
-
-static const char *geometry_validate(const VkPipeState *s, const VkPhysicalDeviceLimits *limits) {
-    static const uint8_t input_vertices[] = {0, 1, 2, 4, 3, 6};
-    if (!s->vs || !s->gs || gfx_shader_stage(s->vs) != GFX_STAGE_VS ||
-        (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) return "geometry shader stage mismatch";
-    const GfxShaderGeometry *g = gfx_shader_geometry(s->gs);
-    if (!P.f_geometry) return "device has no geometryShader";
-    if (!g ||
-        (g->version != GFX_GEOMETRY_VERSION && g->version != GFX_GEOMETRY_PASSTHROUGH_VERSION) || g->passthrough ||
-        !vk_geometry_input(s->prim) || vk_geometry_input(s->prim) != g->input ||
-        g->input_vertices != input_vertices[g->input] || g->output < GFX_GEOMETRY_OUTPUT_POINTS ||
-        g->output > GFX_GEOMETRY_OUTPUT_TRIANGLE_STRIP) return "geometry input/stage contract differs from draw";
-    if (g->version == GFX_GEOMETRY_PASSTHROUGH_VERSION &&
-        (!s->fs || g->input != GFX_GEOMETRY_TRIANGLES || g->output != GFX_GEOMETRY_OUTPUT_TRIANGLE_STRIP ||
-         g->invocations != 1 || g->max_output_vertices != 3)) return "unsupported portable geometry contract";
-    // VUID-VkGraphicsPipelineCreateInfo-shaderTessellationAndGeometryPointSize-08776
-    // requires PointSize on every emitted point. A declaration is not proof of
-    // those writes. Polygon-mode points can also consume last-stage PointSize
-    // depending on polygonModePointSize; that property is not contracted here.
-    if (g->output == GFX_GEOMETRY_OUTPUT_POINTS || s->poly.mode == NVN_POLYGON_MODE_POINT)
-        return "geometry point-size emission/rasterization is not implemented";
-    if (!g->invocations || g->invocations > limits->maxGeometryShaderInvocations || !g->max_output_vertices ||
-        g->max_output_vertices > limits->maxGeometryOutputVertices) return "geometry invocation/output-vertex device limit";
-    const GfxShader *shaders[] = {s->vs, s->gs};
-    for (unsigned j = 0; j < 2; j++) for (int kind = GFX_RES_SSBO; kind < GFX_RES_KINDS; kind++) {
-        const GfxShaderRes *res;
-        int count = gfx_shader_resources(shaders[j], kind, &res);
-        for (int i = 0; i < count; i++)
-            if (!P.f_vertex_stores && ((kind == GFX_RES_SSBO && (res[i].flags & 1)) ||
-                                      (kind == GFX_RES_IMG && (res[i].flags & 4)))) return "pre-raster stores require vertexPipelineStoresAndAtomics";
-    }
-    GeometryInterface vo, gi, go, fi;
-    if (!geometry_interface(s->vs, 3, 0, &vo)) return "unsupported vertex output interface or missing scalar-width metadata";
-    if (!geometry_interface(s->gs, 1, g->input_vertices, &gi)) return "unsupported geometry input interface or missing scalar-width metadata";
-    if (!geometry_interface(s->gs, 3, 0, &go)) return "unsupported geometry output interface or missing scalar-width metadata";
-    if (!geometry_subgroups(s->gs, gi.system_inputs)) return "unsupported geometry subgroup capability, operation or stage";
-    uint64_t per_vertex = UINT64_C(1) | UINT64_C(1) << 1 | UINT64_C(1) << 3 | UINT64_C(1) << 4;
-    uint64_t generated = (UINT64_C(1) << 7) | (UINT64_C(1) << 8); // PrimitiveId / InvocationId are not VS outputs
-    if ((gi.builtin_mask & ~(per_vertex | generated)) || (go.builtin_mask & ~per_vertex))
-        return "geometry built-in outside the supported per-vertex subset";
-    const uint64_t scalar_int = 2 | UINT64_C(32) << 8 | UINT64_C(1) << 16;
-    for (unsigned i = 7; i <= 8; i++)
-        if ((gi.builtin_mask >> i & 1) && gi.builtin[i] != scalar_int) return "geometry invocation/primitive ID type mismatch";
-    if (!geometry_per_vertex(&vo, limits) || !geometry_per_vertex(&gi, limits) || !geometry_per_vertex(&go, limits))
-        return "geometry per-vertex built-in type/device limit";
-    uint64_t distance_components = 0;
-    for (unsigned i = 3; i <= 4; i++) {
-        if (gi.builtin_mask >> i & 1) distance_components += gi.builtin[i] >> 32 & 0x3fffffff;
-        if (go.builtin_mask >> i & 1) distance_components += go.builtin[i] >> 32 & 0x3fffffff;
-    }
-    if (distance_components > limits->maxCombinedClipAndCullDistances)
-        return "geometry combined input/output distance device limit";
-    if (!geometry_link(&vo, &gi)) return "vertex-to-geometry varying mismatch";
-    if (!geometry_builtin_link(&vo, &gi)) return "vertex-to-geometry built-in block mismatch";
-    uint64_t need = gi.builtin_mask & ~generated;
-    if ((need & ~vo.builtin_mask) || !(go.builtin_mask & 1)) return "geometry per-vertex built-in mismatch";
-    for (unsigned i = 0; i < 64; i++) if ((need >> i & 1) && gi.builtin[i] != vo.builtin[i]) return "geometry built-in type mismatch";
-    if (gi.components > limits->maxGeometryInputComponents || go.components > limits->maxGeometryOutputComponents ||
-        (uint64_t)go.components * g->max_output_vertices > limits->maxGeometryTotalOutputComponents ||
-        vo.components > limits->maxVertexOutputComponents || !geometry_locations(gi.mask, limits->maxGeometryInputComponents) ||
-        !geometry_locations(go.mask, limits->maxGeometryOutputComponents) || !geometry_locations(vo.mask, limits->maxVertexOutputComponents))
-        return "geometry interface component device limit";
-    if (s->fs) {
-        if (!geometry_interface(s->fs, 1, 0, &fi)) return "unsupported fragment input interface or missing scalar-width metadata";
-        // VUID-VkGraphicsPipelineCreateInfo-pStages-00740 requires the GS to
-        // write PrimitiveId on every path when FS reads it. This subset admits
-        // no such GS output and must not inherit the rasterizer-generated ID.
-        if (fi.builtin_mask & (UINT64_C(1) << 7)) return "geometry-to-fragment PrimitiveId output is not implemented";
-        if (!geometry_link(&go, &fi)) return "geometry-to-fragment varying mismatch";
-        if (fi.components > limits->maxFragmentInputComponents || !geometry_locations(fi.mask, limits->maxFragmentInputComponents))
-            return "fragment input component device limit";
-    }
-    return NULL;
 }
 
 // ---- descriptor layouts
@@ -1194,15 +963,9 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
 }
 
 static VkShaderStageFlags stage_bit(int stage) {
-    switch (stage) {
-    case GFX_STAGE_VS: return VK_SHADER_STAGE_VERTEX_BIT;
-    case GFX_STAGE_TCS: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
-    case GFX_STAGE_TES: return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-    case GFX_STAGE_GS: return VK_SHADER_STAGE_GEOMETRY_BIT;
-    case GFX_STAGE_FS: return VK_SHADER_STAGE_FRAGMENT_BIT;
-    case GFX_STAGE_CS: return VK_SHADER_STAGE_COMPUTE_BIT;
-    default: return 0;
-    }
+    return stage == GFX_STAGE_VS ? VK_SHADER_STAGE_VERTEX_BIT : stage == GFX_STAGE_FS ? VK_SHADER_STAGE_FRAGMENT_BIT
+         : stage == GFX_STAGE_GS ? VK_SHADER_STAGE_GEOMETRY_BIT : stage == GFX_STAGE_TCS ? VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT
+         : stage == GFX_STAGE_TES ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
 }
 
 // One past the highest binding a shader uses (1 with no resources: binding 0 is the support buffer).
@@ -1221,7 +984,6 @@ static uint32_t binding_span(const GfxShader *s) {
 static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
     int stage = gfx_shader_stage(s);
     VkShaderStageFlags bit = stage_bit(stage);
-    if (!bit) return 0;
     if (!B->n) {
         B->b[0] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL};
         B->pb[0] = (VkPipeBinding){0, (uint8_t)stage, VK_PIPE_SUPPORT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL};
@@ -1236,7 +998,6 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
             if (B->n == MAX_BINDINGS || !r[i].binding) return 0;
             VkDescriptorType t = descriptor_type(k, &r[i]);
             uint32_t binding = r[i].binding + off, count = r[i].count ? r[i].count : 1;
-            if (binding > UINT16_MAX) return 0;           // VkPipeBinding must not truncate a stage's binding
             B->b[B->n] = (VkDescriptorSetLayoutBinding){binding, t, count, bit, NULL};
             B->pb[B->n] = (VkPipeBinding){(uint16_t)binding, (uint8_t)stage, (uint8_t)k, t, (uint16_t)count, bit, &r[i]};
             B->n++;
@@ -1263,37 +1024,11 @@ static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayou
     return -1;
 }
 
-// The stages a pipeline has between vertex and fragment, in pipeline order: tessellation control and evaluation,
-// geometry. Each one's bindings (>= 1) follow the previous stage's in the pipeline's one shared set: off[i] is what
-// stage i's bindings are moved by; *fs_off, when not NULL, what the fragment stage's are. Returns how many.
-static int mid_stages(const VkPipeState *s, const GfxShader *mid[3], uint32_t off[3], uint32_t *fs_off) {
-    int n = 0;
-    uint32_t at = binding_span(s->vs) - 1;
-    const GfxShader *order[3] = {s->tcs, s->tes, s->gs};
-    for (int i = 0; i < 3; i++) {
-        if (!order[i]) continue;
-        mid[n] = order[i], off[n] = at, n++;
-        at += binding_span(order[i]) - 1;
-    }
-    if (fs_off) *fs_off = at;
-    return n;
-}
-
-// Checks every stage against its layout; 0 with why filled for a missing binding.
+// Checks both stages of a graphics pipeline against its layout; 0 with why filled when one uses a missing binding.
 static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off, char *why, size_t cap) {
     uint32_t nv = l->set1 ? l->n0 : l->n;
     int m = module_binding_missing(s->vs, l->b, nv, 0);
     const char *stage = "vertex";
-    if (m < 0 && (s->gs || s->tcs)) {
-        if (l->set1) { snprintf(why, cap, "geometry/tessellation requires a monolithic layout"); return 0; }
-        const GfxShader *mid[3];
-        uint32_t moff[3];
-        int nmid = mid_stages(s, mid, moff, NULL);
-        for (int i = 0; i < nmid && m < 0; i++) {
-            m = module_binding_missing(mid[i], l->b, l->n, moff[i]);
-            stage = mid[i] == s->tcs ? "tess control" : mid[i] == s->tes ? "tess eval" : "geometry";
-        }
-    }
     if (m < 0 && s->fs) {
         m = l->set1 ? module_binding_missing(s->fs, l->b + l->n0, l->n - l->n0, 0) : module_binding_missing(s->fs, l->b, l->n, fs_off);
         stage = "fragment";
@@ -1351,30 +1086,6 @@ static int64_t bindings_sort(Bindings *B, uint64_t *h) {
     return total;
 }
 
-// Whether a set of n bindings holding total descriptors may be a push-descriptor set: it fits maxPushDescriptors and
-// no stage samples through more samplers than maxPerStageDescriptorSamplers. MoltenVK binds a push set slot by slot,
-// and Metal has 16 sampler slots per stage ([[sampler(0..15)]]): a Bananza G-buffer fragment shader with more failed
-// to compile and its draws were skipped. An ordinary set goes through Metal argument buffers there, which have no such
-// slots. Other drivers report thousands of samplers per stage, so their sets stay as they were.
-static int push_fits(const VkDescriptorSetLayoutBinding *b, uint32_t n, int64_t total) {
-    if (total > (int64_t)P.max_push) return 0;
-    static const VkShaderStageFlags st[] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
-                                            VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
-    for (unsigned s = 0; s < sizeof st / sizeof *st; s++) {
-        uint64_t k = 0;
-        for (uint32_t i = 0; i < n; i++)
-            if ((b[i].stageFlags & st[s]) && (b[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
-                                              b[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER))
-                k += b[i].descriptorCount;
-        if (k > P.max_stage_samplers) {
-            LOG_ONCE("vk_pipeline: a stage samples through more than %u samplers: its bindings go in an ordinary "
-                     "descriptor set instead of a push set (logged once)", P.max_stage_samplers);
-            return 0;
-        }
-    }
-    return 1;
-}
-
 static Layout *layout_get(Bindings *B) {
     uint64_t h = FNV0;
     int64_t total = bindings_sort(B, &h);
@@ -1386,7 +1097,7 @@ static Layout *layout_get(Bindings *B) {
     if (!l) return NULL;
     l->hash = h, l->n = B->n;
     memcpy(l->b, B->b, B->n * sizeof *B->b);
-    l->push = push_fits(l->b, l->n, total);
+    l->push = total <= (int64_t)P.max_push;
     VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
                                           .bindingCount = l->n, .pBindings = l->b};
@@ -1414,22 +1125,6 @@ static Layout *layout_get(Bindings *B) {
 // VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT so stage libraries can use it. Only the P.push_stage set is a
 // push-descriptor set (a layout holds one), when it fits maxPushDescriptors; the other is allocated per draw from the
 // command buffer's pools. On success *B holds both lists, set 0 first, VkPipeBinding.set filled in. Caller holds P.lock.
-// TOTK_DYN_UBO: the uniform buffers of an allocated (not pushed) fragment set, b[i0..i1), become
-// UNIFORM_BUFFER_DYNAMIC, in binding order while the total stays within P.dyn_ubo. Bananza's fragment sets differ
-// from draw to draw almost only in one uniform buffer's offset (95% of set rewrites in a dense area, measured):
-// with the offset passed to vkCmdBindDescriptorSets, consecutive draws reuse one written set instead of allocating
-// and writing a new one each (vk_exec_draw.c bind_resources). Push sets cannot hold dynamic descriptors.
-static void dyn_ubo_convert(Bindings *B, uint32_t i0, uint32_t i1) {
-    uint32_t used = 0;
-    for (uint32_t i = i0; i < i1 && P.dyn_ubo; i++) {
-        if (B->b[i].descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) continue;
-        if (used + B->b[i].descriptorCount > P.dyn_ubo) break;
-        used += B->b[i].descriptorCount;
-        B->b[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-        B->pb[i].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    }
-}
-
 static Layout *layout_pair(Bindings *B, Bindings *F) {
     uint64_t h = fnv(FNV0, "indep", 5);
     int64_t tv = bindings_sort(B, &h);
@@ -1442,19 +1137,14 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
     for (uint32_t i = n0; i < n; i++) B->pb[i].set = 1;
     B->n = n;
     Layout **head = &layouts[h % LAYOUT_BUCKETS];
-    // The push choice depends on each set's own bindings only, and so does the dynamic conversion below: the halves
-    // GPL libraries are built with (B or F empty) get set layouts identical to the full pipeline's.
-    int push0 = P.push_stage == GFX_STAGE_VS && push_fits(B->b, n0, tv);
-    int push1 = P.push_stage == GFX_STAGE_FS && F->n && push_fits(B->b + n0, n - n0, tf);
-    if (!push1) dyn_ubo_convert(B, n0, n);
     for (Layout *l = *head; l; l = l->next)
         if (l->hash == h && l->set1 && l->n == n && l->n0 == n0 && !memcmp(l->b, B->b, n * sizeof *B->b)) return l;
     Layout *l = calloc(1, sizeof *l + n * sizeof *B->b);
     if (!l) return NULL;
     l->hash = h, l->n = n, l->n0 = n0;
     memcpy(l->b, B->b, n * sizeof *B->b);
-    l->push = push0;
-    l->push1 = push1;
+    l->push = P.push_stage == GFX_STAGE_VS && tv <= (int64_t)P.max_push;
+    l->push1 = P.push_stage == GFX_STAGE_FS && F->n && tf <= (int64_t)P.max_push;
     VkDescriptorSetLayoutCreateInfo s0 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
                                           .bindingCount = n0, .pBindings = l->b};
@@ -1491,7 +1181,7 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
 
 // Vertex outputs with independent layouts: each vertex shader declares the union of the inputs of every fragment
 // shader met with it (pipeline-keys.bin at the prewarm, then each pipeline built), so its module does not depend on the
-// fragment shader of one pipeline. Unwritten ones read (0, 0, 0, 1) as before. TOTK_VS_OUTS=all declares all 32.
+// fragment shader of one pipeline. Unwritten ones read (0, 0, 0, 1) as before. MTF_VS_OUTS=all declares all 32.
 #define VS_OUTS_CAP 8192
 static struct {
     PlatMutex lock;
@@ -1569,16 +1259,15 @@ typedef struct {                       // normalized: zero where the state is dy
     uint32_t color[8], depth, stencil; // VkFormat
     uint8_t n_color, samples, topo_class, minus_w;
     uint8_t clamp, poly_mode, a2c, logic_op;   // logic_op: VkLogicOp + 1 when enabled
-    uint8_t blend_en, dsb, fbl, alpha;  // dsb: an enabled target blends with a SRC1 factor; fbl: VkPipeState.feedback;
-                                       // alpha: NVN_ALPHA_FUNC_* of an alpha test (spirv_alpha_test), else 0
+    uint8_t blend_en, dsb, fbl, patch;  // dsb: an enabled target blends with a SRC1 factor; fbl: VkPipeState.feedback;
+                                        // patch: control points with tessellation stages
     uint32_t wmask;
     uint8_t blend[8][6];               // src, dst, op, src alpha, dst alpha, alpha op (VkBlendFactor / VkBlendOp)
     uint32_t attr_fmt[32], attr_off[32];
     uint8_t attr_bind[32];
     uint8_t rate[17];                  // per binding: 0 unused, 1 vertex, 2 instance
     uint8_t indep;                     // P.indep when built: the probe draws through both layouts
-    uint8_t geometry_input, patch;
-    float alpha_ref;                   // 0 without an alpha test
+    uint8_t pad2[2];
 } GKey;
 
 static int blendable(VkFormat f) {
@@ -1596,7 +1285,7 @@ static int target_count(const VkPipeState *s) {
 // fragment module whose output 1 is Location 0, Index 1 (spirv_dual_source).
 static int is_src1(unsigned f) { return f >= NVN_BLEND_FUNC_SRC1_COLOR && f <= NVN_BLEND_FUNC_ONE_MINUS_SRC1_ALPHA; }
 // Runs per draw (gkey_fill, target_wmask): only the blend factors of blend-enabled targets are read until one is SRC1,
-// which TotK never sets (0 of 876 pipelines in the field and fight saves).
+// which games rarely set.
 static int uses_src1(const VkPipeState *s) {
     for (uint32_t m = s->color.blend_en & 0xffu; m; m &= m - 1) {
         int i = __builtin_ctz(m);
@@ -1609,9 +1298,8 @@ static int uses_src1(const VkPipeState *s) {
 }
 
 // Colour write mask of target i: NVN's channel mask, zero for a target outside the fragment shader's output map (SPH
-// omap). Maxwell leaves such a target untouched (nxnative 04-graphics.md, "Targets the fragment shader does not
-// write"); Vulkan writes undefined values, and on AMD they lit grass in front of Link as flat lime. Zeros are wrong
-// too: TOTK's half-res transparency pass binds its linear depth (R32F) as target 7, samples it in the same draws and
+// omap). Maxwell leaves such a target untouched; Vulkan writes undefined values, and on AMD they lit grass as flat lime. Zeros are wrong
+// too: a half-res transparency pass may bind its linear depth (R32F) as target 7, samples it in the same draws and
 // writes only targets 0-2, 4 and 5; zeroed, the depth that later passes rebuild from it was 0 in tiles, and the fog
 // over distant geometry showed rectangles of clear sky.
 static uint32_t target_wmask(const VkPipeState *s, int i) {
@@ -1623,21 +1311,11 @@ static uint32_t target_wmask(const VkPipeState *s, int i) {
 
 uint32_t vk_pipeline_target_wmask(const VkPipeState *s, int i) { return target_wmask(s, i); }
 
-// The alpha test reference as the pipeline key holds it: rounded to the nearest 1/255 inside (0, 1). Titles that fade
-// with the alpha test move the reference by less than one 8-bit step per frame, and an exact float built a pipeline
-// for every frame of the fade. The threshold moves by at most half a step. Values outside (0, 1) and NaN stay as they
-// are. After Djihads80/Eglantine#544, as ported in zortos293/Lichii ec3a455.
-static float alpha_ref_step(float ref) {
-    if (!(ref > 0.0f && ref < 1.0f)) return ref;
-    return (float)(int)(ref * 255.0f + 0.5f) / 255.0f;
-}
-
 static void gkey_fill(const VkPipeState *s, GKey *k) {
     memset(k, 0, sizeof *k);
     k->vs = s->vs, k->fs = s->fs, k->gs = s->gs, k->tcs = s->tcs, k->tes = s->tes;
     k->patch = s->tcs ? s->patch_size : 0;
-    k->indep = (s->gs || s->tcs) ? 0 : (uint8_t)P.indep;
-    k->geometry_input = (s->gs && !s->tcs) ? vk_geometry_input(s->prim) : 0;
+    k->indep = (uint8_t)P.indep;
     k->n_color = (uint8_t)target_count(s);
     for (int i = 0; i < k->n_color; i++) k->color[i] = target_format(s->color_fmt[i], NULL, NULL);
     int d, st;
@@ -1649,8 +1327,6 @@ static void gkey_fill(const VkPipeState *s, GKey *k) {
     k->minus_w = s->depth_minus_w != 0;
     k->dsb = s->fs && P.f_dual_src && uses_src1(s);
     k->fbl = s->fs ? s->feedback : 0;
-    if (s->fs && s->color.alpha_func >= NVN_ALPHA_FUNC_NEVER && s->color.alpha_func < NVN_ALPHA_FUNC_ALWAYS)
-        k->alpha = (uint8_t)s->color.alpha_func, k->alpha_ref = alpha_ref_step(s->alpha_ref);
     if (!P.dyn_clamp) k->clamp = s->depth_clamp && P.f_depth_clamp;
     if (!P.dyn_poly) k->poly_mode = (uint8_t)polygon_mode(s->poly.mode);
     if (!P.dyn_a2c) k->a2c = s->ms.a2c != 0;
@@ -1696,42 +1372,34 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     }
     if (P.vs_outs_all)
         for (int i = 0; i < 32; i++)
-            if (!(need >> i & 1)) fin[i] = (GfxShaderIo){GFX_TYPE_FLOAT, 4, 0, 32}, need |= 1u << i;
+            if (!(need >> i & 1)) fin[i] = (GfxShaderIo){GFX_TYPE_FLOAT, 4, 0}, need |= 1u << i;
     for (int i = 0; i < 32; i++)
         if (need >> i & 1 && !(have >> i & 1)) missing |= 1u << i;
     return missing;
 }
 
-static void vattr_int_masks(const VkPipeState *s, uint32_t *uint_mask, uint32_t *sint_mask) {
-    uint32_t u = 0, si = 0;
-    for (int i = 0; i < 16; i++) {
-        va_st a;
-        memcpy(&a, &s->vattr[i], sizeof a);
-        int type = GFX_TYPE_FLOAT;
-        if (a.fmt) vk_vertex_format((int)a.fmt, &type);
-        if (type == GFX_TYPE_UINT) u |= 1u << i;
-        else if (type == GFX_TYPE_SINT) si |= 1u << i;
+// The stages a pipeline has between vertex and fragment, in pipeline order: tessellation control and evaluation,
+// geometry. Each one's bindings (>= 1) follow the previous stage's in the pipeline's one shared set: off[i] is what
+// stage i's bindings are moved by; *fs_off, when not NULL, what the fragment stage's are. Returns how many.
+static int mid_stages(const VkPipeState *s, const GfxShader *mid[3], uint32_t off[3], uint32_t *fs_off) {
+    int n = 0;
+    uint32_t at = binding_span(s->vs) - 1;
+    const GfxShader *order[3] = {s->tcs, s->tes, s->gs};
+    for (int i = 0; i < 3; i++) {
+        if (!order[i]) continue;
+        mid[n] = order[i], off[n] = at, n++;
+        at += binding_span(order[i]) - 1;
     }
-    *uint_mask = u, *sint_mask = si;
+    if (fs_off) *fs_off = at;
+    return n;
 }
 
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
-    if (s->gs && (l->set1 || (!s->tcs && (!k->geometry_input || k->geometry_input > GFX_GEOMETRY_TRIANGLES_ADJACENCY)))) return VK_NULL_HANDLE;
-    if (s->tcs && l->set1) return VK_NULL_HANDLE;
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
     uint32_t *vpatched = NULL, *fpatched = NULL;
-    {
-        uint32_t um, sm;
-        vattr_int_masks(s, &um, &sm);
-        if (um | sm) {
-            uint64_t n2 = 0;
-            uint32_t *r = spirv_rewrite_int_inputs(vcode, vw, um, sm, &n2);
-            if (r) vcode = vpatched = r, vw = n2;
-        }
-    }
-    if (!s->gs && !s->tcs && l->set1) {   // independent layouts: outputs from the vertex shader's union
+    if (l->set1) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
         GfxShaderIo fin[32];
         uint32_t missing = vs_union_missing(s, fin);
         if (missing) {
@@ -1742,33 +1410,25 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         }
     }
     if (s->fs) {
-        if (!s->gs && !s->tcs) {
-            GfxShaderIo fin[32], vout[32];
-            uint32_t need = gfx_shader_inputs(s->fs, fin), have = gfx_shader_outputs(s->vs, vout), missing = 0;
-            for (int i = 0; i < 32; i++) {
-                if (!(need >> i & 1) || fin[i].packed) continue;
-                if (!(have >> i & 1)) missing |= 1u << i;
-                else if (vout[i].type != fin[i].type)
-                    LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
-            }
-            if (missing && !l->set1) {
-                uint64_t n2 = 0;
-                vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
-                if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
-                else vcode = vpatched, vw = n2;
-            }
+        GfxShaderIo fin[32], vout[32];
+        uint32_t need = gfx_shader_inputs(s->fs, fin), have = gfx_shader_outputs(s->vs, vout), missing = 0;
+        for (int i = 0; i < 32; i++) {
+            if (!(need >> i & 1) || fin[i].packed) continue;
+            if (!(have >> i & 1)) missing |= 1u << i;
+            else if (vout[i].type != fin[i].type)
+                LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
+        }
+        if (missing && !l->set1) {
+            uint64_t n2 = 0;
+            vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
+            if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
+            else vcode = vpatched, vw = n2;
         }
         const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw);
-        if (k->alpha && fcode) {   // before spirv_dual_source, which adds a second output at Location 0
-            uint64_t n2 = 0;
-            uint32_t *a = spirv_alpha_test(fcode, fw, k->alpha, k->alpha_ref, &n2);
-            if (a) fcode = fpatched = a, fw = n2;
-            else LOG_ONCE("vk_pipeline: alpha test but the fragment shader has no float vec4 output at location 0");
-        }
         if (k->dsb) {
             uint64_t n2 = 0;
             uint32_t *d = spirv_dual_source(fcode, fw, &n2);
-            if (d) free(fpatched), fcode = fpatched = d, fw = n2;
+            if (d) fcode = fpatched = d, fw = n2;
             else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
         }
         if (l->set1 || fs_off) {
@@ -1777,8 +1437,12 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             fcode = fpatched = r;
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = make_module(s->fs, fcode, fw);
+        if (fcode) fm = make_module(fcode, fw);
     }
+    vm = make_module(vcode, vw);
+    free(vpatched), free(fpatched);
+    // the stages between vertex and fragment (tessellation control, evaluation, geometry): each one's bindings
+    // follow the previous stage's (pipe_miss, mid_stages)
     const GfxShader *mid[3];
     uint32_t moff[3];
     int nmid = mid_stages(s, mid, moff, NULL);
@@ -1787,35 +1451,29 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         uint64_t mw = 0;
         const uint32_t *mcode = gfx_shader_spirv(mid[i], &mw);
         uint32_t *m2 = mcode && moff[i] ? spirv_rebind(mcode, mw, moff[i]) : NULL;
-        if (mcode && (!moff[i] || m2)) mm[i] = make_module(mid[i], m2 ? m2 : mcode, mw);
+        if (mcode) mm[i] = make_module(m2 ? m2 : mcode, mw);
         free(m2);
     }
-    // Only a VS linked to GS uses the GS-chain dead-distance declaration policy.
-    // Plain VS/FS modules retain their original fixup path and uploaded bytes.
-    vm = make_module_linked(s->vs, vcode, vw, s->gs != NULL);
-    free(vpatched), free(fpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (!vm || (s->fs && !fm)) goto out;
     for (int i = 0; i < nmid; i++)
         if (!mm[i]) goto out;
 
-    VkPipelineShaderStageCreateInfo stages[5];
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq[5];
-    const GfxShader *shaders[5] = {s->vs};
-    VkShaderModule modules[5] = {vm};
-    uint32_t nstages = 1;
-    for (int i = 0; i < nmid; i++) shaders[nstages] = mid[i], modules[nstages] = mm[i], nstages++;
-    if (s->fs) shaders[nstages] = s->fs, modules[nstages] = fm, nstages++;
-    uint32_t stage_count = 0;
-    for (uint32_t i = 0; i < nstages; i++) {
-        VkPipelineShaderStageCreateInfo *st = &stages[stage_count];
-        *st = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = stage_bit(gfx_shader_stage(shaders[i])), .module = modules[i], .pName = "main"};
-        uint64_t sw = 0;
-        const uint32_t *scode = gfx_shader_spirv(shaders[i], &sw);
-        pin_subgroup32(st, &rq[stage_count], scode, sw);
-        stage_count++;
-    }
+    VkPipelineShaderStageCreateInfo stages[5] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vm, .pName = "main"}};
+    for (int i = 0; i < nmid; i++)   // vertex, the middle stages in pipeline order, then fragment when there is one
+        stages[1 + i] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                          .stage = stage_bit(gfx_shader_stage(mid[i])),
+                                                          .module = mm[i], .pName = "main"};
+    uint32_t nstages = 1 + (uint32_t)nmid;
+    if (s->fs)
+        stages[nstages++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                              .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fm, .pName = "main"};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf;
+    uint64_t sw;
+    const uint32_t *scode = gfx_shader_spirv(s->vs, &sw);   // vcode may be a patched copy that is freed by now
+    pin_subgroup32(&stages[0], &rqv, scode, sw);
+    if (s->fs) pin_subgroup32(&stages[nstages - 1], &rqf, gfx_shader_spirv(s->fs, &sw), sw);
     VkPipelineTessellationStateCreateInfo ts = {.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
                                                 .patchControlPoints = k->patch ? k->patch : 3};
     VkVertexInputAttributeDescription va[32];
@@ -1834,12 +1492,6 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_PATCH_LIST};
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = class_base[k->topo_class]};
-    if (s->gs && !s->tcs) {
-        static const VkPrimitiveTopology gs_base[] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
-            VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY,
-            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY};
-        ia.topology = gs_base[k->geometry_input];
-    }
     VkPipelineViewportDepthClipControlCreateInfoEXT clip = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
                                                             .negativeOneToOne = k->minus_w};
     VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = &clip};
@@ -1876,14 +1528,13 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                         .pColorAttachmentFormats = (const VkFormat *)k->color,
                                         .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
-                                       .stageCount = stage_count, .pStages = stages, .pVertexInputState = &vi,
+                                       .stageCount = nstages, .pStages = stages, .pVertexInputState = &vi,
                                        .pInputAssemblyState = &ia, .pTessellationState = s->tcs ? &ts : NULL,
                                        .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
                                        .pDynamicState = &dy, .layout = l->layout};
     if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
-    pi.flags |= vk_pipeline_capture_flags();
     uint64_t p0 = perf_begin();
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
@@ -1922,8 +1573,8 @@ typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t 
 static Lib *libs[LIB_BUCKETS];
 
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
-typedef struct { uint32_t kind, missing, uint_attr, sint_attr; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
-typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, alpha; const GfxShader *fs; float alpha_ref; uint32_t pad; } FsKey;
+typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
+typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, pad; const GfxShader *fs; } FsKey;
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, pad[3]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;
 
@@ -1950,8 +1601,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                            .dynamicStateCount = P.n_dyn, .pDynamicStates = P.dyn};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
-                                       .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | vk_pipeline_capture_flags(),
-                                       .pDynamicState = &dy};
+                                       .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR, .pDynamicState = &dy};
     VkShaderModule m = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pName = "main"};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq;
@@ -1997,13 +1647,9 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         uint64_t vw, sw, n2 = 0;
         const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw), *scode = vcode;
         sw = vw;
-        uint32_t *ipat = (pk->uint_attr | pk->sint_attr) ? spirv_rewrite_int_inputs(vcode, vw, pk->uint_attr, pk->sint_attr, &n2) : NULL;
-        if (ipat) vcode = ipat, vw = n2;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
-        m = make_module(s->vs, vcode, vw);
-        free(ipat);
-        if (!m) goto out;
+        if (!(m = make_module(vcode, vw))) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
         pin_subgroup32(&st, &rq, scode, sw);
         pi.stageCount = 1, pi.pStages = &st, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
@@ -2013,18 +1659,14 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             uint64_t fw, sw, n2 = 0;
             const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw), *scode = fcode;
             sw = fw;
-            uint32_t *d = NULL, *at = NULL;
-            if (k->alpha && fcode) {   // before spirv_dual_source, which adds a second output at Location 0
-                if ((at = spirv_alpha_test(fcode, fw, k->alpha, k->alpha_ref, &n2))) fcode = at, fw = n2;
-                else LOG_ONCE("vk_pipeline: alpha test but the fragment shader has no float vec4 output at location 0");
-            }
+            uint32_t *d = NULL;
             if (k->dsb && fcode) {
                 if ((d = spirv_dual_source(fcode, fw, &n2))) fcode = d, fw = n2;
                 else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
-            free(d), free(at);
-            if (!patched || !(m = make_module(s->fs, patched, fw))) goto out;
+            free(d);
+            if (!patched || !(m = make_module(patched, fw))) goto out;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
             pi.stageCount = 1, pi.pStages = &st;
@@ -2091,7 +1733,7 @@ static struct {
     LibJob *head, *tail;
     int idle;                          // workers asleep on work_cv
     int running;                       // jobs workers are building
-    int on;                            // TOTK_PIPE_WAIT: 1 workers (default), 0 the drawing thread builds them (draw);
+    int on;                            // MTF_PIPE_WAIT: 1 workers (default), 0 the drawing thread builds them (draw);
                                        // set by vk_pipeline_async_enable, before the replay runs
     uint64_t waits, queued, by_worker, stolen, timeouts;
 } U;
@@ -2175,17 +1817,6 @@ static VkPipeline lib_get(int kind, const VkPipeState *s, const GKey *k, Layout 
     return lib_put(h, key, size, pipe);
 }
 
-static void libs_destroy(void) {
-    for (int i = 0; i < LIB_BUCKETS; i++) {
-        for (Lib *b = libs[i], *n; b; b = n) {
-            n = b->next;
-            if (b->pipe) vkDestroyPipeline(P.device, b->pipe, NULL);
-            free(b);
-        }
-        libs[i] = NULL;
-    }
-}
-
 // The four library keys of pipeline s (key k).
 static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, FsKey *fk, FoKey *ok) {
     memset(v, 0, sizeof *v);
@@ -2195,13 +1826,11 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
     memset(pk, 0, sizeof *pk);
     GfxShaderIo fin[32];
     pk->kind = LIB_PR, pk->vs = s->vs, pk->clamp = k->clamp, pk->poly_mode = k->poly_mode, pk->minus_w = k->minus_w;
-    vattr_int_masks(s, &pk->uint_attr, &pk->sint_attr);
     pk->missing = vs_union_missing(s, fin);
     for (int i = 0; i < 32; i++)
         if (pk->missing >> i & 1) pk->fin[i] = fin[i];
     memset(fk, 0, sizeof *fk);
     fk->kind = LIB_FS, fk->fs = s->fs, fk->dsb = k->dsb, fk->samples = k->samples, fk->a2c = k->a2c;
-    fk->alpha = k->alpha, fk->alpha_ref = k->alpha_ref;
     memset(ok, 0, sizeof *ok);
     ok->kind = LIB_FO, ok->n_color = k->n_color, ok->samples = k->samples, ok->a2c = k->a2c, ok->logic_op = k->logic_op;
     ok->blend_en = k->blend_en, ok->depth = k->depth, ok->stencil = k->stencil, ok->wmask = k->wmask;
@@ -2216,7 +1845,7 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
 static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc, int build, int *final) {
     Layout *l = (Layout *)lc;
     *final = 1;
-    if (s->gs || s->tcs || !l->set1 || k->fbl) return VK_NULL_HANDLE;
+    if (!l->set1 || k->fbl) return VK_NULL_HANDLE;
     uint64_t t0 = qpc();
     ViKey vk_;
     PrKey pk;
@@ -2238,7 +1867,7 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
         VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4,
                                              .pLibraries = lib};
         VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li,
-                                           .flags = vk_pipeline_capture_flags(), .layout = l->layout};
+                                           .layout = l->layout};
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
@@ -2297,21 +1926,19 @@ static struct {
 // Every graphics pipeline built in a game run appends a KeyRec: the VkPipeState it was built from with the shader
 // pointers zeroed and the shaders named by their gfx_shader input ids instead, which do not depend on the translator,
 // so the record rebuilds the pipeline without guest memory. At the next boot vk_pipeline_prewarm (rt_boot, before the
-// guest runs; TOTK_PIPE_PREBUILD=0 skips it) loads each record's shaders, translating the ones not cached under the
+// guest runs; MTF_PIPE_PREBUILD=0 skips it) loads each record's shaders, translating the ones not cached under the
 // current translator from their stored inputs (gfx_shader_prewarm; a record whose shader has neither is dropped),
 // enters each Pipe as building under the key a draw would compute, queues it to the low queue and builds the queue on
 // every core. Records are deduplicated by a hash of their bytes; they are collected under P.lock by the worker that
 // built the pipeline and appended by the present thread (vk_pipeline_autosave) or at exit (vk_pipeline_save). A file
 // with another magic, version or record size is ignored and rewritten. Bump KEYS_VERSION when VkPipeState or the
 // record changes meaning without changing size.
-#define KEYS_VERSION 3                 // 3: shaders named by input id (gfx_shader.c)
+#define KEYS_VERSION 4                 // 3: shaders named by input id (gfx_shader.c); 4: VkPipeState with tcs, tes
 typedef struct { char magic[8]; uint32_t version, rec_size; } KeysHeader;
 typedef struct {
     uint8_t vs[32], fs[32];            // gfx_shader_input_id of each stage; fs all zero with has_fs 0
     uint32_t has_fs, pad;
-    // Frozen two-stage prefix. Adding the experimental GS pointer must not
-    // change existing version-3 records or reinterpret their bytes at boot.
-    _Alignas(VkPipeState) uint8_t state[offsetof(VkPipeState, gs)];
+    VkPipeState s;                     // vs, fs zero
 } KeyRec;
 static struct {
     char path[PLAT_PATH_MAX * 2];
@@ -2365,15 +1992,19 @@ static void rec_fill(KeyRec *r, const VkPipeState *s) {
     memset(r, 0, sizeof *r);
     memcpy(r->vs, gfx_shader_input_id(s->vs), 32);
     if (s->fs) memcpy(r->fs, gfx_shader_input_id(s->fs), 32), r->has_fs = 1;
-    VkPipeState legacy = *s;
-    legacy.vs = legacy.fs = legacy.gs = NULL;
-    legacy.prim_restart = 0;   // dynamic state: the same pipeline either way
-    memcpy(r->state, &legacy, sizeof r->state);
+    r->s = *s;
+    r->s.vs = r->s.fs = NULL;
+    r->s.prim_restart = 0;   // dynamic state: the same pipeline either way
 }
 
 // A pipeline was built for a draw: queue its record for the file. Caller holds P.lock.
 static void keys_note(const VkPipeState *s) {
-    if (s->gs || s->tcs || s->tes || !A.on || !K.path[0]) return;             // GS/tess prewarm records need a future explicit format
+    if (!A.on || !K.path[0]) return;
+    // a record names the vertex and fragment shaders only: a pipeline with geometry or tessellation stages would
+    // come back with this run's pointers to them
+    if (s->gs || s->tcs || s->tes) return;
+    static const uint8_t none[32];
+    if (s->fs && !memcmp(gfx_shader_input_id(s->fs), none, 32)) return;   // the runtime's own shader (gfx_shader_own)
     KeyRec r;
     rec_fill(&r, s);
     if (!seen_add(rec_hash(&r))) return;
@@ -2399,7 +2030,7 @@ static void keys_flush(void) {
         FILE *f = fopen(K.path, K.header_ok ? "ab" : "wb");
         int ok = f != NULL;
         if (ok && !K.header_ok) {
-            KeysHeader h = {{'T', 'O', 'T', 'K', 'P', 'K', 'E', 'Y'}, KEYS_VERSION, sizeof(KeyRec)};
+            KeysHeader h = {{'M', 'T', 'F', 'P', 'K', 'E', 'Y', 'S'}, KEYS_VERSION, sizeof(KeyRec)};
             ok = fwrite(&h, sizeof h, 1, f) == 1;
         }
         if (ok) ok = fwrite(r, sizeof *r, n, f) == n;
@@ -2419,14 +2050,13 @@ static void keys_open(void) {
     char *slash = strrchr(K.path, '\\'), *fslash = strrchr(K.path, '/');
     if (fslash > slash) slash = fslash;
     snprintf(slash ? slash + 1 : K.path, sizeof K.path - (size_t)(slash ? slash + 1 - K.path : 0), "pipeline-keys.bin");
-    gfx_shader_record_at(K.path);   // shader-answers.bin next to it (gfx_shader.c)
     FILE *f = fopen(K.path, "rb");
     if (!f) return;
     KeysHeader h;
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (len >= (long)sizeof h && fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "TOTKPKEY", 8) &&
+    if (len >= (long)sizeof h && fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "MTFPKEYS", 8) &&
         h.version == KEYS_VERSION && h.rec_size == sizeof(KeyRec)) {
         K.header_ok = 1;
         size_t n = ((size_t)len - sizeof h) / sizeof(KeyRec);
@@ -2458,7 +2088,7 @@ static void pipe_worker(void *arg) {
     plat_mutex_lock(&P.lock);
     for (;;) {
         // With 3 or more workers one never takes low-queue work, so a waiting draw's library starts at once
-        // (not with TOTK_PIPE_WAIT=draw).
+        // (not with MTF_PIPE_WAIT=draw).
         while (!U.head && !A.head && !(A.low && (A.threads < 3 || !U.on || A.low_running < A.threads - 1))) {
             U.idle++;
             plat_cond_wait(&work_cv, &P.lock);
@@ -2493,7 +2123,7 @@ static void pipe_worker(void *arg) {
         }
         // Step 1 for a job a draw waits for: its stage libraries and the fast link. Step 2, the optimised build, goes to
         // the head of the low queue, so a burst of new pipelines gets every fast link before any optimised build.
-        if (P.gpl && !j->s.gs && !j->s.tcs && (!j->prebuild || j->demanded) && !j->p->info.pipeline && !j->p->fast_tried && j->p->lay) {
+        if (P.gpl && (!j->prebuild || j->demanded) && !j->p->info.pipeline && !j->p->fast_tried && j->p->lay) {
             int final;
             VkPipeline f = gpl_link(&j->s, &j->k, j->p->lay, 1, &final);   // releases P.lock while building
             j->p->fast_tried = 1;
@@ -2555,30 +2185,9 @@ static int workers_start(void) {
     return A.threads != 0;
 }
 
-static void workers_drain(void) {
-    plat_mutex_lock(&P.lock);
-    K.loading = 0;
-    for (Job *j = A.low, *n; j; j = n) {   // queued prebuild jobs are dropped, not built
-        n = j->next;
-        j->p->building = 0, j->p->job = NULL;
-        A.inflight--, K.left--;
-        free(j);
-    }
-    A.low = A.low_tail = NULL;
-    for (LibJob *j = U.head, *n; j; j = n) {   // queued library jobs too: their entries read as failed builds
-        n = j->next;
-        j->b->job = NULL, j->b->building = 0;
-        free(j);
-    }
-    U.head = U.tail = NULL;
-    while (A.inflight) plat_cond_wait(&A.idle, &P.lock);
-    while (U.running) plat_cond_wait(&done_cv, &P.lock);
-    plat_mutex_unlock(&P.lock);
-}
-
 void vk_pipeline_async_enable(void) {
-    U.on = strcmp(cfg_value("TOTK_PIPE_WAIT"), "draw") != 0;
-    const char *e = cfg_get("TOTK_PIPE_SYNC");
+    U.on = strcmp(cfg_value("MTF_PIPE_WAIT"), "draw") != 0;
+    const char *e = cfg_get("MTF_PIPE_SYNC");
     if (e && *e && strcmp(e, "0")) return;
     A.on = 1;
 }
@@ -2614,34 +2223,35 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     const char *why = NULL;
     Bindings B = {0};
     Layout *l = NULL;
-    uint32_t fs_off = binding_span(s->vs) - 1;
+    uint32_t span = binding_span(s->vs);
     if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) ||
         (s->gs && gfx_shader_stage(s->gs) != GFX_STAGE_GS) || (s->tcs && gfx_shader_stage(s->tcs) != GFX_STAGE_TCS) ||
         (s->tes && gfx_shader_stage(s->tes) != GFX_STAGE_TES) || !s->tcs != !s->tes) why = "stage mismatch";
     else if ((k->topo_class == 3) != (s->tcs != NULL)) why = "patches and tessellation stages come together";
-    if (!why && s->gs && !s->tcs) why = geometry_validate(s, &vk_ctx()->props.limits);
-    if (!why && k->indep) {
-        Bindings F = {0};
-        if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&F, s->fs, 0))) why = "too many bindings";
-        else if (!(l = layout_pair(&B, &F))) why = "descriptor layout creation failed";
-        fs_off = 0;
-    } else if (!why && (s->gs || s->tcs)) {
+    else if (s->gs || s->tcs) {
+        // geometry or tessellation stages: one shared set, the vertex stage's bindings, then each middle stage's
+        // (mid_stages), then the fragment stage's; no libraries
         const GfxShader *mid[3];
         uint32_t moff[3], foff = 0;
         int nmid = mid_stages(s, mid, moff, &foff), ok = add_stage(&B, s->vs, 0);
         for (int i = 0; ok && i < nmid; i++) ok = add_stage(&B, mid[i], moff[i]);
         if (!ok || (s->fs && !add_stage(&B, s->fs, foff))) why = "too many bindings";
         else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
-        fs_off = foff;
-    } else if (!why && (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, fs_off)))) why = "too many bindings";
-    else if (!why && !l && !(l = layout_get(&B))) why = "descriptor layout creation failed";
+        span = foff + 1;   // the fragment stage's offset below
+    } else if (P.indep) {
+        Bindings F = {0};
+        if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&F, s->fs, 0))) why = "too many bindings";
+        else if (!(l = layout_pair(&B, &F))) why = "descriptor layout creation failed";
+        span = 1;
+    } else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1))) why = "too many bindings";
+    else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
     char lack[128];
-    if (!why && !layout_covers(s, l, fs_off, lack, sizeof lack)) why = lack, l = NULL;
+    if (!why && !layout_covers(s, l, span - 1, lack, sizeof lack)) why = lack, l = NULL;
     VkPipeline pipe = VK_NULL_HANDLE;
     Job *j = NULL;
     if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
-        *j = (Job){.l = l, .fs_off = fs_off, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
-    } else if (!why && !(pipe = create_graphics(s, k, l, fs_off))) {
+        *j = (Job){.l = l, .fs_off = span - 1, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
+    } else if (!why && !(pipe = create_graphics(s, k, l, span - 1))) {
         why = "pipeline creation failed";
     }
     if (why) {
@@ -2763,18 +2373,18 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     // parallel on idle workers (lib_wait; about 0.12 ms per library from the driver's disk cache, 5-180 ms cold), and
     // links them here: its own job may queue behind optimised builds of earlier pipelines. The job then only does the
     // optimised build, from the low queue. Other draws leave the libraries to the job and are skipped meanwhile.
-    // TOTK_PIPE_WAIT=draw builds them on this thread one after the other instead, as before; TOTK_GPL_DRAW_BUILD=0
+    // MTF_PIPE_WAIT=draw builds them on this thread one after the other instead, as before; MTF_GPL_DRAW_BUILD=0
     // leaves them to the job.
     static int draw_build = -1;
     if (draw_build < 0) {
-        const char *e = cfg_get("TOTK_GPL_DRAW_BUILD");
+        const char *e = cfg_get("MTF_GPL_DRAW_BUILD");
         draw_build = !(e && !strcmp(e, "0"));
         rt_log("vk_pipeline: a draw that waits for its pipeline %s", !draw_build ? "leaves its libraries to its job"
                : U.on ? "has its libraries built in parallel on the workers, ahead of other jobs"
-                      : "builds its libraries itself (TOTK_PIPE_WAIT=draw)");
+                      : "builds its libraries itself (MTF_PIPE_WAIT=draw)");
     }
     double end = wait_ms ? now_ms() + wait_ms : 0;
-    if (p && p->building && P.gpl && !s->gs && !s->tcs && !p->info.pipeline && !p->fast_tried && p->lay) {
+    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay) {
         int final = 0, build = wait_ms != 0 && draw_build;
         uint64_t p0 = perf_begin(), t0 = qpc();
         if (build && U.on) {
@@ -2825,10 +2435,6 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     return pipe;
 }
 
-VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info) {
-    return graphics(s, info, 0, NULL, 0);
-}
-
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms) {
     return graphics(s, info, A.on, pending, wait_ms);
 }
@@ -2870,21 +2476,17 @@ static void warm_builder(void *arg) {
     return;
 }
 
-static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]);
-
 void vk_pipeline_prewarm(void) {
     const char *gpu = rt_config()->gpu;
-    uint32_t pr_hist[16] = {0}, fs_hist[4] = {0};   // library state of the recorded pipelines (lb_start)
     if (!A.on || (gpu && !strcmp(gpu, "null"))) return;
-    if (!cfg_bool("TOTK_PIPE_PREBUILD")) {   // prebuild_start logs the off case
-        if (ensure_init()) lb_start(pr_hist, fs_hist);
+    if (!cfg_bool("MTF_PIPE_PREBUILD")) {   // prebuild_start logs the off case
+        ensure_init();
         return;
     }
     double t0 = now_ms();
     K.warm = 1;
     if (!ensure_init() || !K.file_n) {
         rt_log("vk_pipeline: prewarm: no pipeline keys (%s)", K.path[0] ? K.path : "<none>");
-        if (P.ready) lb_start(pr_hist, fs_hist);
         return;
     }
     const KeyRec *r = (const KeyRec *)K.file;
@@ -2904,9 +2506,7 @@ void vk_pipeline_prewarm(void) {
     for (size_t i = 0; i < m; i++)
         if (!u || memcmp(ids[u - 1], ids[i], 32)) memcpy(ids[u++], ids[i], 32);
     int cpus = (int)plat_cpu_usable();
-    const char *pe = cfg_get("TOTK_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
-    int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
-    gfx_shader_prewarm((const uint8_t(*)[32])ids, u, sh, cpus, procs < 1 ? 1 : procs);
+    gfx_shader_prewarm((const uint8_t(*)[32])ids, u, sh, cpus);
     double t1 = now_ms();
 
     if (P.indep) {   // vertex output unions first: workers may take a job before the queue is complete
@@ -2935,13 +2535,10 @@ void vk_pipeline_prewarm(void) {
             dropped++;
             continue;
         }
-        VkPipeState s = {0};
-        memcpy(&s, r[i].state, sizeof r[i].state);
+        VkPipeState s = r[i].s;
         s.vs = vs, s.fs = fs;
         GKey k;
         gkey_fill(&s, &k);
-        pr_hist[(k.clamp & 1) | (k.poly_mode & 3) << 1 | (k.minus_w & 1) << 3]++;
-        fs_hist[k.samples >= 8 ? 3 : k.samples >= 4 ? 2 : k.samples >= 2 ? 1 : 0]++;
         uint64_t h = key_hash(&k, sizeof k);
         int q = 0;
         if (pipe_find(&k, sizeof k, h)) known++;
@@ -2956,9 +2553,7 @@ void vk_pipeline_prewarm(void) {
     for (int i = 0; i < cpus && i < 64 && queued; i++)
         if ((t[nt] = plat_thread_new(warm_builder, NULL, "pipe prewarm"))) nt++;
     if (!nt) warm_builder(NULL);
-    for (int i = 0; i < nt; i++)
-        while (!plat_thread_join_ns(t[i], 2000000000u))
-            rt_log("vk_pipeline: prewarm: %u of %u pipelines, %.0f ms", K.built + K.failed, queued, now_ms() - t1);
+    for (int i = 0; i < nt; i++) plat_thread_join(t[i]);
     plat_mutex_lock(&P.lock);
     while (K.left) plat_cond_wait(&done_cv, &P.lock);   // jobs a pool worker took
     rt_log("vk_pipeline: prewarm: %zu records in %s: %u pipelines built, %u failed, %u already built, %u dropped "
@@ -2967,16 +2562,15 @@ void vk_pipeline_prewarm(void) {
     free(K.file);
     K.file = NULL;
     plat_mutex_unlock(&P.lock);
-    lb_start(pr_hist, fs_hist);
 }
 
-// ensure_init's hook: without a prewarm (TOTK_PIPE_PREBUILD=0, or the device came up first elsewhere) the records
+// ensure_init's hook: without a prewarm (MTF_PIPE_PREBUILD=0, or the device came up first elsewhere) the records
 // are not built. Caller holds no lock.
 static void prebuild_start(void) {
     plat_mutex_lock(&P.lock);
     if (K.file && !K.warm) {
         rt_log("vk_pipeline: prebuild off%s; %zu records not built",
-               !cfg_bool("TOTK_PIPE_PREBUILD") ? " (TOTK_PIPE_PREBUILD=0)" : " (no boot prewarm)", K.file_n);
+               !cfg_bool("MTF_PIPE_PREBUILD") ? " (MTF_PIPE_PREBUILD=0)" : " (no boot prewarm)", K.file_n);
         free(K.file);
         K.file = NULL;
     }
@@ -2987,13 +2581,13 @@ static void prebuild_start(void) {
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
-    VkShaderModule m = make_module(cs, code, words);
+    VkShaderModule m = make_module(code, words);
     if (!m) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
-                                      .flags = vk_pipeline_capture_flags(), .layout = l->layout};
+                                      .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
@@ -3009,51 +2603,6 @@ static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why
     else if (!(l = layout_get(B))) *why = "descriptor layout creation failed";
     return l;
 }
-
-// ---- stage library prebuild
-// Two places build what a draw would otherwise build while the game waits:
-// - totk.exe --prepare-shaders (lb_warm_prepared), after the translation, on every core: for each prepared variant
-//   (shader-prepared.bin) the pre-rasterization library of a vertex shader, the fragment-shader library of a fragment
-//   shader and the pipeline of a compute shader, each built from a private shader copy and destroyed at once. What
-//   stays is the driver's own disk cache: on AMD a library built again in a later process takes 0.1 ms instead of
-//   55 ms (vertex) / 28 ms (fragment). Our pipeline-cache.bin is not written there:
-//   it would grow by about 10 KB per library (~240 MB) and be read into memory at every boot.
-// - boot (lb_worker), after the pipeline-key prewarm, on cpus/4 threads at PLAT_PRIO_IDLE (the short P.lock
-//   sections and shader loads at normal priority, so a preempted thread never holds the lock the replay needs):
-//   compute pipelines of every recorded and prepared compute shader, kept (vk_pipeline_compute builds compute
-//   synchronously on the replay thread; 163 prepared), and the libraries of the first TOTK_LIB_PREBUILD_KEEP variants
-//   play recorded (priority 0), kept in libs[] with their shaders. KEEP defaults to 0: a kept library costs 140-460 KB
-//   of process memory (10,000 kept took 9 GB in run 1) to save a rebuild the driver cache makes 0.1 ms.
-// Library state: the vertex output union known now (vs_union_peek; the prewarm fills it from pipeline-keys.bin, the
-// preparation has none), the clamp, polygon mode and depth mode most recorded pipelines use (defaults without a key
-// file: clamp 0, fill, -w..w), single-sampled, no dual source; the state dynamic on this GPU is 0 in every key.
-// A draw that meets such a variant in a new pipeline then gets its libraries from libs[] or the driver cache and
-// fast-links (gpl_link). TOTK_LIB_PREBUILD=0 turns the boot part off, =N stops it after N variants;
-// TOTK_LIB_PREBUILD_THREADS sets its thread count.
-#define LB_MAX_THREADS 16
-
-static struct {
-    GfxWarmEnt *e;
-    size_t n;
-    volatile int64_t next;
-    volatile int32_t stop, running;
-    int threads;
-    PlatThread *th[LB_MAX_THREADS];
-    uint8_t clamp, poly, minus_w, samples;             // library state (GKey fields)
-    double t0, ms[3];                                  // ms: build time per kind (vertex, fragment, compute)
-    // warmed: driver cache only; nolib: vertex and fragment variants skipped with the graphics pipeline library off
-    uint64_t built[3], have[3], fail[3], warmed[3], noshader, nolib, done, cs_draw;
-    double warm_ms[3];
-    volatile int32_t kept;                                // libraries entered in libs[] so far
-    int32_t keep_n;
-    int idle;                                          // build at PLAT_PRIO_IDLE (boot), normal (preparation)
-    PlatMutex stat;
-    // preparation progress: ok[i] set when variant i finished, mark = first unfinished index (saved to prog_path)
-    uint8_t *ok;
-    size_t mark;
-    char prog_path[PLAT_PATH_MAX * 2 + 32];
-    uint64_t sig;                                      // FNV-1a of shader-prepared.bin: a new list starts over
-} LB = {.stat = PLAT_MUTEX_INIT};
 
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
     if (info) *info = NULL;
@@ -3080,7 +2629,6 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             rt_log("vk_pipeline: compute pipeline not built: %s", why);
         } else {
             P.stats.compute++;
-            LB.cs_draw++;
         }
         p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
     }
@@ -3090,403 +2638,23 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
     return p->info.pipeline;
 }
 
-static void lb_lock(void) {
-    plat_thread_priority(PLAT_PRIO_NORMAL);
-    plat_mutex_lock(&P.lock);
-}
-
-static void lb_unlock(void) {
-    plat_mutex_unlock(&P.lock);
-    if (LB.idle) plat_thread_priority(PLAT_PRIO_IDLE);
-}
-
-static void lb_count(int kind, int what, double ms) {   // what: 0 built, 1 already there, 2 failed, 3 cache only
-    plat_mutex_lock(&LB.stat);
-    if (what == 3) LB.warmed[kind]++, LB.warm_ms[kind] += ms;
-    else (what == 0 ? LB.built : what == 1 ? LB.have : LB.fail)[kind]++, LB.ms[kind] += ms;
-    plat_mutex_unlock(&LB.stat);
-}
-
-// vs_union_missing for vs alone, without entering vs into the union table (it holds VS_OUTS_CAP shaders).
-static uint32_t vs_union_peek(const GfxShader *vs, GfxShaderIo fin[32]) {
-    GfxShaderIo vout[32];
-    uint32_t need = 0, have = gfx_shader_outputs(vs, vout), missing = 0;
-    memset(fin, 0, 32 * sizeof *fin);
-    plat_mutex_lock_shared(&VO.lock);
-    uint32_t j = (uint32_t)(((uintptr_t)vs >> 4) * 0x9e3779b1u) & (VS_OUTS_CAP - 1);
-    while (VO.vs[j] && VO.vs[j] != vs) j = (j + 1) & (VS_OUTS_CAP - 1);
-    if (VO.vs[j]) need = VO.mask[j], memcpy(fin, VO.io[j], 32 * sizeof *fin);
-    plat_mutex_unlock_shared(&VO.lock);
-    if (P.vs_outs_all)
-        for (int i = 0; i < 32; i++)
-            if (!(need >> i & 1)) fin[i] = (GfxShaderIo){GFX_TYPE_FLOAT, 4, 0, 32}, need |= 1u << i;
-    for (int i = 0; i < 32; i++)
-        if (need >> i & 1 && !(have >> i & 1)) missing |= 1u << i;
-    return missing;
-}
-
-static void lb_compute(const GfxShader *cs) {
-    struct { const GfxShader *cs; uint32_t compute; } k = {cs, 1};
-    uint64_t h = key_hash(&k, sizeof k);
-    Bindings B = {0};
-    const char *why = NULL;
-    lb_lock();
-    Layout *l = pipe_find(&k, sizeof k, h) ? NULL : compute_layout(cs, &B, &why);
-    int have = !l && !why;
-    lb_unlock();
-    if (!l) {
-        lb_count(2, have ? 1 : 2, 0);
-        return;
-    }
-    double t0 = now_ms();
-    VkPipeline pipe = compute_create(cs, l);
-    double ms = now_ms() - t0;
-    lb_lock();
-    if (pipe && !pipe_find(&k, sizeof k, h)) {
-        pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
-        P.stats.compute++;
-    } else if (pipe) {
-        vkDestroyPipeline(P.device, pipe, NULL);
-        have = 1;
-    }
-    lb_unlock();
-    lb_count(2, pipe ? have : 2, ms);
-}
-
-// The pre-rasterization (vertex) or fragment-shader library of one shader with the LB state.
-// keep 0: build into the driver's pipeline cache only (sh is a private copy; the library is destroyed).
-static void lb_library(const GfxShader *sh, int vertex, int keep) {
-    int kind = vertex ? LIB_PR : LIB_FS, stat = vertex ? 0 : 1;
-    VkPipeState s;
-    vk_pipe_state_defaults(&s);
-    GKey k;
-    memset(&k, 0, sizeof k);
-    k.clamp = LB.clamp, k.poly_mode = LB.poly, k.minus_w = LB.minus_w, k.samples = LB.samples;
-    PrKey pk;
-    FsKey fk;
-    memset(&pk, 0, sizeof pk), memset(&fk, 0, sizeof fk);
-    const void *key;
-    uint32_t size;
-    if (vertex) {
-        GfxShaderIo fin[32];
-        s.vs = sh;
-        pk.kind = LIB_PR, pk.vs = sh, pk.clamp = k.clamp, pk.poly_mode = k.poly_mode, pk.minus_w = k.minus_w;
-        pk.missing = vs_union_peek(sh, fin);
-        for (int i = 0; i < 32; i++)
-            if (pk.missing >> i & 1) pk.fin[i] = fin[i];
-        key = &pk, size = sizeof pk;
-    } else {
-        s.fs = sh;
-        fk.kind = LIB_FS, fk.fs = sh, fk.samples = k.samples;
-        key = &fk, size = sizeof fk;
-    }
-    uint64_t h = key_hash(key, size);
-    Bindings B = {0}, F = {0};
-    VkPipelineLayout lay = VK_NULL_HANDLE;
-    lb_lock();
-    int have = keep && lib_find(h, key, size) != NULL;
-    if (!have && add_stage(vertex ? &B : &F, sh, 0)) {
-        Layout *l = layout_pair(&B, &F);
-        if (l) lay = half_layout(l, vertex ? 0 : 1);
-    }
-    lb_unlock();
-    if (have || !lay) {
-        lb_count(stat, have ? 1 : 2, 0);
-        return;
-    }
-    double t0 = now_ms();
-    VkPipeline pipe = lib_create(kind, &s, &k, lay, key);
-    double ms = now_ms() - t0;
-    if (!keep) {
-        if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-        lb_count(stat, pipe ? 3 : 2, ms);
-        return;
-    }
-    lb_lock();
-    have = lib_find(h, key, size) != NULL;
-    VkPipeline got = lib_put(h, key, size, pipe);
-    if (!have && pipe) {
-        Lib *b = lib_find(h, key, size);
-        if (b) b->pre = 1;
-    }
-    lb_unlock();
-    lb_count(stat, !pipe ? 2 : have || got != pipe ? 1 : 0, ms);
-}
-
-// A vertex or fragment variant with the graphics pipeline library off: no stage library to build ahead.
-static void lb_skip_lib(void) {
-    plat_mutex_lock(&LB.stat);
-    LB.nolib++;
-    plat_mutex_unlock(&LB.stat);
-}
-
-static void lb_report(const char *how) {
-    float mem_used, mem_total, mem_proc;
-    plat_mem_info(&mem_used, &mem_total, &mem_proc);
-    plat_mutex_lock_shared(&LB.stat);
-    rt_log("vk_pipeline: stage library prebuild %s: %llu of %zu variants in %.0f ms; kept: vertex %llu built (avg %.1f ms), "
-           "%llu there; fragment %llu built (avg %.1f ms), %llu there; compute %llu built (avg %.1f ms), %llu there; driver "
-           "cache only: vertex %llu (avg %.1f ms), fragment %llu (avg %.1f ms), compute %llu (avg %.1f ms); %llu failed, %llu not in the shader cache, "
-           "%llu vertex/fragment skipped (graphics pipeline library off); process working set %.0f MB", how, (unsigned long long)LB.done, LB.n,
-           now_ms() - LB.t0, (unsigned long long)LB.built[0], LB.built[0] ? LB.ms[0] / LB.built[0] : 0.0,
-           (unsigned long long)LB.have[0], (unsigned long long)LB.built[1], LB.built[1] ? LB.ms[1] / LB.built[1] : 0.0,
-           (unsigned long long)LB.have[1], (unsigned long long)LB.built[2], LB.built[2] ? LB.ms[2] / LB.built[2] : 0.0,
-           (unsigned long long)LB.have[2], (unsigned long long)LB.warmed[0], LB.warmed[0] ? LB.warm_ms[0] / LB.warmed[0] : 0.0,
-           (unsigned long long)LB.warmed[1], LB.warmed[1] ? LB.warm_ms[1] / LB.warmed[1] : 0.0,
-           (unsigned long long)LB.warmed[2], LB.warmed[2] ? LB.warm_ms[2] / LB.warmed[2] : 0.0,
-           (unsigned long long)(LB.fail[0] + LB.fail[1] + LB.fail[2]),
-           (unsigned long long)LB.noshader, (unsigned long long)LB.nolib, (double)mem_proc);
-    plat_mutex_unlock_shared(&LB.stat);
-}
-
-// Boot: compute pipelines and kept libraries, all entered for the process.
-static void lb_worker(void *arg) {
-    (void)arg;
-    plat_thread_priority(PLAT_PRIO_IDLE);
-    for (;;) {
-        size_t i = (size_t)plat_inc64(&LB.next) - 1;
-        if (i >= LB.n || LB.stop) break;
-        plat_thread_priority(PLAT_PRIO_NORMAL);   // gfx_shader's cache lock, disk reads
-        const GfxShader *sh = gfx_shader_load_input(LB.e[i].iid, 0);
-        plat_thread_priority(PLAT_PRIO_IDLE);
-        if (!sh) {
-            plat_mutex_lock(&LB.stat);
-            LB.noshader++;
-            plat_mutex_unlock(&LB.stat);
-        } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
-            lb_compute(sh);
-        } else if (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS) {
-            if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);
-            else lb_skip_lib();
-        }
-        plat_mutex_lock(&LB.stat);
-        LB.done++;
-        plat_mutex_unlock(&LB.stat);
-    }
-    if (!plat_dec32(&LB.running)) lb_report(LB.stop ? "stopped" : "done");
-    return;
-}
-
-// The library state from the key file's records (prewarm); defaults without one.
-static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
-    // state index: clamp | poly (0 fill, 1 line, 2 point -> VkPolygonMode) << 1 | minus_w << 3 (pr); samples log2 (fs)
-    uint32_t best = 0, bf = 0;
-    for (uint32_t i = 1; i < 16; i++) best = pr_hist[i] > pr_hist[best] ? i : best;
-    for (uint32_t i = 1; i < 4; i++) bf = fs_hist[i] > fs_hist[bf] ? i : bf;
-    if (!pr_hist[best]) best = 8;   // no key file: TotK clips -w..w (all 2706 records of a recorded key file)
-    LB.clamp = (uint8_t)(best & 1), LB.poly = (uint8_t)(best >> 1 & 3), LB.minus_w = (uint8_t)(best >> 3 & 1);
-    LB.samples = (uint8_t)(1u << bf);
-}
-
-// Boot: compute shaders of the warm list (recorded and prepared), then the first KEEP recorded graphics variants.
-static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
-    const char *e = cfg_value("TOTK_LIB_PREBUILD"), *ke = cfg_get("TOTK_LIB_PREBUILD_KEEP");
-    const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // no fixed default: a quarter of the CPUs when unset
-    if (!A.on || !cfg_bool("TOTK_LIB_PREBUILD")) return;
-    GfxWarmEnt *all = NULL;
-    size_t total = gfx_shader_warm_list(&all), n = 0, n_cs = 0;
-    LB.keep_n = ke && *ke ? atoi(ke) : 0;
-    LB.e = malloc((total + 1) * sizeof *LB.e);
-    for (size_t i = 0; LB.e && i < total; i++)
-        if (all[i].stage == GFX_STAGE_CS) LB.e[n++] = all[i];
-    n_cs = n;
-    for (size_t i = 0; LB.e && i < total && (int32_t)(n - n_cs) < LB.keep_n; i++)
-        if (all[i].stage != GFX_STAGE_CS && all[i].prio == 0) LB.e[n++] = all[i];
-    free(all);
-    if (atoi(e) > 1 && (size_t)atoi(e) < n) n = (size_t)atoi(e);   // a count above 1 caps the list; 1 is plain on
-    if (!n) {
-        free(LB.e), LB.e = NULL;
-        return;
-    }
-    LB.n = n;
-    lb_state(pr_hist, fs_hist);
-    LB.idle = 1;
-    int cpus = (int)plat_cpu_usable();
-    int t = te && *te ? atoi(te) : cpus / 4;
-    t = t < 1 ? 1 : t > LB_MAX_THREADS ? LB_MAX_THREADS : t;
-    if ((size_t)t > n) t = (int)n;
-    LB.t0 = now_ms();
-    LB.running = t;
-    int started = 0;
-    for (int i = 0; i < t; i++)
-        if ((LB.th[started] = plat_thread_new(lb_worker, NULL, "lib prebuild"))) started++;
-    plat_add32(&LB.running, started - t);
-    LB.threads = started;
-    rt_log("vk_pipeline: stage library prebuild: %zu compute pipelines and %zu recorded variants' libraries "
-           "(TOTK_LIB_PREBUILD_KEEP %d) on %d idle-priority threads; library state clamp %u, polygon mode %u, depth "
-           "-w..w %u, samples %u", n_cs < n ? n_cs : n, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly,
-           LB.minus_w, LB.samples);
-}
-
-static void lb_stop(void) {
-    plat_xchg32(&LB.stop, 1);
-    for (int i = 0; i < LB.threads; i++)
-        if (LB.th[i]) plat_thread_join(LB.th[i]), LB.th[i] = NULL;
-    LB.threads = 0;
-}
-
-// Preparation: one prepared variant at a time into the driver's disk cache (private shader copy, nothing kept).
-static void lb_warm_worker(void *arg) {
-    (void)arg;
-    plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);   // an hour-long run must leave the PC usable
-    for (;;) {
-        size_t i = (size_t)plat_inc64(&LB.next) - 1;
-        if (i >= LB.n) return;
-        int owned = 0;
-        const GfxShader *sh = gfx_shader_load_private(LB.e[i].iid, &owned);
-        int st = sh ? gfx_shader_stage(sh) : -1;
-        if (!sh) {
-            plat_mutex_lock(&LB.stat);
-            LB.noshader++;
-            plat_mutex_unlock(&LB.stat);
-        } else if (st == GFX_STAGE_CS) {
-            Bindings B = {0};
-            const char *why = NULL;
-            lb_lock();
-            Layout *l = compute_layout(sh, &B, &why);
-            lb_unlock();
-            double t0 = now_ms();
-            VkPipeline pipe = l ? compute_create(sh, l) : VK_NULL_HANDLE;
-            if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-            lb_count(2, pipe ? 3 : 2, now_ms() - t0);
-        } else if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) {
-            if (P.gpl) lb_library(sh, st == GFX_STAGE_VS, 0);
-            else lb_skip_lib();
-        }
-        if (owned) gfx_shader_release_private(sh);
-        plat_mutex_lock(&LB.stat);
-        uint64_t d = ++LB.done;
-        LB.ok[i] = 1;
-        size_t old = LB.mark;
-        while (LB.mark < LB.n && LB.ok[LB.mark]) LB.mark++;
-        // resume point on disk every 256 variants: a closed or killed run continues there (lb_warm_prepared)
-        if (LB.mark / 256 != old / 256) {
-            char buf[64];
-            int len = snprintf(buf, sizeof buf, "%zu %llu %zu\n", LB.n, (unsigned long long)LB.sig, LB.mark);
-            plat_file_write_atomic(LB.prog_path, buf, (size_t)len);
-        }
-        plat_mutex_unlock(&LB.stat);
-        if (d % 4000 == 0) lb_report("preparation progress");
-    }
-}
-
-// Preparation: every variant of <dir>/shader-prepared.bin on every core but one (from 4 cores up) at below-normal priority.
-static void lb_warm_prepared(const char *dir) {
-    char path[PLAT_PATH_MAX * 2 + 32];
-    snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
-    uint64_t size = 0;
-    uint8_t *f = plat_file_read(path, &size);
-    size_t n = f && size >= 16 ? (size_t)(size - 16) / 36 : 0;
-    LB.e = n ? calloc(n, sizeof *LB.e) : NULL;
-    for (size_t i = 0; LB.e && i < n; i++)
-        memcpy(LB.e[i].iid, f + 16 + 36 * i + 4, 32), LB.e[i].stage = f[16 + 36 * i], LB.e[i].prio = f[16 + 36 * i + 1];
-    uint64_t sg = 1469598103934665603ull;
-    for (size_t i = 0; f && i < size; i++) sg = (sg ^ f[i]) * 1099511628211ull;
-    free(f);
-    if (!LB.e) return;
-    LB.n = n, LB.idle = 0, LB.t0 = now_ms();
-    // Resume: lib-warm.progress holds "count signature mark" of an interrupted run over this same list (the driver
-    // cache keeps the variants below mark). A finished run deletes it, so the next run builds everything again.
-    LB.ok = calloc(n, 1);
-    LB.sig = sg;
-    snprintf(LB.prog_path, sizeof LB.prog_path, "%s/lib-warm.progress", dir);
-    uint64_t psz = 0;
-    uint8_t *pf = plat_file_read(LB.prog_path, &psz);
-    size_t pn = 0, pm = 0;
-    unsigned long long ps = 0;
-    if (pf && psz < 63) {
-        char b[64] = {0};
-        memcpy(b, pf, psz);
-        if (sscanf(b, "%zu %llu %zu", &pn, &ps, &pm) == 3 && pn == n && ps == LB.sig && pm <= n) {
-            memset(LB.ok, 1, pm), LB.mark = pm, LB.next = (int64_t)pm, LB.done = pm;
-            rt_log("vk_pipeline: stage library prebuild resumes at %zu of %zu variants", pm, n);
-        }
-    }
-    free(pf);
-    static const uint32_t no_pr[16], no_fs[4];
-    lb_state(no_pr, no_fs);
-    int cpus = (int)plat_cpu_usable(), k = 0;
-    if (cpus >= 4) cpus--;
-    rt_log("vk_pipeline: stage library preparation on %d threads at below-normal priority", cpus);
-    PlatThread *t[64];
-    for (int i = 0; i < cpus && i < 64; i++)
-        if ((t[k] = plat_thread_new(lb_warm_worker, NULL, "lib warm"))) k++;
-    if (!k) lb_warm_worker(NULL);
-    for (int i = 0; i < k; i++) plat_thread_join(t[i]);
-    lb_report("preparation done");
-    plat_file_delete(LB.prog_path);
-    free(LB.ok), LB.ok = NULL, LB.mark = 0;
-    // with gpl off only compute variants are built: say so, rather than count the skipped ones as built
-    if (LB.nolib)
-        printf("prepare-shaders: %zu variants on %d threads in %.0f ms, %llu vertex/fragment variants skipped (graphics "
-               "pipeline library off, they build at their first draw)\n", n, k, now_ms() - LB.t0, (unsigned long long)LB.nolib);
-    else
-        printf("prepare-shaders: %zu variants built into the driver cache on %d threads in %.0f ms\n", n, k, now_ms() - LB.t0);
-    free(LB.e), LB.e = NULL, LB.n = 0, LB.next = 0, LB.done = 0;
-}
-
-// totk.exe --prepare-shaders (tools/prepare_shaders.py): the device sets the translator's host answers (they are in every
-// cache key), the seed next to totk.exe is translated on every core, then every prepared variant's stage library or
-// compute pipeline is built once into the driver's disk cache (lb_warm_prepared). No game runs.
-static int prepare_shaders(int libraries) {
-    if (!ensure_init()) {
-        fprintf(stderr, "prepare-shaders: no Vulkan device\n");
-        return 1;
-    }
-    char dir[PLAT_PATH_MAX * 2];
-    snprintf(dir, sizeof dir, "%s", P.cache_path);
-    char *cut = plat_last_sep(dir);
-    if (!cut) return 1;
-    *cut = 0;
-    int cpus = (int)plat_cpu_usable();
-    const char *pe = cfg_get("TOTK_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
-    int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
-    int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
-    if (!rc && libraries) lb_warm_prepared(dir);
-    return rc;
-}
-
-int vk_pipeline_prepare_shaders(void) { return prepare_shaders(1); }
-
-// dkb.exe --translate-shaders (installer/bananza.py): the translation and shader-prepared.bin only, so a driver that
-// crashes while building the libraries cannot fail it. --warm-shaders builds the libraries afterwards.
-int vk_pipeline_translate_shaders(void) { return prepare_shaders(0); }
-
-// totk.exe --warm-shaders: every variant of shader-prepared.bin built into the driver's disk cache again from the shader
-// cache, without translating the seed. The AMD cache is keyed to the exe path (a relink keeps it: 29,587 variants in
-// 1.8 s) and holds a limited amount: preparing another build dir evicted this one's libraries, and a library a draw
-// needed then took 40-220 ms in play instead of 0.2 ms. Seconds when the libraries are still there.
-int vk_pipeline_warm_shaders(void) {
-    if (!ensure_init()) {
-        fprintf(stderr, "warm-shaders: no Vulkan device\n");
-        return 1;
-    }
-    char dir[PLAT_PATH_MAX * 2];
-    snprintf(dir, sizeof dir, "%s", P.cache_path);
-    char *cut = plat_last_sep(dir);
-    if (!cut) return 1;
-    *cut = 0;
-    char prp[PLAT_PATH_MAX * 2 + 32];
-    snprintf(prp, sizeof prp, "%s/shader-prepared.bin", dir);
-    if (!plat_file_exists(prp)) {
-        fprintf(stderr, "warm-shaders: no %s (tools/prepare_shaders.py writes it)\n", prp);
-        return 1;
-    }
-    lb_warm_prepared(dir);
-    return 0;
-}
-
 // ---- dynamic state
 
-void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
-    if (!ensure_init()) return;
+// NVN_FACE_* has VkCullModeFlagBits' values. MTF_NO_CULL=1 (diagnostic): nothing is culled.
+static VkCullModeFlags cull_mode(const poly_st *pl) {
+    static int no_cull = -1;
+    if (no_cull < 0) no_cull = cfg_bool("MTF_NO_CULL");
+    return no_cull ? VK_CULL_MODE_NONE : (VkCullModeFlags)(pl->cull & 3);
+}
+
+uint32_t vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
+    if (!ensure_init()) return VK_PIPE_ALL_BINDINGS;
     const poly_st *pl = &s->poly;
     const ds_st *d = &s->ds;
-    // The front face maps unchanged: TOTK sets the upper-left window origin, and the y-flipped viewport (y_flip) puts
-    // NDC +y at row 0 as NVN does, so the framebuffer winding Vulkan tests is the one NVN tests (MacNativeGames passes
-    // it to Metal unchanged; LAS Recomp exec.c mirrors it only for the lower-left origin).
+    // The front face maps unchanged: the game sets the upper-left window origin, and the y-flipped viewport (y_flip) puts
+    // NDC +y at row 0 as NVN does, so the framebuffer winding Vulkan tests is the one NVN tests.
     int front_cw = pl->front == NVN_FRONT_FACE_CW;
-    vkCmdSetCullMode(cb, (VkCullModeFlags)(pl->cull & 3));   // NVN_FACE_* has VkCullModeFlagBits' values
+    vkCmdSetCullMode(cb, cull_mode(pl));
     vkCmdSetFrontFace(cb, front_cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
     vkCmdSetDepthTestEnable(cb, d->dt);
@@ -3502,16 +2670,21 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     vkCmdSetDepthBiasEnable(cb, (pl->offset_en >> mode & 1) != 0);
     vkCmdSetRasterizerDiscardEnable(cb, s->raster_discard != 0);
     vkCmdSetPrimitiveRestartEnable(cb, s->prim_restart != 0);
-    if (P.dyn_vi && s->vs) {
+    // The vertex bindings the draw reads: those of its vertex input, set here or made into the pipeline from the same
+    // state by the same vertex_input.
+    uint32_t streams = VK_PIPE_ALL_BINDINGS;
+    if (s->vs) {
         VtxInput v;
         vertex_input(s, &v);
-        rec_vertex_input(P.set_vi, cb, v.n_bind, v.b, v.n_attr, v.a);
+        if (P.dyn_vi) rec_vertex_input(P.set_vi, cb, v.n_bind, v.b, v.n_attr, v.a);
+        streams = 0;
+        for (uint32_t i = 0; i < v.n_bind; i++) streams |= 1u << v.b[i].binding;
     }
     if (P.dyn_clamp) rec_bool(P.set_clamp, cb, s->depth_clamp != 0);
     if (P.dyn_poly) rec_polygon_mode(P.set_poly, cb, polygon_mode(pl->mode));
     if (P.dyn_a2c) rec_bool((PFN_vkCmdSetDepthClampEnableEXT)P.set_a2c, cb, s->ms.a2c != 0);   // the same signature
     int n = target_count(s);
-    if (!n) return;
+    if (!n) return streams;
     VkBool32 en[8];
     VkColorBlendEquationEXT eq[8];
     VkColorComponentFlags wm[8];
@@ -3525,6 +2698,119 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     if (P.dyn_blend_en) rec_blend_enable(P.set_blend_en, cb, 0, (uint32_t)n, en);
     if (P.dyn_blend_eq) rec_blend_equation(P.set_blend_eq, cb, 0, (uint32_t)n, eq);
     if (P.dyn_wmask) rec_write_mask(P.set_wmask, cb, 0, (uint32_t)n, wm);
+    return streams;
+}
+
+// The values vk_pipeline_set_dynamic records for a state, as the commands take them.
+typedef struct {
+    VkCullModeFlags cull;
+    VkFrontFace front;
+    VkPrimitiveTopology topo;
+    VkBool32 dt, dw, st, bias, discard, restart, clamp, a2c;
+    VkCompareOp df, scmp[2];
+    VkStencilOp sop[2][3];               // fail, pass, depth fail; front, back
+    VkPolygonMode poly;
+    int n;                               // colour attachments en, eq and wm hold
+    VkBool32 en[8];
+    VkColorBlendEquationEXT eq[8];
+    VkColorComponentFlags wm[8];
+} DynVals;
+
+static void dyn_vals(const VkPipeState *s, DynVals *o) {
+    const poly_st *pl = &s->poly;
+    const ds_st *d = &s->ds;
+    memset(o, 0, sizeof *o);
+    o->cull = cull_mode(pl);
+    o->front = pl->front == NVN_FRONT_FACE_CW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    o->topo = vk_pipeline_topology(s->prim);
+    o->dt = d->dt, o->dw = d->dw, o->st = d->st;
+    o->df = compare_op(d->df);
+    o->sop[0][0] = stencil_op(d->fail_f), o->sop[0][1] = stencil_op(d->zpass_f), o->sop[0][2] = stencil_op(d->zfail_f);
+    o->sop[1][0] = stencil_op(d->fail_b), o->sop[1][1] = stencil_op(d->zpass_b), o->sop[1][2] = stencil_op(d->zfail_b);
+    o->scmp[0] = compare_op(d->sf_f), o->scmp[1] = compare_op(d->sf_b);
+    unsigned mode = pl->mode <= NVN_POLYGON_MODE_FILL ? pl->mode : NVN_POLYGON_MODE_FILL;
+    o->bias = (pl->offset_en >> mode & 1) != 0;
+    o->discard = s->raster_discard != 0, o->restart = s->prim_restart != 0;
+    o->clamp = s->depth_clamp != 0, o->a2c = s->ms.a2c != 0;
+    o->poly = polygon_mode(pl->mode);
+    o->n = target_count(s);
+    for (int i = 0; i < o->n; i++) {
+        const blend_st *b = &s->blend[i];
+        o->en[i] = (s->color.blend_en >> i & 1) && blendable(target_format(s->color_fmt[i], NULL, NULL));
+        o->eq[i] = (VkColorBlendEquationEXT){blend_factor(b->src_rgb), blend_factor(b->dst_rgb), blend_op(b->eq_rgb),
+                                             blend_factor(b->src_a), blend_factor(b->dst_a), blend_op(b->eq_a)};
+        o->wm[i] = target_wmask(s, i);
+    }
+}
+
+// What the replay's command buffer holds, as vk_pipeline_set_dynamic_delta last recorded it (the replay thread only):
+// the values, the inputs of the vertex input and the vertex bindings it reads. Invariant while the caller passes
+// valid 1: cb holds DC.v for every dynamic state of P.dyn, colour attachments [0, DC.v.n) included.
+static struct {
+    DynVals v;
+    const GfxShader *vs;
+    uint32_t vattr[16];
+    vs_st vstream[16];
+    uint32_t streams;
+} DC;
+
+uint32_t vk_pipeline_set_dynamic_delta(VkCommandBuffer cb, const VkPipeState *s, int valid, uint32_t *cmds) {
+    *cmds = 0;
+    if (!ensure_init()) return VK_PIPE_ALL_BINDINGS;
+    if (!valid) {   // a new command buffer, or one whose dynamic state someone else set: everything, as before
+        uint32_t streams = vk_pipeline_set_dynamic(cb, s);
+        dyn_vals(s, &DC.v);
+        DC.vs = s->vs, DC.streams = streams;
+        memcpy(DC.vattr, s->vattr, sizeof DC.vattr), memcpy(DC.vstream, s->vstream, sizeof DC.vstream);
+        *cmds = 1;
+        return streams;
+    }
+    DynVals v;
+    dyn_vals(s, &v);
+    const DynVals *o = &DC.v;
+    uint32_t k = 0;
+    if (v.cull != o->cull) vkCmdSetCullMode(cb, v.cull), k++;
+    if (v.front != o->front) vkCmdSetFrontFace(cb, v.front), k++;
+    if (v.topo != o->topo) vkCmdSetPrimitiveTopology(cb, v.topo), k++;
+    if (v.dt != o->dt) vkCmdSetDepthTestEnable(cb, v.dt), k++;
+    if (v.dw != o->dw) vkCmdSetDepthWriteEnable(cb, v.dw), k++;
+    if (v.df != o->df) vkCmdSetDepthCompareOp(cb, v.df), k++;
+    if (v.st != o->st) vkCmdSetStencilTestEnable(cb, v.st), k++;
+    for (int f = 0; f < 2; f++)
+        if (memcmp(v.sop[f], o->sop[f], sizeof v.sop[f]) || v.scmp[f] != o->scmp[f])
+            vkCmdSetStencilOp(cb, f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT, v.sop[f][0], v.sop[f][1],
+                              v.sop[f][2], v.scmp[f]),
+                k++;
+    if (v.bias != o->bias) vkCmdSetDepthBiasEnable(cb, v.bias), k++;
+    if (v.discard != o->discard) vkCmdSetRasterizerDiscardEnable(cb, v.discard), k++;
+    if (v.restart != o->restart) vkCmdSetPrimitiveRestartEnable(cb, v.restart), k++;
+    // The vertex input is made from the vertex shader's inputs and the attribute and stream states alone
+    // (vertex_input): a draw that keeps all three keeps it, and the bindings it reads.
+    if (s->vs != DC.vs || memcmp(s->vattr, DC.vattr, sizeof DC.vattr) || memcmp(s->vstream, DC.vstream, sizeof DC.vstream)) {
+        uint32_t streams = VK_PIPE_ALL_BINDINGS;
+        if (s->vs) {
+            VtxInput vi;
+            vertex_input(s, &vi);
+            if (P.dyn_vi) rec_vertex_input(P.set_vi, cb, vi.n_bind, vi.b, vi.n_attr, vi.a), k++;
+            streams = 0;
+            for (uint32_t i = 0; i < vi.n_bind; i++) streams |= 1u << vi.b[i].binding;
+        }
+        DC.vs = s->vs, DC.streams = streams;
+        memcpy(DC.vattr, s->vattr, sizeof DC.vattr), memcpy(DC.vstream, s->vstream, sizeof DC.vstream);
+    }
+    if (P.dyn_clamp && v.clamp != o->clamp) rec_bool(P.set_clamp, cb, v.clamp), k++;
+    if (P.dyn_poly && v.poly != o->poly) rec_polygon_mode(P.set_poly, cb, v.poly), k++;
+    if (P.dyn_a2c && v.a2c != o->a2c) rec_bool((PFN_vkCmdSetDepthClampEnableEXT)P.set_a2c, cb, v.a2c), k++;
+    // Attachments past o->n may hold nothing yet in this command buffer: a state with more targets sets all of them.
+    // One with fewer leaves the ones past its count as they were, which no draw of it reads.
+    uint32_t n = (uint32_t)v.n;
+    int all = v.n > o->n;
+    if (n && P.dyn_blend_en && (all || memcmp(v.en, o->en, n * sizeof *v.en))) rec_blend_enable(P.set_blend_en, cb, 0, n, v.en), k++;
+    if (n && P.dyn_blend_eq && (all || memcmp(v.eq, o->eq, n * sizeof *v.eq))) rec_blend_equation(P.set_blend_eq, cb, 0, n, v.eq), k++;
+    if (n && P.dyn_wmask && (all || memcmp(v.wm, o->wm, n * sizeof *v.wm))) rec_write_mask(P.set_wmask, cb, 0, n, v.wm), k++;
+    DC.v = v;   // the invariant now covers [0, v.n) only
+    *cmds = k;
+    return DC.streams;
 }
 
 // ---- statistics, persistence, teardown
@@ -3557,15 +2843,10 @@ void vk_pipeline_save(void) {
         for (int i = 0; i < 4; i++)
             rt_log("vk_pipeline: gpl: %s libraries %llu (avg %.2f ms, max %.2f ms)", kn[i], (unsigned long long)P.g.lib_n[i],
                    P.g.lib_n[i] ? P.g.lib_ms[i] / P.g.lib_n[i] : 0.0, P.g.lib_max[i]);
-        if (LB.n)
-            rt_log("vk_pipeline: gpl: prebuilt libraries a draw used: pre-rasterization %llu, fragment shader %llu; "
-                   "compute pipelines built on the replay thread %llu", (unsigned long long)P.g.pre_used[LIB_PR],
-                   (unsigned long long)P.g.pre_used[LIB_FS], (unsigned long long)LB.cs_draw);
     }
-    gfx_shader_record_flush(1);
     if (!P.ready || !P.cache || !P.cache_path[0]) return;
     // Not under P.lock: the driver synchronises P.cache, and holding P.lock through the copy and the file write (about
-    // 60 ms on the 1.4.3 fight) stopped every pipeline lookup of the replay, a freeze at each 20 s autosave.
+    // 60 ms in one test) stopped every pipeline lookup of the replay, a freeze at each 20 s autosave.
     plat_mutex_lock(&save_lock);
     if (!P.cache) {   // vk_pipeline_shutdown destroyed it
         plat_mutex_unlock(&save_lock);
@@ -3588,7 +2869,6 @@ static void autosave_once(void) {
     if (!P.ready) return;
     uint64_t now = plat_now_ms();
     if (*(volatile uint32_t *)&K.pend_n && now - last_keys >= 2000) last_keys = now, keys_flush();
-    gfx_shader_record_flush(0);
     if (now - last_ms < 20000) return;
     VkPipeStats s;
     vk_pipeline_stats(&s);
@@ -3615,46 +2895,6 @@ void vk_pipeline_autosave(void) {
         rt_log("vk_pipeline: cannot start the autosave thread; the cache is saved at exit only");
 }
 
-void vk_pipeline_shutdown(void) {
-    if (!P.ready) return;
-    lb_stop();
-    workers_drain();   // jobs point at layouts and Pipe entries freed below
-    vk_pipeline_save();
-    plat_mutex_lock(&P.lock);
-    vkDeviceWaitIdle(P.device);
-    for (int i = 0; i < PIPE_BUCKETS; i++) {
-        for (Pipe *p = pipes[i], *n; p; p = n) {
-            n = p->next;
-            if (p->info.pipeline) vkDestroyPipeline(P.device, p->info.pipeline, NULL);
-            if (p->fast && p->fast != p->info.pipeline) vkDestroyPipeline(P.device, p->fast, NULL);
-            free(p->bindings), free(p);
-        }
-        pipes[i] = NULL;
-    }
-    libs_destroy();
-    for (int i = 0; i < LAYOUT_BUCKETS; i++) {
-        for (Layout *l = layouts[i], *n; l; l = n) {
-            n = l->next;
-            for (int k = 0; k < 2; k++)
-                if (l->tpl[k]) P.tpl_destroy(P.device, l->tpl[k], NULL);
-            vkDestroyPipelineLayout(P.device, l->layout, NULL);
-            for (int h = 0; h < 2; h++)
-                if (l->half[h]) vkDestroyPipelineLayout(P.device, l->half[h], NULL);
-            vkDestroyDescriptorSetLayout(P.device, l->set, NULL);
-            if (l->set1) vkDestroyDescriptorSetLayout(P.device, l->set1, NULL);
-            free(l);
-        }
-        layouts[i] = NULL;
-    }
-    plat_mutex_lock(&save_lock);   // not while the autosave thread copies it
-    if (P.cache) vkDestroyPipelineCache(P.device, P.cache, NULL);
-    P.cache = VK_NULL_HANDLE;
-    plat_mutex_unlock(&save_lock);
-    memset(&P.stats, 0, sizeof P.stats);
-    plat_xchg32(&P.ready, 0);
-    plat_mutex_unlock(&P.lock);
-}
-
 // ---- self-test: census shaders (probe_census_dir, tools/shader_census.py) through gfx_shader_get into pipelines.
 // Graphics pairs are a fragment shader and a vertex shader of the same source file, spread over the census; compute
 // shaders are spread the same way. Every pipeline is built twice (the second call must hit the cache) and the
@@ -3662,220 +2902,3 @@ void vk_pipeline_shutdown(void) {
 
 typedef struct { const char *key, *c1, *src; size_t c1_len, src_len; int stage; uint32_t local[3]; } CensusEntry;
 
-static const char *st_field(const char *from, const char *to, const char *name, size_t *len) {
-    char pat[32];
-    snprintf(pat, sizeof pat, "\"%s\": \"", name);
-    const char *p = strstr(from, pat);
-    if (!p || p >= to) return NULL;
-    p += strlen(pat);
-    const char *e = memchr(p, '"', (size_t)(to - p));
-    if (!e) return NULL;
-    *len = (size_t)(e - p);
-    return p;
-}
-
-static int census_cmp(const void *x, const void *y) {
-    const CensusEntry *a = x, *b = y;
-    size_t n = a->src_len < b->src_len ? a->src_len : b->src_len;
-    int c = memcmp(a->src, b->src, n);
-    if (c) return c;
-    if (a->src_len != b->src_len) return a->src_len < b->src_len ? -1 : 1;
-    return a->stage - b->stage;
-}
-
-static char *census_read(const char *root, size_t *size) {
-    char path[PLAT_PATH_MAX * 2 + 64];
-    snprintf(path, sizeof path, "%s/jobs.json", root);
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *b = malloc((size_t)n + 1);
-    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) free(b), b = NULL;
-    fclose(f);
-    if (b) b[n] = 0, *size = (size_t)n;
-    return b;
-}
-
-static int census_parse(const char *jobs, CensusEntry *out, int max) {
-    int n = 0;
-    for (const char *p = jobs; n < max && (p = strstr(p, "\"job\": {")); p += 8) {
-        const char *end = strstr(p, "\"origin\": ");
-        if (!end) break;
-        size_t kl, sl, cl, rl;
-        const char *k = st_field(p, end, "key", &kl), *s = st_field(p, end, "stage", &sl), *c = st_field(p, end, "c1", &cl),
-                   *r = st_field(p, end, "source", &rl);
-        if (!k || !s || !c || !r || kl != 64) continue;
-        CensusEntry *e = &out[n++];
-        e->key = k, e->c1 = c, e->c1_len = cl / 2, e->src = r, e->src_len = rl;
-        e->stage = !strncmp(s, "vs", sl) ? GFX_STAGE_VS : !strncmp(s, "ps", sl) ? GFX_STAGE_FS : GFX_STAGE_CS;
-        e->local[0] = e->local[1] = e->local[2] = 1;
-        const char *l = strstr(p, "\"local\": [");
-        if (l && l < end) {
-            l += 10;
-            for (int i = 0; i < 3; i++) {
-                while (*l == ' ' || *l == '\n' || *l == '\r' || *l == ',') l++;
-                e->local[i] = (uint32_t)strtoul(l, (char **)&l, 10);
-            }
-        }
-    }
-    return n;
-}
-
-static int hexv(char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; }
-
-// The program the game would hand NVN for a census entry, translated with default answers (as gfx_shader_probe.c).
-static const GfxShader *census_shader(const char *root, const CensusEntry *e) {
-    char path[PLAT_PATH_MAX * 2 + 128];
-    static uint8_t c1[8192];
-    uint8_t control[0x880] = {0};
-    if (e->c1_len > sizeof c1) return NULL;
-    for (size_t b = 0; b < e->c1_len; b++) c1[b] = (uint8_t)(hexv(e->c1[b * 2]) << 4 | hexv(e->c1[b * 2 + 1]));
-    snprintf(path, sizeof path, "%s/code/%.64s.code", root, e->key);
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long body = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    size_t skip = e->stage == GFX_STAGE_CS ? 0 : 0x30, total = skip + (size_t)body;
-    uint8_t *code = calloc(1, total);
-    int ok = code && fread(code + skip, 1, (size_t)body, f) == (size_t)body;
-    fclose(f);
-    if (!ok) return free(code), NULL;
-    uint32_t c1_off = (uint32_t)(total - e->c1_len), length = (uint32_t)total;
-    memcpy(control + 0x700, &c1_off, 4), memcpy(control + 0x704, &length, 4);
-    GfxShaderAnswers a = {0};
-    if (e->stage == GFX_STAGE_CS) for (int k = 0; k < 3; k++) a.local[k] = (uint16_t)e->local[k];
-    const GfxShader *s = gfx_shader_get(e->stage, control, code, total, c1, &a);
-    free(code);
-    return s;
-}
-
-// A state for a census pair: one target per fragment output (RGBA8 of the output's type), D32S8 depth with the test on,
-// alpha blending on target 0, one RGBA32 attribute per vertex input, interleaved in stream 0.
-static void selftest_state(VkPipeState *s, const GfxShader *vs, const GfxShader *fs) {
-    vk_pipe_state_defaults(s);
-    s->vs = vs, s->fs = fs;
-    GfxShaderIo io[32];
-    uint32_t outs = gfx_shader_outputs(fs, io);
-    for (int i = 0; i < 8; i++)
-        if (outs >> i & 1)
-            s->color_fmt[i] = io[i].type == GFX_TYPE_UINT ? NVN_FORMAT_RGBA8UI : io[i].type == GFX_TYPE_SINT ? NVN_FORMAT_RGBA8I
-                                                                                                            : NVN_FORMAT_RGBA8;
-    s->depth_fmt = NVN_FORMAT_DEPTH32F_STENCIL8;
-    s->ds.dt = 1;
-    s->color.blend_en = 1;
-    s->blend[0].src_rgb = NVN_BLEND_FUNC_SRC_ALPHA, s->blend[0].dst_rgb = NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA;
-    s->poly.cull = NVN_FACE_BACK;
-    uint32_t ins = gfx_shader_inputs(vs, io), off = 0;
-    for (int l = 0; l < 16; l++)
-        if (ins >> l & 1) {
-            va_st a = {io[l].type == GFX_TYPE_UINT ? NVN_FORMAT_RGBA32UI : io[l].type == GFX_TYPE_SINT ? NVN_FORMAT_RGBA32I
-                                                                                                      : NVN_FORMAT_RGBA32F,
-                       off, 0};
-            memcpy(&s->vattr[l], &a, sizeof a);
-            off += 16;
-        }
-    s->vstream[0].stride = off ? off : 16;
-}
-
-// Records the dynamic state of a pipeline into a command buffer that is never submitted (validation checks the calls).
-static int selftest_record(const VkPipeState *s, VkPipeline pipe) {
-    VkCtx *c = vk_ctx();
-    VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = c->gfx_family};
-    VkCommandPool pool;
-    if (vkCreateCommandPool(c->device, &pi, NULL, &pool) != VK_SUCCESS) return 0;
-    VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
-                                      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-    VkCommandBuffer cb;
-    int ok = vkAllocateCommandBuffers(c->device, &ai, &cb) == VK_SUCCESS;
-    if (ok) {
-        VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-        vkBeginCommandBuffer(cb, &bi);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        vk_pipeline_set_dynamic(cb, s);
-        ok = vkEndCommandBuffer(cb) == VK_SUCCESS;
-    }
-    vkDestroyCommandPool(c->device, pool, NULL);
-    return ok;
-}
-
-int vk_pipeline_selftest(void) {
-    enum { MAXN = 20000, WANT_PAIRS = 64, WANT_CS = 16 };
-    char root[PLAT_PATH_MAX * 2];
-    if (!vk_init() || !ensure_init()) { printf("vk_pipeline selftest: FAILED: no Vulkan device\n"); return 1; }
-    if (!probe_census_dir(root, sizeof root)) {   // the census folder, build/<version>/shaders
-        printf("vk_pipeline selftest: FAILED: no build/v%d/shaders/jobs.json above the exe\n", rt_game_version);
-        return 1;
-    }
-    size_t size;
-    char *jobs = census_read(root, &size);
-    CensusEntry *e = malloc(sizeof *e * MAXN);
-    int n = jobs && e ? census_parse(jobs, e, MAXN) : 0;
-    if (!n) { printf("vk_pipeline selftest: FAILED: no census entries\n"); free(jobs), free(e); return 1; }
-    qsort(e, (size_t)n, sizeof *e, census_cmp);
-    long err0 = vk_validation_errors_total();
-    VkPipeStats st0;
-    vk_pipeline_stats(&st0);
-
-    // candidate pairs: each fragment shader of a source file with one of the file's vertex shaders (round robin)
-    int (*pairs)[2] = malloc(sizeof *pairs * (size_t)n), np = 0, *cs = malloc(sizeof *cs * (size_t)n), nc = 0;
-    for (int i = 0; i < n;) {
-        int j = i, v0 = -1, nv = 0, nf = 0;
-        for (; j < n && e[j].src_len == e[i].src_len && !memcmp(e[j].src, e[i].src, e[i].src_len); j++) {
-            if (e[j].stage == GFX_STAGE_VS && v0 < 0) v0 = j;   // sorted by stage within a file: vertex shaders first
-            nv += e[j].stage == GFX_STAGE_VS;
-            if (e[j].stage == GFX_STAGE_CS) cs[nc++] = j;
-        }
-        for (int k = i; k < j && nv; k++)
-            if (e[k].stage == GFX_STAGE_FS) pairs[np][0] = v0 + nf++ % nv, pairs[np][1] = k, np++;
-        i = j;
-    }
-    int tried = 0, built = 0, cached = 1, shader_fail = 0, ctried = 0, cbuilt = 0, recorded = 0, varying_fix = 0;
-    for (int t = 0; t < WANT_PAIRS && t < np; t++) {
-        const int *pr = pairs[(long long)t * np / (np < WANT_PAIRS ? np : WANT_PAIRS)];
-        tried++;
-        const GfxShader *vs = census_shader(root, &e[pr[0]]), *fs = census_shader(root, &e[pr[1]]);
-        if (!vs || !fs) { shader_fail++; continue; }
-        if (gfx_shader_inputs(fs, NULL) & ~gfx_shader_outputs(vs, NULL)) varying_fix++;
-        VkPipeState s;
-        selftest_state(&s, vs, fs);
-        GfxShaderAnswers fa = {0};
-        vk_pipeline_answers(&s, NULL, &fa);
-        const VkPipeInfo *info;
-        VkPipeline p = vk_pipeline_graphics(&s, &info);
-        if (!p) continue;
-        built++;
-        const VkPipeInfo *again;
-        if (vk_pipeline_graphics(&s, &again) != p || again != info) cached = 0;
-        if (!recorded) recorded = selftest_record(&s, p);
-    }
-    for (int t = 0; t < WANT_CS && t < nc; t++) {
-        const CensusEntry *c = &e[cs[(long long)t * nc / (nc < WANT_CS ? nc : WANT_CS)]];
-        ctried++;
-        const GfxShader *s = census_shader(root, c);
-        if (!s) { shader_fail++; continue; }
-        const VkPipeInfo *info;
-        VkPipeline p = vk_pipeline_compute(s, &info);
-        if (!p) continue;
-        cbuilt++;
-        const VkPipeInfo *again;
-        if (vk_pipeline_compute(s, &again) != p || again != info) cached = 0;
-    }
-    vk_pipeline_save();
-    VkPipeStats st;
-    vk_pipeline_stats(&st);
-    long errors = vk_validation_errors_total() - err0;
-    printf("vk_pipeline selftest: graphics %d/%d census pairs (%d needed vertex outputs added), compute %d/%d, "
-           "%d shaders failed to translate; layouts %llu (%llu push); cache hits %llu; dynamic state recorded %d; "
-           "validation errors %ld\n",
-           built, tried, varying_fix, cbuilt, ctried, shader_fail, (unsigned long long)(st.layouts - st0.layouts),
-           (unsigned long long)(st.push_layouts - st0.push_layouts), (unsigned long long)(st.hits - st0.hits), recorded,
-           errors);
-    free(pairs), free(cs), free(e), free(jobs);
-    int ok = built > 0 && cbuilt > 0 && cached && recorded && errors == 0;
-    printf("vk_pipeline selftest: %s\n", ok ? "passed" : "FAILED");
-    return ok ? 0 : 1;
-}

@@ -17,18 +17,15 @@
 
 // ---- logging and results
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // "[host] <msg>\n" to the log, one write
-// The log is stderr plus, in a game run whose stderr is not a file, logs\totk.log next to totk.exe (main.c log_open).
+// The log is stderr plus, in a game run whose stderr is not a file, logs\mtf.log next to mtf-recomp.exe (main.c log_open).
 // rt_logf and rt_log_raw write to both without the prefix and the newline: crash reports, fatal errors, guest output.
 void rt_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void rt_vlogf(const char *fmt, va_list ap);
 void rt_log_raw(const char *p, size_t n);
-void rt_log_set_capture_file(void *f);
-void rt_log_capture_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-const char *rt_log_path(void);                  // the log file, NULL when this run writes none
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,
-       RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256, RT_TRACE_CODEC = 512 };
-extern unsigned rt_trace;                       // from TOTK_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present,codec (or all)
-// prof_win.c: TOTK_PROFILE=<path> sampling profiler; TOTK_TRACE=perf frame timing (waits of the render thread)
+       RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
+extern unsigned rt_trace;                       // from MTF_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
+// prof_win.c: MTF_PROFILE=<path> sampling profiler; MTF_TRACE=perf frame timing (waits of the render thread)
 // PERF_TEX: texture uploads on the render thread (deswizzle, decode, staging), PERF_ASTC included
 enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_N };
 void prof_start(void);
@@ -36,11 +33,8 @@ void prof_write(void);                          // idempotent; boot.c calls it b
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
 void perf_end(int kind, uint64_t t0);           // counts render-thread time only
 void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recording) time on any thread, waits inside it included
-// Running totals after a replay: draws and dispatches recorded, descriptor pools taken and created (the per-draw cost
-// and pool line of TOTK_TRACE=perf).
-void perf_replay_totals(uint64_t draws, uint64_t pools_taken, uint64_t pools_created);
 void perf_replay_thread(void);                  // the calling thread replays for the render thread: perf_end counts its waits
-void perf_main_thread(void);                    // the calling thread is the guest main thread (TOTK_PROFILE_MAIN)
+void perf_main_thread(void);                    // the calling thread is the guest main thread (MTF_PROFILE_MAIN)
 // Events per 60-frame window: graphics pipelines finished by the background workers, draws skipped while pending,
 // first texture uploads and re-uploads after CPU writes, draws skipped while a shader translates in the background,
 // draws that waited for their pending pipeline and got it, draws into a target the previous frame did not render that
@@ -52,15 +46,8 @@ enum { PERF_CNT_PIPE_ASYNC, PERF_CNT_PIPE_SKIP, PERF_CNT_TEX_UP, PERF_CNT_TEX_RE
        PERF_CNT_PIPE_WAIT, PERF_CNT_ONESHOT_WAIT, PERF_CNT_PIPE_BUILT, PERF_CNT_TEX_NEW, PERF_CNT_TEX_ALIAS,
        PERF_CNT_WB, PERF_CNT_WB_SKIP, PERF_CNT_N };
 void perf_count(int kind);
-// TOTK_TRACE=perf: a contended acquire of one of the replay's shared locks waited ns (callers time only after a failed
-// try). The perf line counts the waits over 100 us per lock and the longest: slices of parallel passes stalled for
-// milliseconds now and then, and a lock held by another thread is one cause.
-enum { PERF_LOCK_TEXTURE, PERF_LOCK_POOL, PERF_LOCK_MIRROR, PERF_LOCK_N };
-void perf_lock_wait(int lock, uint64_t ns);
 void perf_present(uint64_t frame);
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
-void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
-int vk_backend_selftest(void);                  // replay write-back deduplication cases; failures (vk_backend.c)
 void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)
 // GPU side of the 60-frame perf line, filled by the graphics back end when it set perf_gpu_stats. gpu_ns: GPU busy time
 // since the previous call (timestamp queries, overlaps counted once), have_gpu 0 when the device has no timestamps.
@@ -68,15 +55,16 @@ typedef struct {
     int have_gpu, have_vram, vram_exact;
     uint64_t gpu_ns, gpu_parts, gpu_missed;     // busy time, submission parts timed, parts left untimed
     uint64_t vram_used, vram_budget;
-    uint64_t up_gpu_ns, up_timed, up_batches, up_wait_ns, up_bytes;   // upload batches (vk_memory.c, vk_upload_perf)
+    int have_idle;                              // calibrated timestamps: the idle split below is filled
+    uint64_t idle_ns, starved_ns, queued_ns;    // GPU idle between timed parts; of it, before the part was submitted; submit to start
+    uint64_t idle_gaps, max_gap_ns;             // gaps over 0.5 ms; the longest
 } PerfGpu;
 extern void (*perf_gpu_stats)(PerfGpu *out);
 // The performance overlay (perfmon.c): mode 0 off, 1 fps, 2 full. While it is on, perf_present hands every frame to
-// perfmon_frame; full also takes the event counts (perf_count) and the GPU timestamps as TOTK_TRACE=perf does.
+// perfmon_frame; full also takes the event counts (perf_count) and the GPU timestamps as MTF_TRACE=perf does.
 void perf_set_overlay(int mode);
-int perf_gpu_timing(void);                      // GPU timestamps wanted: TOTK_TRACE=perf or the full overlay
+int perf_gpu_timing(void);                      // GPU timestamps wanted: MTF_TRACE=perf or the full overlay
 void perf_gpu_busy(uint64_t ns);                // GPU busy time of a timed submission part (vk_sync.c, any thread)
-void perf_present_gpu(uint64_t ns);             // GPU time of one present submission (vk_present.c), for the perf line
 uint64_t perf_gpu_busy_total(void);             // its running total (the overlay's GPU time per frame)
 #define RT_RESULT(module, desc) ((uint32_t)(module) | ((uint32_t)(desc) << 9))
 void rt_sha256(const void *p, size_t n, uint8_t out[32]);   // BCrypt; fatal if the provider fails
@@ -86,9 +74,6 @@ void rt_sha256(const void *p, size_t n, uint8_t out[32]);   // BCrypt; fatal if 
 #define RT_KERNEL_BASE 0x7010000000ull
 #define RT_KERNEL_SIZE 0x10000000ull
 #define RT_HOSTFN_BASE 0x7020000000ull
-// The game's application/program id (main.npdm ACI0): Mario Tennis Fever. GetInfo 18 returns it and save data is
-// kept for it alone.
-#define RT_APPLICATION_ID 0x0400D4201C6EA000ull
 #define RT_HOSTFN_SIZE 0x100000ull
 
 // ---- AAPCS64 argument access for host functions (section 2.2)
@@ -109,15 +94,12 @@ typedef struct { const char *name; GuestFn fn; } RtHostEntry;
 #define RT_CAT(a, b) RT_CAT2(a, b)
 // File-scope declarations; fn must be declared before. The loader binds them by symbol name. The entries of every
 // object file meet in one section per kind, which hostfn.c walks: on PE/COFF ".ovr$m", which the linker sorts between
-// hostfn.c's ".ovr$a" and ".ovr$z" markers; on ELF "totk_ovr", which the linker brackets with __start_totk_ovr and
-// __stop_totk_ovr; on Mach-O "__DATA,__totk_ovr", which ld64 brackets with section$start$__DATA$__totk_ovr and
-// section$end$__DATA$__totk_ovr.
+// hostfn.c's ".ovr$a" and ".ovr$z" markers; on ELF "mtf_ovr", which the linker brackets with __start_mtf_ovr and
+// __stop_mtf_ovr.
 #ifdef _WIN32
 #define RT_HOST_SECTION(kind) section("." #kind "$m")
-#elif defined(__APPLE__)
-#define RT_HOST_SECTION(kind) section("__DATA,__totk_" #kind)
 #else
-#define RT_HOST_SECTION(kind) section("totk_" #kind)
+#define RT_HOST_SECTION(kind) section("mtf_" #kind)
 #endif
 #define HOST_OVERRIDE(sym, fn) /* replaces sym in every GOT/GLOB_DAT/ABS64 of every module */                  \
     __attribute__((used, RT_HOST_SECTION(ovr))) static const RtHostEntry RT_CAT(rt_ovr_, __COUNTER__) = {sym, fn}
@@ -125,15 +107,14 @@ typedef struct { const char *name; GuestFn fn; } RtHostEntry;
     __attribute__((used, RT_HOST_SECTION(obs))) static const RtHostEntry RT_CAT(rt_obs_, __COUNTER__) = {sym, fn}
 uint64_t hostfn_register(const char *name, GuestFn fn);    // synthetic address; before hostfn_seal only. The same
                                                            // (name, fn) pair returns the same address
+typedef void (*HostUserFn)(Cpu *c, void *user);
 GuestFn hostfn_override(const char *name);                 // NULL if none
 GuestFn hostfn_observer(const char *name);                 // NULL if none
-void hostfn_add_override(const char *name, GuestFn fn);    // an override outside the linker table (probes); before
                                                            // ldr_load
 const char *hostfn_name(uint64_t addr);                    // name registered at a synthetic address, NULL if none
 void hostfn_seal(void);                                    // build the dispatch table (rt_dispatch_init over every
                                                            // linked module); idempotent; registration ends here
 uint64_t hostfn_calls(void);                               // host-function calls so far, all threads
-void hostfn_report(void);                                  // call count per host function to stderr, busiest first
 int hostfn_table_size(int observers);                      // linked HOST_OVERRIDE (0) / HOST_OBSERVER (1) entries
 const char *hostfn_table_name(int observers, int i);       // symbol of linked entry i, NULL past the end
 uint64_t rt_original(Cpu *c);                              // inside an observer: call the guest definition with the
@@ -151,8 +132,9 @@ typedef struct { uint64_t base, size; } RtRange;
 typedef struct { RtRange aslr, stack, heap, alias, kernel, hostfn; uint64_t pool; } RtGuestLayout;
 typedef struct { uint64_t base, size; uint32_t state, attr, perm, ipc, device, pad; } RtMemoryInfo;   // Horizon layout
 void mem_init(void);                                       // reserve every region; on a collision re-run the process
-                                                           // (up to 20 times, TOTK_REEXEC), then fatal
+                                                           // (up to 20 times, MTF_REEXEC), then fatal
 const RtGuestLayout *mem_layout(void);
+uint64_t mem_host_alloc(uint64_t size, uint64_t align);    // zeroed guest memory for host use (watched); 0 if full
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr);                      // 0x01
 uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm);             // 0x02
 uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at); // 0x03
@@ -180,12 +162,12 @@ int mem_frozen(uint64_t a);                                // the 2 MiB region o
                                                            // since its freeze
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
                                                            // before a kernel write (file read) into guest memory
-void mem_touch(uint64_t a, uint64_t n);                    // commits the lazy guest heap (TOTK_HEAP_LAZY) over [a, a+n)
-                                                           // before a kernel or driver access; no-op otherwise
-void mem_commit_report(const char *when);                  // logs where the process's commit goes (TOTK_MEM_REPORT)
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
                                                            // regions frozen now; freezes and thaws since the last call
 void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse after thread exit
+int mem_guest_readable(uint64_t a, uint64_t n);            // [a, a+n) can be read without a fault: inside a loaded
+                                                           // module or the committed heap answered from the layout,
+                                                           // anything else by plat_mem_readable (an OS query)
 
 // ---- modules (loader.c)
 typedef struct {
@@ -194,23 +176,14 @@ typedef struct {
 } RtLoaded;
 void ldr_load(const char *exefs_dir);                      // load, relocate (overrides applied), seal; once
 int ldr_count(void);
+const RtLoaded *ldr_load_image(const char *name, const uint8_t *image, uint64_t size);   // the runtime-loaded NRO
+                                                           // at its layout base: relocated, sealed; DT_INIT not run
+int ldr_in_layout(const char *name);                       // name has a place in the layout (the NRO was lifted)
 const RtLoaded *ldr_module(int i);                         // order: main, subsdk0, sdk
 uint64_t ldr_symbol(const char *name);                     // exported definition, 0 if none
-uint64_t ldr_plt_stub(const char *module, const char *name); // PLT stub whose GOT slot holds name, 0 if none
 const char *ldr_describe(uint64_t a, char *buf, int n);    // "main+0x1234 (symbol+0x10)", "host <name>", or the address
-// DKB_HDR_TRACE=1 (ov_gfx.c): hdr_trace_on is the setting. hdr_trace_hit counts a call of the named HDR/colour-space
-// API and, for the first 20 and then every 600th, logs "hdr-trace: <name> #<count> from <caller>" and returns 1 so the
-// caller may log its arguments; 0 when off.
-int hdr_trace_on(void);
-int hdr_trace_hit(const Cpu *c, const char *name);
-// Logs the first 64 bytes at p (a guest metadata struct) as hex, "null" or "not readable"; call after a hdr_trace_hit
-// that returned 1.
-void hdr_trace_dump(const char *name, const void *p);
-// DKB_HDR_NATIVE=1 in effect (ov_gfx.c): the setting, on game 3.2.0 with hdr = 1. Read once.
-int hdr_native_on(void);
-// The peak in nits the game last said its HDR picture reaches (SetLayerNextHdrExtendedContentLuminanceRangeMetadata),
-// 0 before it said one (ov_gfx.c). Any thread.
-int hdr_game_content_peak(void);
+uint64_t rt_lifted_function(uintptr_t host);               // guest start of the lifted function holding a host code
+                                                           // address, 0 outside the lifted code (main.c)
 uint8_t *ldr_read_verified(const char *dir, const char *file, size_t *len);   // whole file, SHA-256 checked against
                                                            // modules.c (fatal on mismatch); free() it
 
@@ -219,16 +192,14 @@ typedef struct { const char *file, *sha256; } RtFileHash;
 extern const RtFileHash rt_exefs_sha256[];                 // tools/data/expected-<version>.json "exefs_sha256"
 extern const int rt_exefs_sha256_count;
 extern const char rt_default_exefs[], rt_default_romfs[], rt_default_profile[];
-extern const int rt_game_version;                          // the game build: 111 (1.1.1), 121 (1.2.1) or 143 (1.4.3)
-extern const char rt_game_target[];                        // build target, including dkb100 and dkb458752
-extern const char rt_game_display[];                       // the same version as a release name: 1.4.3, 1.0.0+458752
+extern const int rt_game_version;                          // the game build: 111 (1.1.1)
 extern const char rt_port_version[];                       // VERSION at the build's root: 0.1.0, 0.1.0+973c626 in a release
-#define RT_V111 (rt_game_version == 111)                    // 1.1.1: its own boot constants and data slots
-#define RT_V143 (rt_game_version >= 143)
 
 // ---- kernel (kernel.c)
 typedef struct RtThread RtThread;
 Cpu *kern_cpu(void);                                       // current guest thread's Cpu, NULL on host threads
+void kern_free_cores_note(void);                           // for crash reports: logs that free_cores = 1 lifted the
+                                                           // virtual core gate, nothing when the gate is on
 uint32_t kern_main_thread(Cpu **cpu);                      // main thread object and Cpu for the calling host thread
                                                            // (main.npdm: 1 MiB stack at the top of the stack region,
                                                            // priority 44, core 0); on the main thread: its handle
@@ -237,22 +208,19 @@ void kern_main_stack(uint64_t *base, uint64_t *size);      // the main thread's 
 void kern_run_on_guest_main(void (*fn)(Cpu *c));           // start the guest main host thread, run fn there, join
 int kern_core_away(void);                                  // give the virtual core up around a blocking host wait
 void kern_core_back(int *away);
+void kern_settle_started(uint64_t max_ns);               // started threads reached guest code (ro.c); bounded wait
 void kern_checkpoint(void);                                // preemption point, at every SVC and indirect call
 // A preempt request is pending for the thread (Cpu.thread): its RtThread starts with the flag (kernel.c).
 static inline int kern_preempt_pending(const void *thread) { return __atomic_load_n((const int *)thread, __ATOMIC_RELAXED); }
-// Set once before guest threads start (TOTK_CORE_DIAG, TOTK_ASYNC_PREEMPT): host calls (hostfn.c) and SVCs (svc.c) count their depth in
+// Set once before guest threads start (MTF_CORE_DIAG, MTF_ASYNC_PREEMPT): host calls (hostfn.c) and SVCs (svc.c) count their depth in
 // the thread's second int, so the kernel knows whether a core owner runs game code at the top level.
 extern int kern_host_track;
 static inline int *kern_host_depth(void *thread) { return (int *)thread + 1; }
 void kern_host_left(void *thread);                         // back at depth 0 with a preempt request pending
-int kern_core_diag_on(void);                               // TOTK_CORE_DIAG
-void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_present, every present (also logs the
                                                            // asynchronous preemption counters)
-void kern_sched_report(uint64_t frame);                    // TOTK_TRACE=sched: per-thread time split, on present
+void kern_sched_report(uint64_t frame);                    // MTF_TRACE=sched: per-thread time split, on present
 uint32_t kern_handle_new(int kind, void *obj);             // kind: KERN_SESSION or KERN_TMEM (ipc.c)
 void *kern_handle_get(uint32_t h, int kind);
-struct IpcSession;
-struct IpcSession *kern_session_acquire(uint32_t h);        // retained under the handle lock; release after use
 void kern_handle_close(uint32_t h);                        // CloseHandle from the host side, any thread; fatal on a
                                                            // bad handle
 enum { KERN_SESSION = 4, KERN_TMEM = 5 };
@@ -261,6 +229,7 @@ uint32_t kern_event_readable(uint32_t writable);
 void kern_event_signal(uint32_t writable);
 void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear);   // guest thread only
 void kern_signal_system_event(uint64_t ev);                // any thread
+void kern_clear_system_event(uint64_t ev);                 // any thread; a no-op on an unbound or destroyed event
 int kern_svc(Cpu *c, uint32_t imm);                        // thread/sync SVCs; 1 if handled
 uint64_t kern_now_ns(void);
 extern uint64_t rt_guest_start_ns;   // kern_now_ns when the guest started (boot.c), 0 before
@@ -270,7 +239,6 @@ RtStats rt_stats(void);                                    // host_calls: hostfn
 // ---- IPC (ipc.c)
 int ipc_svc(Cpu *c, uint32_t imm);                         // 0x15, 0x1F, 0x21, 0x22; 1 if handled
 void ipc_handle_closed(int kind, void *obj);               // CloseHandle on a KERN_SESSION/KERN_TMEM handle
-void ipc_session_retain(struct IpcSession *session);        // atomic retain; caller owns a ref or holds the handle lock
 
 // ---- file system (romfs.c / fs_host.c)
 void fs_init(void);                                        // idempotent; paths from rt_config()
@@ -282,28 +250,38 @@ void account_uid(uint64_t out[2]);                         // the local user's n
 // ---- movies (ov_movie.c)
 void movie_tick(Cpu *c);                                   // at every present, on the presenting guest thread: hands
                                                            // decoded movie frames over when due, signals their events
-// ---- game resolution (resolution.c): TOTK_OUTPUT_RES, TOTK_RENDER_SCALE
+// ---- camera speed (camera_speed.c): MTF_STICK_SENS
+float cam_speed_wanted(void);                              // the factor MTF_STICK_SENS asks for, 0.1 to 3
+float cam_speed_applied(void);                             // the factor in effect: 1 until romfs.c serves the pack
+int cam_pack_build(const void *in, size_t n, const void *zsdic, size_t zsdic_n, void **out, size_t *out_n);
+                                                           // Pack/Actor/PlayerCamera.pack.zs with the camera speeds
+                                                           // multiplied, malloc'd; 0 = factor 1 or cannot (logged)
+void cam_pack_served(void);                                // romfs.c serves the multiplied pack
+// ---- game resolution (resolution.c): MTF_OUTPUT_RES, MTF_RENDER_SCALE
 uint64_t res_heap_extra_bytes(void);                       // added to the application pool (mem_init), 2 MiB steps
 uint64_t res_heap_extra_kib(void);                         // added to the HeapDef texture heap and its parent; 0 = none
+uint64_t res_tex_heap_extra_bytes(void);                   // MTF_TEX_HEAP_EXTRA_MB: added to the application pool and
+                                                           // the heap cap (mem_init), 2 MiB steps; 0 = none
+int res_heapdef_tex_grown(const void *in, size_t n);       // the HeapDef table (.byml.zs) grows TextureHeap over the
+                                                           // shipped size (an HD texture pack's)
+int res_heapdef_plain(const void *in, size_t n);           // a readable HeapDef table whose TextureHeap is not
+                                                           // grown (a content mod's)
 int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);   // the HeapDef table (.byml.zs) with
                                                            // the grown heaps, malloc'd; 0 = cannot (logged)
 void res_heapdef_served(void);                             // romfs.c serves the grown table
-int res_heapdef_grown(void);                               // 1 once romfs.c serves it
-const char *res_heapdef_path(void);                        // the game's HeapDef table in the RomFS
 void res_init(void);                                       // after rt_patches_init: the patch page and the sets
-void dkb_wide_init(void);                                  // Bananza-only virtual display and camera patch values
-uint64_t dkb_wide_heap_extra_kib(void);                    // Bananza: what the render-target pool needs added to GSys
-int dkb_wide_output(unsigned out[2]);                      // active mode; optional output gets its size or the stock size
-int res_sizes(unsigned out[2], unsigned scene[2]);         // the output and scene sizes in effect (the game's own
-                                                           // until res_init switched the sets on). Bananza: the game's
-                                                           // upscaler output and input; 0 (both zero) when none ran
-                                                           // in the last 120 presents
-void res_note_upscaler(unsigned in_w, unsigned in_h, unsigned out_w, unsigned out_h);   // Bananza: a dispatch of the
-                                                           // game's upscaler (vk_exec_draw.c op_dispatch)
+float res_dlss_lod_bias(void);                             // MTF_DLSS upscaling: texture LOD bias (<= 0)
+int res_dlss_mode(const char *mode);                       // MTF_DLSS changed while running: new scene size
+void res_fn_hit(uint64_t addr, uint64_t x0);               // main.c fnprof_hit: catches the renderer at start
+void res_present(Cpu *c);                                  // nvnQueuePresentTexture: applies a pending scene size
+void res_sizes(unsigned out[2], unsigned scene[2]);      // the output and scene sizes in effect (the game's own
+                                                           // until res_init switched the sets on)
 int res_is_16x9(unsigned w, unsigned h);                   // within 1% of 16:9 (the test res_init and romfs.c share)
 int res_wants_wide_overlay(const unsigned out[2]);         // not 16:9 on a game version with the camera aspect patch
-void res_wanted(unsigned out[2]);                          // the output size TOTK_OUTPUT_RES asks for
-void res_fov_live(void);                                   // TOTK_FOV to the camera (set fov); on a settings change
+int romfs_shaped_ready(unsigned w, unsigned h);            // romfs-patches-<w>x<h> has a manifest (romfs.c; works
+                                                           // before fs_init)
+void res_wanted(unsigned out[2]);                          // the output size MTF_OUTPUT_RES asks for
+void res_fov_live(void);                                   // MTF_FOV to the camera (set fov); on a settings change
 // ---- code patches (patches.c) and the frame step (frame_rate.c)
 void rt_patches_init(void);                                // after ldr_load: switches from the environment, the patch
                                                            // page committed; logs the sets
@@ -313,18 +291,17 @@ void rt_patch_disable(int set);                            // before the guest s
 void rt_patch_switch(int set, int on);                     // at run time (live settings): each site takes the new code
                                                            // the next time it runs
 void *rt_patch_page(void);                                 // the page the patched code reads (NULL without the table)
-void dkb_camera_init(void);                                // camera patch callbacks, before hostfn_seal
 void frame_step_init(void);                                // after rt_patches_init: the real-time step's first value
 int frame_step_realtime(void);                             // the real-time step is on: presents ignore the interval
 uint64_t frame_step_cap_ns(void);                          // with the real-time step: the shortest frame in ns
 double frame_step_limit_hz(void);                         // the frame rate the limit gives (overlay); 0 unknown
 int64_t frame_step_world_us(void);                         // game time since the loaded save's first frame, -1 before
-                                                           // (TOTK_FPS_LIMIT, live)
+                                                           // (MTF_FPS_LIMIT, live)
 uint64_t frame_step_ticks(void);                           // game time since the first present in 60 Hz ticks (input scripts)
-// In-launch A/B measurement: TOTK_AB=<seconds> splits the world clock (frame_step_world_us) into blocks of that much
+// In-launch A/B measurement: MTF_AB=<seconds> splits the world clock (frame_step_world_us) into blocks of that much
 // game time in the order A B B A (repeated); rt_ab() is 1 in the B blocks, 0 in A blocks, before the world clock and
-// without TOTK_AB. rt_knob(name, def) reads the switch
-// TOTK_<name> once per call (def when unset): 0 off, 2 for "ab" (on in the B blocks only), 1 for anything else;
+// without MTF_AB. rt_knob(name, def) reads the switch
+// MTF_<name> once per call (def when unset): 0 off, 2 for "ab" (on in the B blocks only), 1 for anything else;
 // callers keep it and test it with RT_KNOB_ON. The perf line counts the B frames of its window (tools/ab_summary.py
 // compares the windows that are wholly A or wholly B).
 int rt_ab(void);
@@ -333,37 +310,30 @@ int rt_knob(const char *name, const char *def);
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)
 // ---- boot (boot.c, main.c)
-typedef struct { const char *exefs, *romfs, *profile; int boot; double seconds; const char *shot, *gpu; } RtConfig;
+typedef struct { const char *exefs, *romfs, *profile; int boot, capture_nro; double seconds; const char *shot, *gpu; } RtConfig;
                                                            // romfs: directory with romfs.bin and index.json;
                                                            // frames: --frames N (0 = no limit); shot: --shot
-                                                           // PATH; gpu: TOTK_GPU
+                                                           // PATH; gpu: MTF_GPU
 const RtConfig *rt_config(void);
-// 8-bit RGBA PNG with stored deflate blocks (boot.c); stops with rt_fatal when the file cannot be written.
-void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
 void rt_boot_event(const char *what, Cpu *c, const char *detail);   // checkpoint log; "nvn" ends --boot
 void rt_boot(void);                                        // boot.c
-// Modes of totk.exe. main.c has run mem_init and parsed the paths; each mode calls ldr_load itself if it needs the
+// Modes of mtf-recomp.exe. main.c has run mem_init and parsed the paths; each mode calls ldr_load itself if it needs the
 // modules, registers its host functions, then seals (hostfn_seal, or implicitly at the first rt_call). Return the
 // process exit code.
 int probe_cfg(void);                                       // cfg_probe.c
 int probe_dpi(void);                                       // dpi_probe_win.c (Windows only)
-int probe_loader(void), probe_kernel(void), probe_ipc(void), probe_ipc_lifetime(void), probe_services(void), probe_fs(void);
+int probe_mods(void);                                      // mods_probe.c
+void discord_init(void);                                   // discord_rpc.c: the Rich Presence thread, game runs only
+void playtime_init(void);                                  // playtime.c: the play time thread, game runs only
+void playtime_save(void);                                  // playtime.c: writes <profile>/playtime.txt; at exit
+void rt_exit_saves(void);                                  // gfx_present.c: what every way out saves first
+int playtime_get(uint64_t *total_s, uint64_t *session_s); // playtime.c: all runs and this one; 0 without a profile
+int probe_playtime(void);                                  // playtime.c: the file, the ticks and the save
+int probe_discord(void);                                   // discord_rpc.c
+int probe_loader(void), probe_kernel(void), probe_services(void);
 int probe_gfx_abi(void);                                   // gfx_abi_probe.c
-int probe_vkdevice(void);                                 // vk_device.c
 int probe_nvn(void), probe_nvn_tex(void);                  // nvn_probe.c, nvn_tex_probe.c
 int probe_window(void);                                    // gfx_window_probe.c
 int probe_shader(void);                                    // gfx_shader.c
-int probe_geometry_shader(void);                           // gfx_geometry_probe.c: original GS service/cache roundtrip
-int probe_vkgeometry(void);                                // vk_geometry_probe.c: original ordinary-GS replay/readback
-int probe_vkgeometry_passthrough(void);                    // original portable-passthrough replay/readback
-int probe_vkgeometry_ordering(void);                       // original portable producer/barrier/indirect in one submission
-int probe_census_dir(char *dir, size_t n);                 // gfx_shader_probe.c: build/<version>/shaders for the probes
 int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // tex_probe.c, vk_exec_probe.c, astc_probe.c
-int probe_vkcopy_astc(void);                              // vk_copy_probe.c: original ASTC copy replay/readback
-int probe_vkpool(void);                                   // vk_pool_probe.c: original descriptor-pool sampling
-int probe_vkreset(void);                                  // vk_reset_probe.c: original indirect reset ordering
-int probe_vkclear(void);                                                  // vk_clear_probe.c
 int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
-int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
-int vk_pipeline_translate_shaders(void);                  // vk_pipeline.c: --translate-shaders (installer/bananza.py)
-int vk_pipeline_warm_shaders(void);                       // vk_pipeline.c: --warm-shaders (tools/build_game.py)

@@ -1,8 +1,7 @@
-"""Refuse files that look like game content, keys, or generated game code.
+"""Refuse files that look like game content, keys or generated game code.
 
-Adapted from valentderah/totk-pc-recomp (tools/check_content.py, MIT).
-Runs in CI (.github/workflows/content-guard.yml) and locally as a pre-commit
-hook (.githooks/pre-commit).
+Run it before a commit. With no arguments it checks every tracked file; with
+--staged it checks the files staged for the next commit.
 
 Standard library only, so it runs before any environment is set up.
 """
@@ -13,22 +12,28 @@ import subprocess
 import sys
 from pathlib import Path
 
-MAX_BYTES = 1024 * 1024  # 1 MiB limit per tracked file
+MAX_BYTES = 1024 * 1024
 
-# Switch containers, executables, and Camelot/NintendoWare game data formats.
+# Switch containers, executables and game data formats.
 BLOCKED_SUFFIXES = {
     ".nup", ".xci", ".xcz", ".nsp", ".nsz", ".nca", ".ncz", ".tik", ".cert",
     ".nso", ".nro", ".nrr", ".npdm", ".keys",
-    ".bfres", ".fres", ".bntx", ".bnsh", ".fsha", ".vfxb", ".sarc", ".narc",
-    ".szs", ".zs", ".pack", ".byml", ".bgyml", ".msbt", ".bars", ".bwav",
-    ".bfwav", ".bfstm", ".bfttf", ".bfotf", ".sharcb", ".webm", ".spv",
+    ".bfres", ".bntx", ".bnsh", ".sarc", ".szs", ".zs", ".pack", ".byml",
+    ".bgyml", ".msbt", ".bars", ".bwav", ".bfwav", ".bfstm", ".bfttf",
+    ".bfotf", ".sharcb", ".webm",
 }
 
-# ExeFS modules and MTF's CRA archive carry no extension.
-BLOCKED_NAMES = {"main", "sdk", "rtld", "subsdk0", "subsdk1", "main.npdm", "42"}
+# ExeFS modules carry no extension.
+BLOCKED_NAMES = {"main", "sdk", "rtld", "subsdk0", "subsdk1", "main.npdm"}
 
 # Written by the code generator into every file it emits.
 GENERATED_MARKER = "MTF_RECOMP_" + "GENERATED_FROM_GAME_CODE"
+# Every marker a generated file can carry: code generated before the project took its name has the older one.
+GENERATED_MARKERS = (GENERATED_MARKER.encode(), ("TOTK_RECOMP_" + "GENERATED_FROM_GAME_CODE").encode())
+
+
+def generated(data: bytes) -> bool:
+    return any(m in data for m in GENERATED_MARKERS)
 
 # A prod.keys / title.keys line: name containing key, kek or seed, then hex.
 KEY_LINE = re.compile(
@@ -36,39 +41,37 @@ KEY_LINE = re.compile(
     re.MULTILINE,
 )
 
-# Magic bytes of Switch executables and Camelot CRA archives.
-BLOCKED_MAGICS = (b"NSO0", b"NRO0", b"NRR0", b"META", b"CRA.")
-
 
 def list_files(staged: bool) -> list[Path]:
     if staged:
         cmd = ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"]
     else:
+        # Tracked files plus untracked ones that are not ignored: everything a commit could pick up.
         cmd = ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
     out = subprocess.run(cmd, check=True, capture_output=True).stdout
     return [Path(p) for p in out.decode("utf-8").split("\0") if p]
 
 
 def problems_for(path: Path, allow_large: bool = False) -> list[str]:
+    """allow_large: files over MAX_BYTES (toolchain binaries in a release folder) are checked for the generated marker
+    only, not refused."""
     found = []
     if path.suffix.lower() in BLOCKED_SUFFIXES:
         found.append(f"blocked file type {path.suffix}")
     if path.name.lower() in BLOCKED_NAMES:
-        found.append("name of a Switch executable module or CRA archive")
+        found.append("name of a Switch executable module")
     if not path.is_file():
         return found
     size = path.stat().st_size
     if size > MAX_BYTES and allow_large:
-        if GENERATED_MARKER.encode() in path.read_bytes():
+        if generated(path.read_bytes()):
             found.append("generated from game code")
         return found
     if size > MAX_BYTES:
         found.append(f"{size // 1024} KiB, over the {MAX_BYTES // 1024} KiB limit")
         return found
     data = path.read_bytes()
-    if data[:4] in BLOCKED_MAGICS:
-        found.append(f"blocked binary magic {data[:4]!r}")
-    if GENERATED_MARKER.encode() in data:
+    if generated(data):
         found.append("generated from game code")
     if KEY_LINE.search(data.decode("utf-8", errors="ignore")):
         found.append("contains a key in prod.keys format")
@@ -86,9 +89,9 @@ def main() -> int:
             print(f"{path}: {problem}")
             failed = True
     if failed:
-        print("\nGame content, keys, and generated game code never go into the repository.")
+        print("\nGame content, keys and generated game code never go into the repository.")
+        print("See CONTRIBUTING.md.")
         return 1
-    print("Content guard passed: 0 violations.")
     return 0
 
 

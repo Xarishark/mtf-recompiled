@@ -1,4 +1,4 @@
-# Adapted from LAS Recomp tools/lifter.py @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
+# Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 """AArch64 -> C static recompiler.
 
 Integer, memory, and control flow are translated to C. FP/SIMD instructions (and CRC32) are
@@ -294,14 +294,14 @@ class Lifter:
             nz, rt = bits(w, 24, 1), bits(w, 0, 5)
             t = pc + sext(bits(w, 5, 14), 14) * 4
             return Insn('bcond', target=t, cond=f'(({X(rt)} >> {b}) & 1) {"!=" if nz else "=="} 0')
+        # Switch 2 binaries use the pointer-authenticated return encodings. Guest modules are
+        # loaded below 2^39 and their pointers do not carry host PAC bits, so these are a
+        # normal guest return. Keep this case ahead of the strict BR/BLR/RET field check.
+        if w in (0xD65F0BFF, 0xD65F0FFF):  # RETAA / RETAB
+            return Insn('ret')
         if bits(w, 25, 7) == 0b1101011:  # branch register
             opc, rn = bits(w, 21, 4), bits(w, 5, 5)
-            op3 = bits(w, 10, 6)
-            if bits(w, 16, 5) == 31 and op3 in (2, 3) and opc in (0, 1, 2, 8, 9):
-                # Pointer authentication (ARMv8.3, Switch 2): BRA{A,B}[Z], BLRA{A,B}[Z], RETA{A,B}. The host never
-                # signs pointers (PACIxSP and friends are hints, so NOPs), so these branch like BR/BLR/RET.
-                opc &= 7
-            elif bits(w, 16, 5) != 31 or op3 or bits(w, 0, 5):
+            if bits(w, 16, 5) != 31 or bits(w, 10, 6) or bits(w, 0, 5):
                 raise Unsupported('branch reg variant')
             if opc == 0:
                 return Insn('br', target=X(rn))
@@ -325,6 +325,9 @@ class Lifter:
         L = bits(w, 21, 1)
         op0, op1, crn, crm, op2, rt = (bits(w, 19, 2), bits(w, 16, 3), bits(w, 12, 4),
                                        bits(w, 8, 4), bits(w, 5, 3), bits(w, 0, 5))
+        if w in (0xD503237F, 0xD50323FF, 0xD503219F, 0xD50321DF,
+                 0xD50323BF, 0xD50320FF):  # PACIBSP/AUTIBSP, AUTIA/B1716, AUTIASP, XPACLRI
+            return Insn('op', '/* pointer authentication: guest pointers are untagged */')
         if op0 == 0 and not L:
             if crn == 2 and op1 == 3 and rt == 31:  # hints
                 return Insn('op', '/* hint */')
@@ -394,7 +397,7 @@ class Lifter:
 
     def stg(self, w):
         """STG (post-index, signed offset, pre-index). Horizon runs without MTE, so storing an allocation tag
-        changes no memory; only the base writeback remains (1.4.3 sdk+0x640050)."""
+        changes no memory; only the base writeback remains."""
         mode, rn = bits(w, 10, 2), bits(w, 5, 5)
         if mode == 2:
             return Insn('op', '/* stg */')
@@ -467,8 +470,6 @@ class Lifter:
         p, v = f'({t} *)(uintptr_t)({XS(rn)})', f'({t}){X(rs)}'
         order = ('__ATOMIC_RELAXED', '__ATOMIC_RELEASE', '__ATOMIC_ACQUIRE', '__ATOMIC_ACQ_REL')[A << 1 | R]
         if o3:
-            if opc == 4 and A and not R and rs == 31:  # LDAPR{B,H} (RCpc, ARMv8.3): acquire load
-                return Insn('op', set_reg(size == 3, rt, f'__atomic_load_n({p}, __ATOMIC_ACQUIRE)'))
             if opc:
                 raise Unsupported('ldapr')
             expr = f'__atomic_exchange_n({p}, {v}, {order})'
@@ -525,6 +526,9 @@ class Lifter:
             kind = bits(w, 10, 2)
             if bits(w, 21, 1):
                 if kind == 0:
+                    if (bits(w, 23, 1) and not bits(w, 22, 1) and bits(w, 16, 5) == 31
+                            and bits(w, 15, 1) and bits(w, 12, 3) == 4):
+                        return self.ldapr(w)
                     return self.atomic(w)
                 if kind != 2:
                     raise Unsupported('ldst reg pac')
@@ -564,6 +568,16 @@ class Lifter:
         if load:
             parts.append(load)
         return Insn('op', '{ ' + ' '.join(parts) + ' }')
+
+    def ldapr(self, w):
+        """LDAPR[B/H]: RCpc acquire load; host acquire is a safe stronger ordering."""
+        size, opc, rn, rt = bits(w, 30, 2), bits(w, 22, 2), bits(w, 5, 5), bits(w, 0, 5)
+        if opc != 2:
+            raise Unsupported('ldapr signed variant')
+        nbits = 8 << size
+        pointer = f'(const uint{nbits}_t *)(uintptr_t)({XS(rn)})'
+        value = f'__atomic_load_n({pointer}, __ATOMIC_ACQUIRE)'
+        return Insn('op', set_reg(size == 3, rt, value))
 
     def ldst_simd(self, w, pc):
         """FP/SIMD loads and stores are passed through as asm; GPR address regs are remapped."""
@@ -680,10 +694,13 @@ class Lifter:
         if op2 == 6:
             opcode = bits(w, 10, 6)
             if bits(w, 30, 1):  # 1-source
-                if bits(w, 16, 5) == 1 and sf and opcode <= 17:
-                    # PAC*/AUT* (opcode 0-15) and XPAC{I,D} (16, 17): pointers are never signed on the host, so
-                    # signing, authenticating and stripping all leave the register as it is.
-                    return Insn('op', '/* pac */')
+                # PACIA Xd, Xn and XPACI Xd occur in this exact encoding class. Under this
+                # runtime's low-address guest map, signing/stripping leaves the raw pointer
+                # unchanged. Other PAuth variants remain unsupported until observed.
+                if sf and opcode == 0 and (w & 0xFFFFFC00) == 0xDAC10000:
+                    return Insn('op', '/* PACIA: guest pointers are untagged */')
+                if sf and opcode == 16 and (w & 0xFFFFFC00) == 0xDAC14000:
+                    return Insn('op', '/* XPACI: guest pointers are untagged */')
                 if bits(w, 16, 5):
                     raise Unsupported('dp1 opcode2')
                 a = R(sf, rn)

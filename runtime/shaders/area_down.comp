@@ -1,0 +1,27 @@
+#version 450
+// An area filter for a picture larger than the window (runtime/vk_fsr.c): each window pixel averages sixteen bilinear
+// taps spread over the part of the picture it covers. The blit's single bilinear tap reads only 2x2 texels, which at a
+// 4K picture in a 1440p window skips texels, so thin text and edges broke up.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Params {
+    vec4 a;   // crop width and height, texture width and height
+    vec4 b;   // window picture width and height, crop x and y
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.b.x) || p.y >= int(pc.b.y)) return;
+    vec2 step_ = pc.a.xy / pc.b.xy;   // picture texels per window pixel
+    vec2 texel = 1.0 / pc.a.zw;
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            vec2 at = pc.b.zw + (vec2(p) + (vec2(x, y) + 0.5) / 4.0) * step_;
+            sum += textureLod(src, at * texel, 0.0).rgb;
+        }
+    imageStore(dst, p, vec4(sum / 16.0, 1.0));
+}

@@ -1,6 +1,6 @@
-// Adapted from LAS Recomp runtime/simd_fp.h @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
 // FP helpers for one precision; included twice by simd.h (F = s/float, d/double). No include guard.
 // Scalar entry points take/return T, vector ones VT (all lanes; callers zero the unused half for Q=0).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 
 #define FN(x) SIMD_CAT(x, F)
 #define SGN ((U)1 << (NB - 1))

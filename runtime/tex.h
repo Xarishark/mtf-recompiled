@@ -8,7 +8,7 @@
 #include "nvn_tex.h"
 #include "vk.h"
 
-// ---- tex_deswizzle.c (MacNativeGames nvn_deswizzle.c, MIT) ----
+// ---- tex_deswizzle.c ----
 // Block-linear <-> linear for one level and layer of a texture. The linear side is laid out by block rows: dst_pitch
 // bytes per row (>= row bytes of the level), compressed formats one block row per row, 3D textures slice k at
 // dst + k * dst_pitch * block rows. LINEAR / LINEAR_RENDER_TARGET storage is copied by pitch. Multisampled and BUFFER
@@ -31,7 +31,7 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer, uin
 void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
                  unsigned th, unsigned td, int to_linear);
 
-// ---- tex_astc.c (LAS Recomp runtime/nvn/astc.c, MIT) ----
+// ---- tex_astc.c ----
 // ASTC LDR 2D to RGBA8, bit-exact with astcenc's 8-bit decode. blocks: row-major 16-byte blocks covering
 // ceil(width/bw) x ceil(height/bh); rgba_out: width*height*4 bytes. srgb only selects the sRGB endpoint expansion.
 // Error blocks and HDR content decode to magenta.
@@ -42,7 +42,7 @@ bool astc_decode_block(const uint8_t block[16], uint32_t bw, uint32_t bh, bool s
 void astc_decode_ldr_mt(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh, bool srgb,
                         uint8_t *rgba_out);
 
-// ---- vk_formats.c (LAS Recomp runtime/nvn/vulkan/textures.c format table, MIT) ----
+// ---- vk_formats.c ----
 typedef struct TexVkFormat {
     VkFormat vk;                  // format of the image created on this GPU
     VkFormat ideal;               // format the NVN format maps to by itself; differs from vk after a fallback
@@ -54,14 +54,14 @@ typedef struct TexVkFormat {
     uint8_t astc_bw, astc_bh;     // nonzero: ASTC decoded into vk (RGBA8, same colour space) by vk_astc.c or tex_astc.c;
                                   // zero for native ASTC (vk == ideal, raw blocks as for BC)
     uint8_t astc_srgb;
-    uint8_t astc_bc;              // ASTC decoded and then encoded to BC3 (vk BC3, TOTK_ASTC_BC; vk_astc.c)
+    uint8_t astc_bc;              // ASTC decoded and then encoded to BC3 (vk BC3, MTF_ASTC_BC; vk_astc.c)
     uint8_t depth, stencil;       // aspect flags of depth / stencil formats
     const char *note;             // why a fallback or an expansion was chosen; NULL when the mapping is direct
     const char *reason;           // unmapped formats only: why there is no Vulkan format
 } TexVkFormat;
 
 // 1 when nvn_format (an NVNformat value) has a Vulkan mapping, 0 otherwise (out->reason says why). The mapping is
-// fixed per device: ASTC decodes to RGBA8 unless vk_astc_native (TOTK_ASTC) takes the format as it is, D24S8 is
+// fixed per device: ASTC decodes to RGBA8 unless vk_astc_native (MTF_ASTC) takes the format as it is, D24S8 is
 // D32S8, DEPTH24 is D32. Whether the GPU reports the features is a separate question (tex_vk_format_supported).
 int tex_vk_format(int nvn_format, TexVkFormat *out);
 // 1 when vk_ctx()->phys reports every bit of f->need for f->vk in optimal tiling. Needs vk_init().

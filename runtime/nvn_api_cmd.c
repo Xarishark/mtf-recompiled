@@ -1,10 +1,6 @@
 // NVN front end, command-buffer slice: command buffers, their memory, recording
 // as op records (nvn_obj.h), recording copies behind command handles, and the submit-time resolution of deferred binds
-// (nvn_submit_prepare, called by nvnQueueSubmitCommands in nvn_api_core.c). Ported from MacNativeGames
-// games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou; origin d2r-mobile),
-// lines 647-1062, 1261-1286, 1486-1760 and 1975-1990, and the *Deferred and memory-callback entry points of
-// totk_nvn_ext.c in the same directory. Metal, mach, the translation thread, Apple diagnostics, the per-frame
-// statistics and the long-session sweeps (copy marks in control memory, texture pin sweep) dropped.
+// (nvn_submit_prepare, called by nvnQueueSubmitCommands in nvn_api_core.c).
 //
 // Records are written into a growable host buffer per command buffer, never into the game's command memory: games hand
 // the same command memory to several command buffers recording at once (budgeted for real NVN encodings), and our
@@ -12,21 +8,22 @@
 // recording into host memory; the handle is that copy (a flat OP_BEGIN ... OP_END sequence) and lives until the game
 // adds the same control memory again. CallCommands and CopyCommands inline the called recording, so copies hold no
 // OP_CALL or OP_JUMP.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
+#include "diag_watch.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
-#include "nvn_mode_trace.h"
 #include "platform/platform.h"
 
 #define CMD_MAGIC MAGIC('C', 'M', 'D', 'B')
 #define COPY_MAGIC 0x59504f43444d43ull     // "CMDCOPY": prefix of a live recording copy
-#define REC_MAGIC 0x4345524d444d43ull      // "CMDMREC": prefix of a live recording buffer
 #define OP_RESERVE 24                       // room always kept at the end of the recording buffer
 #define MIN_COMMAND_SIZE 512                // NVN_DEVICE_INFO_COMMAND_BUFFER_MIN_COMMAND_SIZE (nvn_api_core.c devinfo)
 #define MIN_CONTROL_SIZE 256                // NVN_DEVICE_INFO_COMMAND_BUFFER_MIN_CONTROL_SIZE
@@ -37,9 +34,17 @@ static cmd_t *cmd_of(const Cpu *c) { return arg_p(c, 0); }
 
 // ---------- memory callbacks
 // NVN calls the game's memory callback when a recording needs command or control memory and none is left. Records
-// live in host memory here, so the callback is called only where the hardware certainly would: a recording starts
-// without any command memory, or ends without any control memory. It runs on the calling guest thread through
-// rt_call; whatever memory it adds is accounted. Set{Command,Control}MemoryCallbackEnabled(false) suppress it.
+// live in host memory here; the memory the game gives is accounted (hw_used, ctl_used) and the callback is called
+// where that accounting runs out: before a command that does not fit the command memory left (cmd_need), at the end
+// of a recording that does not fit the control memory left, and when a recording starts without any command memory.
+// It runs on the calling guest thread through rt_call; AddCommandMemory / AddControlMemory reset the accounting.
+// Set{Command,Control}MemoryCallbackEnabled(false) suppress it; MTF_CMD_MEM_CB=0 keeps only the no-memory cases.
+//
+// MTF needs the mid-recording calls: it records each material's draws into command lists with 512-byte
+// command and 256-byte control chunks, and keeps a list's handle only if Get{Command,Control}MemoryUsed read around
+// the recording grew by 9 bytes or more (nro+0x1257224); otherwise it stores a null handle and the draw loop calls
+// that (nro+0x11a6d34). Without the callback both readings stopped at the chunk size, the growth read 0, and about
+// one list in eight was dropped every frame: the players' colour passes among them.
 enum { CB_NO_COMMAND = 1, CB_NO_CONTROL = 2 };
 static PlatMutex cb_lock = PLAT_MUTEX_INIT;
 static nvn_hmap cb_off = {.klen = 8};       // command buffer -> disabled callback kinds | 0x100
@@ -67,89 +72,184 @@ static void memory_event(Cpu *c, cmd_t *o, int event, uint64_t min) {
     NVN_LOG("command buffer %p: memory callback %p (%s memory, %llu bytes)", (void *)o, (void *)o->cb,
             event == NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY ? "command" : "control",
             (unsigned long long)min);
+    // The callback can come in the middle of a command (cmd_need), whose arguments are still read from c after it:
+    // the registers a call may change (AAPCS64: x0-x18, x30, the flags, the vector registers) are kept around it.
+    uint64_t x[31], nzcv = c->nzcv;
+    __uint128_t v[32];
+    memcpy(x, c->x, sizeof x);
+    memcpy(v, c->v, sizeof v);
     rt_call(c, (uint64_t)(uintptr_t)o->cb, 4, (uint64_t)(uintptr_t)o, (uint64_t)event, min,
             (uint64_t)(uintptr_t)o->cb_data);
+    memcpy(c->x, x, sizeof x);
+    memcpy(c->v, v, sizeof v);
+    c->nzcv = nzcv;
+}
+
+static int mid_recording_cb(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("MTF_CMD_MEM_CB");
+    return on;
+}
+
+// Before n more bytes of command memory are accounted while recording: the callback when they do not fit.
+static void cmd_need(cmd_t *o, uint64_t n) {
+    if (!o->recording || !o->game_size || o->hw_used + n <= o->game_size || !mid_recording_cb()) return;
+    Cpu *c = kern_cpu();
+    if (c) memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, n > MIN_COMMAND_SIZE ? n : MIN_COMMAND_SIZE);
 }
 
 // ---------- recording buffer
-#define SEG_TOK(o) ((uint32_t)(((uintptr_t)(o) >> 3) & 0x7fffffffu))
-#define SEG_OWNED(o) ((o)->seg && (o)->seg_tok == SEG_TOK(o))
-// The prefix of a copy and of a recording buffer (see "recording copies" below).
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, block; } copy_prefix;
-_Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) {
     op_hdr h = {op, size};
     memcpy(p, &h, sizeof h);
 }
 
-// The recording buffer is a copy block (copy_block below) with the copy's prefix in front, so EndRecording can hand
-// it over as the copy (take_recording). rec_buffer: one with room for at least cap bytes after the prefix, and the
-// room in *room.
-static uint8_t *rec_buffer(size_t cap, size_t *room);
-static void rec_buffer_free(uint8_t *seg);
-static int rec_owned(const cmd_t *o);
+// A game may initialize and finalize command buffers about 2000 times a second while a scene loads and several times a
+// frame in play, and its two largest per-frame recordings take 1-2 MiB. Freeing the recording buffer at Finalize made
+// every new recording grow again from 64 KiB through up to five reallocations and copies, the last ones fresh 1-2 MiB
+// blocks the heap takes from the system: new commit and zero-filled pages twice a frame. Those growths were most of the
+// process's new commit requests, so when the system ran short for a moment (a Depths load at render scale 200 on 16 GB)
+// a 1 MiB growth was the allocation that failed. Finalized buffers therefore wait in a small pool for the next
+// recording, and a failed allocation waits for memory instead of ending the game (realloc_wait).
+#define POOL_SLOTS 16
+#define POOL_MAX_BYTES ((size_t)4 << 20)   // a larger buffer (a recording that inlined a big one) goes back to the heap
+static PlatMutex pool_lock = PLAT_MUTEX_INIT;
+static struct { uint8_t *p; size_t size; } pool[POOL_SLOTS];
+static uint32_t npool;
 
-// Diagnostic for a seg that is no buffer of ours: a command buffer object the game overwrote or copied shows a wrong
-// magic or more used than its old size.
-static void seg_check(const cmd_t *o, size_t need) {
-    if (!o->seg) return;
-    const copy_prefix *pf = (const copy_prefix *)o->seg - 1;
-    size_t size = (size_t)(o->end - o->seg), used = (size_t)(o->cur - o->seg);
-    if (o->cur < o->seg || o->cur > o->end || size + sizeof *pf != (size_t)pf->block)
-        rt_fatal("nvn: corrupt recording buffer (command buffer %p, magic %#x, buffer %p of %zu bytes, %zu used, %zu "
-                 "asked, block %llu)", (const void *)o, o->magic, (const void *)o->seg, size, used, need,
-                 (unsigned long long)pf->block);
+// The largest pooled buffer and its size, or NULL: the largest, so the big per-frame recordings stop growing once the
+// pool holds enough buffers of their size.
+static uint8_t *pool_take(size_t *size) {
+    uint8_t *p = NULL;
+    plat_mutex_lock(&pool_lock);
+    if (npool) {
+        uint32_t best = 0;
+        for (uint32_t i = 1; i < npool; i++)
+            if (pool[i].size > pool[best].size) best = i;
+        p = pool[best].p;
+        *size = pool[best].size;
+        pool[best] = pool[--npool];
+    }
+    plat_mutex_unlock(&pool_lock);
+    return p;
+}
+
+// Keeps a finalized buffer when the pool has room or holds a smaller one (which is freed instead).
+static void pool_put(uint8_t *p, size_t size) {
+    if (!p) return;
+    if (size <= POOL_MAX_BYTES) {
+        plat_mutex_lock(&pool_lock);
+        if (npool < POOL_SLOTS) {
+            pool[npool].p = p;
+            pool[npool++].size = size;
+            p = NULL;
+        } else {
+            uint32_t small = 0;
+            for (uint32_t i = 1; i < npool; i++)
+                if (pool[i].size < pool[small].size) small = i;
+            if (pool[small].size < size) {
+                uint8_t *drop = pool[small].p;
+                pool[small].p = p;
+                pool[small].size = size;
+                p = drop;
+            }
+        }
+        plat_mutex_unlock(&pool_lock);
+    }
+    free(p);
+}
+
+static void pool_drain(void) {
+    plat_mutex_lock(&pool_lock);
+    while (npool) free(pool[--npool].p);
+    plat_mutex_unlock(&pool_lock);
+}
+
+// realloc that waits out a short commit shortage: Windows refuses commit beyond the current limit while it grows a
+// system-managed page file, so the same request succeeds a moment later, and a stall of some frames is better than
+// ending the game. Frees the pooled buffers first. NULL only after about 30 s without memory; the caller ends the game.
+// Never called with a lock held.
+static void big_drain(void);
+
+static void *realloc_wait(void *old, size_t n, const char *what) {
+    void *p = realloc(old, n);
+    if (p) return p;
+    pool_drain();
+    big_drain();
+    static uint32_t reports;
+    int report = __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 8;
+    if (report) {
+        double proc, used, limit;
+        plat_commit_info(&proc, &used, &limit);
+        rt_log("nvn: %s of %zu bytes failed (memory commit: this process %.0f MB, the system %.0f of %.0f MB); waiting "
+               "for memory", what, n, proc, used, limit);
+    }
+    uint64_t t0 = plat_now_ms();
+    while (plat_now_ms() - t0 < 30000) {
+        plat_sleep_ms(10);
+        if ((p = realloc(old, n))) {
+            if (report)
+                rt_log("nvn: %s of %zu bytes succeeded after %llu ms", what, n,
+                       (unsigned long long)(plat_now_ms() - t0));
+            return p;
+        }
+    }
+    return NULL;
 }
 
 static void cmd_reserve(cmd_t *o, size_t need) {
-    if (o->seg && SEG_OWNED(o) && o->cur + need + OP_RESERVE <= o->end) return;
-    int twin = o->seg && !SEG_OWNED(o);
-    if (twin) {   // a copied cmd_t: its seg may be a handed-over copy or already freed, so it is not read
-        rt_log("nvn: command buffer %p records on a buffer it does not own; starting a new one", (void *)o);
-        o->seg = o->cur = o->end = NULL;
-    } else {
-        seg_check(o, need);
+    if (o->seg && o->cur + need + OP_RESERVE <= o->end) return;
+    if (!o->seg) {   // the first record since Initialize: a pooled buffer when one waits
+        size_t size = 0;
+        uint8_t *p = pool_take(&size);
+        if (p) {
+            o->seg = o->cur = p;
+            o->end = p + size;
+            if (need + OP_RESERVE <= size) return;
+        }
     }
     size_t used = o->seg ? (size_t)(o->cur - o->seg) : 0;
     size_t cap = o->seg ? (size_t)(o->end - o->seg) : 0;
-    if (!cap) cap = 48 << 10;
+    if (!cap) cap = 64 << 10;
     while (used + need + OP_RESERVE > cap) cap *= 2;
-    size_t room;
-    uint8_t *b = rec_buffer(cap, &room);
-    if (used) memcpy(b, o->seg, used);
-    rec_buffer_free(o->seg);
+    uint8_t *b = realloc_wait(o->seg, cap, "command recording buffer");
+    // Still failing after the wait: the system has no commit left (the fatal report states it), or seg is no block of
+    // ours: a command buffer object the game overwrote or copied shows a wrong magic or more used than its old size.
+    if (!b)
+        rt_fatal("nvn: command recording buffer of %zu bytes (command buffer %p, magic %#x, buffer %p of %zu bytes, %zu "
+                 "used, %zu asked)", cap, (void *)o, o->magic, (void *)o->seg, o->seg ? (size_t)(o->end - o->seg) : 0,
+                 used, need);
     o->seg = b;
-    o->seg_tok = SEG_TOK(o);
     o->cur = b + used;
-    o->end = b + room;
-    if (twin && o->recording) {   // the lost records are gone; keep what follows a valid recording
-        put_hdr(o->cur, OP_BEGIN, 8);
-        o->cur += 8;
-    }
+    o->end = b + cap;
 }
 
-// Space for one record (header included); the header's op is filled by the caller.
-static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
+// Space for one record (header included); the header's op is filled by the caller. hw: the record stands for a
+// command the console writes to command memory: hw_size's bytes when the caller gave the command's real encoding,
+// else the record's own size. The memory callback runs before it when those bytes do not fit.
+static uint8_t *cmd_alloc_(cmd_t *o, uint32_t size, int hw) {
     size = (size + 7) & ~7u;
+    size_t hw_bytes = hw ? (o->hw_next ? o->hw_next : size) : 0;
+    o->hw_next = 0;
+    if (hw_bytes) cmd_need(o, hw_bytes);
     cmd_reserve(o, size);
     uint8_t *p = o->cur;
     o->cur += size;
     o->cmd_used += size;
-    o->hw_used += size;
-    o->last_rec = size;
+    o->hw_used += hw_bytes;
     put_hdr(p, 0, size);
     return p;
 }
+static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) { return cmd_alloc_(o, size, 1); }
+// BEGIN and END have no hardware equivalent: no command memory, no memory callback
+static uint8_t *cmd_mark(cmd_t *o) { return cmd_alloc_(o, 8, 0); }
 
 // The game sums nvnCommandBufferGetCommandMemoryUsed over recordings to size resource heaps, so usage must be what the
 // real NVN push-buffer encoding takes, not our record size. Known encodings (Maxwell methods, from a real recording):
 // DrawElements 12 words, DrawElementsBaseVertex 11, BindVertexAttribState 1+16, BindVertexStreamState 16+n,
 // BindVertexBuffer 6 words each.
-static void hw_fix(cmd_t *o, size_t bytes) {
-    o->hw_used += bytes;
-    o->hw_used -= o->last_rec;
-    o->last_rec = bytes;
-}
+// hw_size gives the next record's real size, before the record is allocated.
+static void hw_size(cmd_t *o, size_t bytes) { o->hw_next = bytes; }
 
 // A zeroed payload of one record.
 static void *rec(cmd_t *o, uint32_t op, size_t payload) {
@@ -171,123 +271,180 @@ static void copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) {
 // ---------- texture pins
 // Recordings refer to textures by pointer, but the game may finalize or reuse an NVNtexture after recording and before
 // the submit (NVN itself captured only GPU state). Records therefore point at an immutable host copy per texture
-// initialization (tex_t.serial). The copies are kept for the whole run (MacNativeGames sweeps them for long sessions).
-static PlatMutex pin_lock = PLAT_MUTEX_INIT;
-static nvn_hmap pins = {.klen = 8};         // serial -> tex_t copy
+// initialization (tex_t.serial). The game initializes its transient targets again every frame, about 29 new serials a
+// frame in one game, so copies kept for the run grew the heap by about 44 MiB per minute of play, standing still too, until
+// the commit limit ended the game after a few hours. A copy is freed once nothing can read it any more:
+// - refs counts the recording copies whose ops name it: live ones, released ones a queued submission still reads, and
+//   per-submission clones (pin_refs, at flatten_recording and wherever such a copy is freed or cloned);
+// - a recording in progress holds pins no copy counts yet, through its own tex_pin calls and through ops inlined from a
+//   copy that was released since: a pin goes only NVN_PIN_AGE submits after its last tex_pin and after refs fell to 0;
+// - the replay's current render targets carry over to later submissions and are compared by pointer (vk_exec.c set_rt),
+//   so a freed address reused by a new pin would read as the same target: nvn_pins_sweep runs between submissions on
+//   the thread that replays them and keeps the pins it is given.
+// Without it the copies grow without bound (3.16 million copies, 405 MB after 27 minutes in one test). Counting at
+// copy and release walks each copy's ops once more, when it is freed. MTF_PIN_SWEEP=0 keeps every copy.
+typedef struct {
+    tex_t t;              // first: ops hold pins as tex_t pointers
+    uint64_t last_use;    // nsubmits at the last tex_pin or the last drop of refs
+    uint32_t refs;
+    uint8_t queued;       // in pin_q
+} pin_t;
+_Static_assert(offsetof(pin_t, t) == 0, "ops hold pins as tex_t pointers");
+typedef struct { pin_t *p; uint64_t at; } pin_due;
+static PlatMutex pin_lock = PLAT_MUTEX_INIT;   // lock order: copy_lock, then pin_lock
+static nvn_hmap pins = {.klen = 8};         // serial -> pin_t
+static pin_due *pin_q;                      // pins with no counted copy, oldest first: [pin_qh, pin_qn)
+static size_t pin_qh, pin_qn, pin_qcap;
+static uint64_t pins_live, pins_freed;
+static uint64_t nsubmits;                   // QueueSubmitCommands calls so far
+
+static void pin_queue(pin_t *p, uint64_t at) {   // pin_lock held
+    if (p->queued) return;
+    if (pin_qh && pin_qh * 2 >= pin_qn) {
+        memmove(pin_q, pin_q + pin_qh, sizeof *pin_q * (pin_qn - pin_qh));
+        pin_qn -= pin_qh, pin_qh = 0;
+    }
+    if (pin_qn == pin_qcap) {
+        pin_qcap = pin_qcap ? pin_qcap * 2 : 4096;
+        if (!(pin_q = realloc(pin_q, sizeof *pin_q * pin_qcap))) rt_fatal("nvn: out of memory (texture pin queue)");
+    }
+    pin_q[pin_qn++] = (pin_due){p, at};
+    p->queued = 1;
+}
 
 static const tex_t *tex_pin(const NVNtexture *nt) {
     const tex_t *t = (const tex_t *)nt;
     if (!t) return NULL;
     uint64_t serial = t->serial;
     if (!serial) rt_fatal("nvn: a recording references the uninitialized texture object %p", (const void *)t);
-    plat_mutex_lock_shared(&pin_lock);
-    const tex_t *r = nvn_hm_get(&pins, &serial);
+    uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
+    plat_mutex_lock_shared(&pin_lock);   // nvn_pins_sweep frees under the exclusive lock
+    pin_t *r = nvn_hm_get(&pins, &serial);
+    if (r) __atomic_store_n(&r->last_use, now, __ATOMIC_RELAXED);
     plat_mutex_unlock_shared(&pin_lock);
-    if (r) return r;
+    if (r) return &r->t;
     plat_mutex_lock(&pin_lock);
     r = nvn_hm_get(&pins, &serial);
     if (!r) {
-        tex_t *copy = malloc(sizeof *copy);
-        if (!copy) rt_fatal("nvn: texture pin copy");
-        *copy = *t;
-        nvn_hm_put(&pins, &serial, copy);
-        r = copy;
+        if (!(r = malloc(sizeof *r))) rt_fatal("nvn: texture pin copy");
+        *r = (pin_t){.t = *t};
+        nvn_hm_put(&pins, &serial, r);
+        pins_live++;
+        pin_queue(r, now);   // freed like any other if no copy ever names it
+    }
+    __atomic_store_n(&r->last_use, now, __ATOMIC_RELAXED);
+    plat_mutex_unlock(&pin_lock);
+    return &r->t;
+}
+
+// The pins an op's payload names, into out (at most 9); returns how many.
+static int op_pins(uint32_t op, const void *a, const tex_t *out[9]) {
+    int k = 0;
+    switch (op) {
+    case OP_SET_RT: {
+        const p_set_rt *r = a;
+        int n = r->n < 0 ? 0 : r->n > 8 ? 8 : r->n;
+        for (int i = 0; i < n; i++)
+            if (r->color[i]) out[k++] = r->color[i];
+        if (r->depth) out[k++] = r->depth;
+        break;
+    }
+    case OP_COPY_B2T: case OP_COPY_T2B:
+        if (((const p_copy_b2t *)a)->tex) out[k++] = ((const p_copy_b2t *)a)->tex;
+        break;
+    case OP_CLEAR_TEX:
+        if (((const p_clear_tex *)a)->tex) out[k++] = ((const p_clear_tex *)a)->tex;
+        break;
+    case OP_COPY_T2T: {
+        const p_copy_t2t *c = a;
+        if (c->src) out[k++] = c->src;
+        if (c->dst) out[k++] = c->dst;
+        break;
+    }
+    default: break;
+    }
+    return k;
+}
+
+static void pin_ref(const tex_t *t, int delta, uint64_t now) {
+    pin_t *p = (pin_t *)(uintptr_t)t;
+    if (delta > 0) {
+        __atomic_add_fetch(&p->refs, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    __atomic_store_n(&p->last_use, now, __ATOMIC_RELAXED);
+    if (__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL)) return;
+    plat_mutex_lock(&pin_lock);
+    pin_queue(p, now);
+    plat_mutex_unlock(&pin_lock);
+}
+
+// Counts (delta 1) or uncounts (-1) the pins named by the copy at handle, OP_BEGIN to OP_END; returns how many.
+static uint32_t pin_refs(const uint8_t *copy, int delta) {
+    uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
+    uint32_t n = 0;
+    for (const op_hdr *h = nvn_op_first((uintptr_t)copy); h->op != OP_END; h = nvn_op_next(h)) {
+        const tex_t *p[9];
+        int k = op_pins(h->op, nvn_op_payload(h), p);
+        for (int i = 0; i < k; i++) pin_ref(p[i], delta, now);
+        n += (uint32_t)k;
+    }
+    return n;
+}
+
+void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep) {
+    if (now < NVN_PIN_AGE) return;
+    static int on = -1;
+    if (on < 0) {
+        const char *s = cfg_get("MTF_PIN_SWEEP");
+        on = !(s && !strcmp(s, "0"));
+        if (!on) rt_log("nvn: MTF_PIN_SWEEP=0: texture pin copies are kept for the run (the heap grows in long sessions)");
+    }
+    if (!on) return;
+    static uint64_t logged;
+    plat_mutex_lock(&pin_lock);
+    for (int budget = 1024; pin_qh < pin_qn && budget; budget--) {
+        pin_due d = pin_q[pin_qh];
+        if (d.at > now - NVN_PIN_AGE) break;
+        pin_qh++;
+        pin_t *p = d.p;
+        p->queued = 0;
+        if (__atomic_load_n(&p->refs, __ATOMIC_ACQUIRE)) continue;   // queued again when the count falls to 0
+        uint64_t last = __atomic_load_n(&p->last_use, __ATOMIC_RELAXED);
+        int kept = 0;
+        for (int i = 0; i < nkeep; i++) kept |= keep[i] == &p->t;
+        if (kept || last > now - NVN_PIN_AGE) {
+            pin_queue(p, kept ? now : last);
+            continue;
+        }
+        nvn_hm_del(&pins, &p->t.serial);
+        free(p);
+        pins_live--, pins_freed++;
+    }
+    if (now / 7200 != logged) {
+        logged = now / 7200;
+        rt_log("nvn: texture pins at submit %llu: %llu live, %llu waiting, %llu freed so far", (unsigned long long)now,
+               (unsigned long long)pins_live, (unsigned long long)(pin_qn - pin_qh), (unsigned long long)pins_freed);
     }
     plat_mutex_unlock(&pin_lock);
-    return r;
 }
 
 // ---------- recording copies
 // A handle points just past a copy_prefix. Copies are indexed by the 64 KiB block of their control-memory position, so
 // adding control memory again releases the copies recorded there without walking every live copy. 4 KiB pages cost
-// about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
+// about 500 lookups per AddControlMemory under the exclusive lock (one test: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
-// deferred: 0 unknown, 1 none, 2 some. block: the size of the block the prefix starts (copy_block).
-
-// The blocks of copies and recording buffers of 64 KiB and more (the prefix included) come in power-of-two sizes and
-// go back to a cache when released, up to BLK_CACHE bytes, instead of to the heap. The CRT hands blocks of about
-// 512 KiB and more to VirtualAlloc and VirtualFree, so every copy wrote into new pages and took a demand-zero fault on
-// each: in the Hilltop Layer of Surf Hills (3.2.0), where the game records about 28,500 draws a frame, the copies came
-// to 185 KiB on average and the game took 470,000 page faults a second.
-#define BLK_MIN_SHIFT 16
-#define BLK_CLASSES 12               // 64 KiB to 128 MiB; larger copies use the heap
-#define BLK_CACHE (256ull << 20)     // bytes kept in the cache at most
-static PlatMutex blk_lock = PLAT_MUTEX_INIT;
-static void **blk_free[BLK_CLASSES];
-static uint32_t blk_n[BLK_CLASSES], blk_cap[BLK_CLASSES];
-static uint64_t blk_cached;
-
-static int blk_class(size_t total) {   // -1: from the heap
-    if (total < (1u << BLK_MIN_SHIFT)) return -1;
-    int c = 0;
-    while (((size_t)1 << (BLK_MIN_SHIFT + c)) < total) c++;
-    return c < BLK_CLASSES ? c : -1;
-}
-
-// A block of at least total bytes; its prefix's block field holds its size, and the other fields are left to the caller.
-static copy_prefix *copy_block(size_t total) {
-    int c = blk_class(total);
-    void *p = NULL;
-    if (c >= 0) {
-        total = (size_t)1 << (BLK_MIN_SHIFT + c);
-        plat_mutex_lock(&blk_lock);
-        if (blk_n[c]) p = blk_free[c][--blk_n[c]], blk_cached -= total;
-        plat_mutex_unlock(&blk_lock);
-        if (!p) p = malloc(total);
-    } else {
-        p = malloc(total);
-    }
-    if (!p) rt_fatal("nvn: command copy allocation (%zu bytes)", total);
-    ((copy_prefix *)p)->block = total;
-    return p;
-}
-
-static void copy_block_free(copy_prefix *pf) {
-    if (!pf) return;
-    size_t size = (size_t)pf->block;
-    int c = blk_class(size);
-    if (c >= 0 && size == (size_t)1 << (BLK_MIN_SHIFT + c)) {
-        plat_mutex_lock(&blk_lock);
-        if (blk_cached + size <= BLK_CACHE) {
-            if (blk_n[c] == blk_cap[c]) {
-                uint32_t cap = blk_cap[c] ? blk_cap[c] * 2 : 16;
-                void **v = realloc(blk_free[c], sizeof *v * cap);
-                if (!v) rt_fatal("nvn: out of memory (command copy cache)");
-                blk_free[c] = v, blk_cap[c] = cap;
-            }
-            blk_free[c][blk_n[c]++] = pf, blk_cached += size;
-            pf = NULL;
-        }
-        plat_mutex_unlock(&blk_lock);
-    }
-    free(pf);
-}
-
-// The game may copy a cmd_t (see nvnCommandBufferInitialize), so two objects can hold one seg. Only the object named in
-// the cmd_t's seg_tok (its own address) writes into it or frees it; another one takes a block of its own (or copies and leaves the
-// shared one alone). Safe rather than fatal: a twin that records on is a game quirk we can serve, and the owner's
-// buffer, or the copy handed over from it, stays intact. Once handed over, the buffer belongs to the copy list: the command buffer takes a new seg.
-static uint8_t *rec_buffer(size_t cap, size_t *room) {
-    copy_prefix *b = copy_block(sizeof *b + cap);
-    b->magic = REC_MAGIC;
-    *room = (size_t)b->block - sizeof *b;
-    return (uint8_t *)(b + 1);
-}
-
-// From the object alone: a twin's seg may be freed, so the prefix is never read to decide.
-static int rec_owned(const cmd_t *o) { return SEG_OWNED(o); }
-
-static void rec_buffer_free(uint8_t *seg) {
-    if (!seg) return;
-    ((copy_prefix *)seg - 1)->magic = 0;   // a stale REC_MAGIC must not look live
-    copy_block_free((copy_prefix *)seg - 1);
-}
+// deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs; pin_v: those pins, in
+// record order, or NULL (then pin_refs walks the records); cap: bytes of the block from the large-block cache
+// (copy_block), 0 for a plain heap block
+typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins, cap; const tex_t **pin_v; } copy_prefix;
+_Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
 static PlatMutex copy_lock = PLAT_MUTEX_INIT;    // guards the two maps, the counters and every prefix
 static nvn_hmap copy_pages = {.klen = 8};   // page -> copy_bucket
 static nvn_hmap copy_live = {.klen = 8};    // handle -> copy_prefix of a live copy
-static uint64_t ncopies, copy_bytes, copies_made, nsubmits;
+static uint64_t ncopies, copy_bytes, copies_made;
 // Asynchronous replay: copies released by the game, and per-submission clones, that a queued submission still reads.
 // Freed once gfx_replayed_submits() reaches their used_at. Empty with synchronous replay.
 static copy_prefix **zombies;
@@ -302,10 +459,117 @@ static void zombie_add(copy_prefix *pf) {   // copy_lock held
     zombies[nzombies++] = pf;
 }
 
-static void zombie_sweep(uint64_t replayed) {   // copy_lock held
+// Blocks of large copies are kept for the next ones. A game may make two copies of 0.5-2 MiB a frame (the per-frame
+// recordings that inline many others); above the heap's direct-allocation threshold (about 512 KiB) every malloc mapped
+// fresh zero-filled pages and every free unmapped them, so the copy ran at half the speed of a small one and the free
+// held copy_lock for tens of microseconds. A block is reused for a copy that fills at least half of it.
+#define BIG_MIN ((size_t)256 << 10)        // smaller blocks come from the heap and go back to it
+#define BIG_MAX ((size_t)16 << 20)         // a larger block is never kept
+#define BIG_SLOTS 8
+static PlatMutex big_lock = PLAT_MUTEX_INIT;   // lock order: copy_lock, then big_lock
+static struct { copy_prefix *p; size_t cap; } big[BIG_SLOTS];
+static uint32_t nbig;
+
+static void big_drain(void) {
+    plat_mutex_lock(&big_lock);
+    while (nbig) free(big[--nbig].p);
+    plat_mutex_unlock(&big_lock);
+}
+
+// A block for a copy of n bytes after its prefix; prefix.cap says where it goes back (copy_block_free). wait: a failed
+// allocation waits for memory (realloc_wait), which is never done with a lock held; else it ends the game at once.
+static copy_prefix *copy_block(size_t n, int wait, const char *what) {
+    size_t total = sizeof(copy_prefix) + n, cap = 0;
+    copy_prefix *pf = NULL;
+    if (total >= BIG_MIN && total <= BIG_MAX) {
+        plat_mutex_lock(&big_lock);
+        uint32_t best = BIG_SLOTS;
+        for (uint32_t i = 0; i < nbig; i++)
+            if (big[i].cap >= total && big[i].cap / 2 <= total && (best == BIG_SLOTS || big[i].cap < big[best].cap))
+                best = i;
+        if (best < BIG_SLOTS) {
+            pf = big[best].p;
+            cap = big[best].cap;
+            big[best] = big[--nbig];
+        }
+        plat_mutex_unlock(&big_lock);
+        if (!pf) cap = (total + total / 8 + 0xffff) & ~(size_t)0xffff;   // room for the next frame's slightly larger one
+    }
+    if (!pf) pf = wait ? realloc_wait(NULL, cap ? cap : total, what) : malloc(cap ? cap : total);
+    if (!pf) rt_fatal("nvn: %s allocation (%zu bytes)", what, cap ? cap : total);
+    pf->cap = cap;
+    return pf;
+}
+
+static void copy_block_free(copy_prefix *pf) {
+    size_t cap = pf->cap;
+    if (cap) {
+        plat_mutex_lock(&big_lock);
+        if (nbig < BIG_SLOTS) {
+            big[nbig].p = pf;
+            big[nbig++].cap = cap;
+            pf = NULL;
+        } else {
+            uint32_t small = 0;
+            for (uint32_t i = 1; i < nbig; i++)
+                if (big[i].cap < big[small].cap) small = i;
+            if (big[small].cap < cap) {
+                copy_prefix *drop = big[small].p;
+                big[small].p = pf;
+                big[small].cap = cap;
+                pf = drop;
+            }
+        }
+        plat_mutex_unlock(&big_lock);
+    }
+    free(pf);
+}
+
+// Counts (delta 1) or uncounts (-1) the pins a copy names: from its list, without walking its records. A copy of a
+// per-frame recording is 0.5-2 MiB of records naming a few pins; walking them again at every free cost about 40 us.
+static void copy_pins_ref(const copy_prefix *pf, int delta) {
+    if (!pf->pins) return;
+    if (!pf->pin_v) {
+        pin_refs((const uint8_t *)(pf + 1), delta);
+        return;
+    }
+    uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
+    for (uint64_t i = 0; i < pf->pins; i++) pin_ref(pf->pin_v[i], delta, now);
+}
+
+// A copy in no map and no zombie list: nothing else can reach it, so copy_lock need not be held.
+static void copy_free(copy_prefix *pf) {
+    copy_pins_ref(pf, -1);
+    free((void *)pf->pin_v);
+    copy_block_free(pf);
+}
+
+// Copies retired under copy_lock and freed after it is released: the frees, the unpinning walk over their records and
+// the large blocks kept the lock exclusive for most of release_copies, while the game's other recording threads waited
+// for it in copy_touch (one test: three threads, 0.6 ms a frame of waiting).
+typedef struct { copy_prefix **v; uint32_t n, cap; } dead_list;
+static __thread dead_list dead;
+
+static void dead_add(copy_prefix *pf) {
+    if (dead.n == dead.cap) {
+        uint32_t cap = dead.cap ? dead.cap * 2 : 256;
+        copy_prefix **v = realloc(dead.v, sizeof *v * cap);
+        if (!v) { copy_free(pf); return; }   // out of memory: free it here, under the lock, as before
+        dead.v = v;
+        dead.cap = cap;
+    }
+    dead.v[dead.n++] = pf;
+}
+
+static void dead_free(void) {   // copy_lock not held
+    for (uint32_t i = 0; i < dead.n; i++) copy_free(dead.v[i]);
+    dead.n = 0;
+}
+
+static void zombie_sweep(uint64_t replayed) {   // copy_lock held; the swept copies go to the dead list
     for (uint32_t i = 0; i < nzombies;) {
         if (zombies[i]->used_at <= replayed) {
-            copy_block_free(zombies[i]);
+            dead_add(zombies[i]);
             zombies[i] = zombies[--nzombies];
         } else {
             i++;
@@ -315,21 +579,6 @@ static void zombie_sweep(uint64_t replayed) {   // copy_lock held
 
 static copy_prefix *copy_find(uint64_t handle) {   // copy_lock held
     return nvn_hm_get(&copy_live, &handle);
-}
-
-int nvn_handle_live(uint64_t handle) {
-    plat_mutex_lock_shared(&copy_lock);
-    int live = copy_find(handle) != NULL;
-    plat_mutex_unlock_shared(&copy_lock);
-    return live;
-}
-
-uint64_t nvn_handle_bytes(uint64_t handle) {
-    plat_mutex_lock_shared(&copy_lock);
-    const copy_prefix *pf = copy_find(handle);
-    uint64_t n = pf ? pf->bytes : 0;
-    plat_mutex_unlock_shared(&copy_lock);
-    return n;
 }
 
 // Marks a live copy used by submission now; its size from OP_BEGIN to OP_END inclusive.
@@ -344,45 +593,46 @@ static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
     return bytes;
 }
 
-// The recording [seg, cur), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), checked
-// record by record, as a copy. One of RECORDING_HANDOVER bytes or more is its recording buffer itself, a copy_block
-// with the prefix in front, and the command buffer takes a block of the same size from the cache for its next
-// recording; a smaller one is copied into a block of its own, as a handed-over buffer of 64 KiB or more would stay
-// allocated for as long as the game keeps the handle. Growing the copy record by record cost the game's main thread
-// about 1 ms a frame in reallocations and small copies (1.4.3, field); copying every recording at its end took about
-// two fifths of the main thread's running time in the Hilltop Layer of Surf Hills (3.2.0, 185 KiB a copy on average).
-#define RECORDING_HANDOVER (32u << 10)
-static uint8_t *take_recording(cmd_t *o) {
-    const uint8_t *p = o->seg;
-    size_t n = (size_t)(o->cur - o->seg);
+// The recording [p, p + n), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), copied
+// into one host block (copy_block: its exact size, or a kept large block). One allocation and one copy: growing the
+// copy record by record cost the game's main thread about 1 ms a frame in reallocations and small copies (one test,
+// field). The pins the records name are counted and listed (copy_prefix.pin_v) on the way.
+static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
+    copy_prefix *block = copy_block(n, 1, "command copy");
+    uint8_t *out = (uint8_t *)block;
+    memcpy(out + sizeof(copy_prefix), p, n);
+    static __thread struct { const tex_t **v; uint64_t cap; } named;   // the pins of this recording, reused
+    uint64_t pins_named = 0;
+    int listed = 1;   // 0 after a failed growth: the copy goes without a list
     for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
         op_hdr h;
         memcpy(&h, p + at, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL || at + h.size > n ||
             (!at && h.op != OP_BEGIN))
             rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h.op, h.size);
+        const tex_t *pinned[9];
+        int k = op_pins(h.op, out + sizeof(copy_prefix) + at + 8, pinned);
+        for (int i = 0; i < k; i++) pin_ref(pinned[i], 1, 0);
+        if (k && listed && pins_named + (uint64_t)k > named.cap) {
+            uint64_t cap = named.cap ? named.cap * 2 : 64;
+            while (cap < pins_named + (uint64_t)k) cap *= 2;
+            const tex_t **v = realloc((void *)named.v, sizeof *v * cap);
+            if (v) named.v = v, named.cap = cap;
+            else listed = 0;
+        }
+        if (k && listed) memcpy((void *)(named.v + pins_named), pinned, sizeof *pinned * (size_t)k);
+        pins_named += (uint64_t)k;
         at += h.size;
         if (h.op == OP_END) {
             if (at != n) rt_fatal("nvn: recording at %p ends at %zu of %zu bytes", (const void *)p, at, n);
             break;
         }
     }
-    copy_prefix *pf;
-    // Hand the buffer over only when it is the block a copy would get anyway (else a 40 KiB recording could pin the
-    // 8 MiB the buffer grew to) and this object owns it. The next buffer is sized to the same class.
-    if (n >= RECORDING_HANDOVER && rec_owned(o) &&
-        blk_class(sizeof *pf + n) == blk_class((size_t)((copy_prefix *)o->seg - 1)->block)) {
-        pf = (copy_prefix *)o->seg - 1;
-        size_t room;
-        o->seg = o->cur = rec_buffer((size_t)pf->block - sizeof *pf, &room);
-        o->end = o->seg + room;
-    } else {
-        pf = copy_block(sizeof *pf + n);
-        memcpy(pf + 1, p, n);
-    }
-    uint64_t block = pf->block;
-    *pf = (copy_prefix){COPY_MAGIC, n, 0, 0, 0, block};
-    return (uint8_t *)(pf + 1);
+    const tex_t **pin_v = NULL;
+    if (pins_named && listed && (pin_v = malloc(sizeof *pin_v * pins_named)))
+        memcpy((void *)pin_v, (const void *)named.v, sizeof *pin_v * pins_named);
+    *block = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named, .cap = block->cap, .pin_v = pin_v};
+    return out + sizeof(copy_prefix);
 }
 
 static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
@@ -431,7 +681,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             copy_bytes -= pf->bytes;
             pf->magic = 0;
             if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
-            else copy_block_free(pf);
+            else dead_add(pf);
             b->v[i] = b->v[--b->n];
         }
         if (!b->n) {
@@ -441,6 +691,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
         }
     }
     plat_mutex_unlock(&copy_lock);
+    dead_free();
 }
 
 // ---------- CommandBuffer: object and memory
@@ -460,21 +711,15 @@ NVN_API(nvnCommandBufferInitialize) {
     o->inline_cur = ~0ull;
     o->inline_end = 0;
     cb_set_disabled(o, CB_NO_COMMAND | CB_NO_CONTROL, 0);
-    nvn_mode_trace(NVN_MODE_INIT, (uintptr_t)o, 0, 0, 0);
     ret_x(c, 1);
 }
 // void nvnCommandBufferFinalize(NVNcommandBuffer *cmd): handles outlive their recorder
 NVN_API(nvnCommandBufferFinalize) {
     cmd_t *o = cmd_of(c);
-    if (rec_owned(o)) {
-        seg_check(o, 0);
-        rec_buffer_free(o->seg);
-    }
+    pool_put(o->seg, (size_t)(o->end - o->seg));
     o->seg = o->cur = o->end = NULL;
-    o->seg_tok = 0;
     o->magic = 0;
     cb_set_disabled(o, CB_NO_COMMAND | CB_NO_CONTROL, 0);
-    nvn_mode_trace(NVN_MODE_FINALIZE, (uintptr_t)o, 0, 0, 0);
 }
 // void nvnCommandBufferSetMemoryCallback(NVNcommandBuffer *cmd, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC callback)
 NVN_API(nvnCommandBufferSetMemoryCallback) { cmd_of(c)->cb = arg_p(c, 1); }
@@ -517,83 +762,78 @@ NVN_API(nvnCommandBufferGetControlMemoryUsed) { const cmd_t *o = cmd_of(c); ret_
 NVN_API(nvnCommandBufferGetControlMemoryFree) { const cmd_t *o = cmd_of(c); ret_x(c, o->ctl_size - min_size(o->ctl_used, o->ctl_size)); }
 NVN_API(nvnCommandBufferGetCommandMemorySize) { ret_x(c, cmd_of(c)->game_size); }
 NVN_API(nvnCommandBufferGetCommandMemoryUsed) { const cmd_t *o = cmd_of(c); ret_x(c, min_size(o->hw_used, o->game_size)); }
-NVN_API(nvnCommandBufferGetCommandMemoryFree) { const cmd_t *o = cmd_of(c); ret_x(c, o->game_size - min_size(o->hw_used, o->game_size)); }
+NVN_API(nvnCommandBufferGetCommandMemoryFree) {
+    const cmd_t *o = cmd_of(c);
+    uint64_t freeb = o->game_size - min_size(o->hw_used, o->game_size);
+    ret_x(c, freeb);
+}
 
 // ---------- CommandBuffer: recording
 // void nvnCommandBufferBeginRecording(NVNcommandBuffer *cmd)
 NVN_API(nvnCommandBufferBeginRecording) {
     cmd_t *o = cmd_of(c);
     if (o->recording) rt_log("nvn: BeginRecording on command buffer %p while it records", (void *)o);
-    // Notify the game before recording if command or control memory is nearly exhausted so its callback
-    // can replenish the buffer before Get{Command,Control}MemoryUsed saturates at game_size/ctl_size.
-    if (!o->game_size || o->hw_used + 1024 > o->game_size)
-        memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,
-                     o->game_size ? 1024 : MIN_COMMAND_SIZE);
-    if (!o->ctl_size || o->ctl_used + CTL_PER_RECORDING > o->ctl_size)
-        memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY,
-                     o->ctl_size ? CTL_PER_RECORDING : MIN_CONTROL_SIZE);
     o->recording = 1;
-    if (o->seg && !rec_owned(o)) o->seg = o->cur = o->end = NULL;   // a twin's or handed-over buffer: take a block of our own
-    o->cur = o->seg;   // the previous recording was copied or handed over at EndRecording (take_recording)
+    o->cur = o->seg;   // the previous recording was copied at EndRecording
     o->rec_start = o->cmd_used;
-    put_hdr(cmd_alloc(o, 8), OP_BEGIN, 8);
-    o->hw_used -= 8;   // BEGIN and END have no hardware equivalent
-    o->hw_start = o->hw_used;
-    nvn_mode_trace(NVN_MODE_BEGIN, (uintptr_t)o, 0, 0, 0);
+    put_hdr(cmd_mark(o), OP_BEGIN, 8);
     if (!o->game_size) memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, MIN_COMMAND_SIZE);
 }
 // NVNcommandHandle nvnCommandBufferEndRecording(NVNcommandBuffer *cmd)
 NVN_API(nvnCommandBufferEndRecording) {
     cmd_t *o = cmd_of(c);
     if (!o->recording || !o->seg) rt_fatal("nvn: EndRecording on command buffer %p, which does not record", (void *)o);
-    if (!o->ctl_size) memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, MIN_CONTROL_SIZE);
-    put_hdr(cmd_alloc(o, 8), OP_END, 8);
-    o->hw_used -= 8;
+    if (!o->ctl_size || (o->ctl_used + CTL_PER_RECORDING > o->ctl_size && mid_recording_cb()))
+        memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, MIN_CONTROL_SIZE);
+    put_hdr(cmd_mark(o), OP_END, 8);
     o->recording = 0;
-    uint8_t *copy = take_recording(o);
+    uint8_t *copy = flatten_recording(o->seg, (size_t)(o->cur - o->seg));
     // Finalizing the recorder does not retire its handle; only reusing the control memory it was recorded in does.
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     uintptr_t hi = o->ctl ? lo + 1 : 0;
     o->ctl_used += CTL_PER_RECORDING;
     copy_add(lo, hi, copy);
-    nvn_mode_trace(NVN_MODE_END, (uintptr_t)o, (uintptr_t)copy, 0, 0);
     ret_x(c, (uintptr_t)copy);
+    if (diag_watch_on) diag_watch_end_cmd(o, (uintptr_t)copy);
 }
 // NVNboolean nvnCommandBufferIsRecording(const NVNcommandBuffer *cmd)
 NVN_API(nvnCommandBufferIsRecording) { ret_x(c, cmd_of(c)->recording != 0); }
 
 // The called recording is copied into the caller at the call position: the game recycles command memory in small steps,
 // so a handle may be gone by the time the caller is submitted. Deferred binds stay deferred. A copy is OP_BEGIN, its
-// records and OP_END (take_recording checked them), so the records go over as one block; usage grows by the same
-// bytes as record by record.
-static void inline_recording(cmd_t *o, uint64_t handle, const char *what) {
-    if (!handle) {
-        static int once;
-        if (!once++) rt_log("nvn: %s: ignoring null handle", what);
+// records and OP_END (flatten_recording checked them), so the records go over as one block.
+// Command memory: CopyCommands writes the body into the caller's memory; CallCommands only a call into the called
+// memory and the return (CALL_HW_BYTES, an estimate of that encoding). Counting a call's whole body ran the game's
+// memory callback about 70 times per frame recording, which the console does not.
+#define CALL_HW_BYTES 16
+static void inline_recording(cmd_t *o, uint64_t handle, int copy, const char *what) {
+    if (!handle) {   // MTF passes one; nothing is called (open: why it is null)
+        static volatile int32_t n;
+        if (plat_inc32(&n) <= 4) rt_log("[RED] nvn: %s with a null handle: nothing called", what);
         return;
     }
     uint64_t bytes = copy_touch(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what);
     if (bytes <= 16) return;
-    size_t body = (size_t)bytes - 16;
+    size_t body = (size_t)bytes - 16, hw = copy ? body : CALL_HW_BYTES;
+    cmd_need(o, hw);
     cmd_reserve(o, body);
     memcpy(o->cur, (const uint8_t *)(uintptr_t)handle + 8, body);
     o->cur += body;
     o->cmd_used += body;
-    o->hw_used += body;
-    o->last_rec = 0;
+    o->hw_used += hw;
 }
 // void nvnCommandBuffer{Call,Copy}Commands(NVNcommandBuffer *cmd, int n, const NVNcommandHandle *handles)
 NVN_API(nvnCommandBufferCallCommands) {
     cmd_t *o = cmd_of(c);
     int n = (int)arg_x(c, 1);
     const uint64_t *h = arg_p(c, 2);
-    for (int i = 0; i < n; i++) inline_recording(o, h[i], "CallCommands");
+    for (int i = 0; i < n; i++) inline_recording(o, h[i], 0, "CallCommands");
 }
 NVN_API(nvnCommandBufferCopyCommands) {
     cmd_t *o = cmd_of(c);
     int n = (int)arg_x(c, 1);
     const uint64_t *h = arg_p(c, 2);
-    for (int i = 0; i < n; i++) inline_recording(o, h[i], "CopyCommands");
+    for (int i = 0; i < n; i++) inline_recording(o, h[i], 1, "CopyCommands");
 }
 
 // ---------- CommandBuffer: commands with CPU-visible results (performed by the back end in GPU order)
@@ -613,6 +853,11 @@ NVN_API(nvnCommandBufferReportCounter) {
 // size_t size, int flags)
 NVN_API(nvnCommandBufferCopyBufferToBuffer) {
     *REC(cmd_of(c), OP_COPY_B2B, p_copy_b2b) = (p_copy_b2b){arg_x(c, 1), arg_x(c, 2), arg_x(c, 3)};
+    if (diag_watch_range(arg_x(c, 2), arg_x(c, 3))) {
+        diag_watch_mark_cmd(cmd_of(c));
+        diag_watch_note("update CopyBufferToBuffer %#llx -> %#llx+%#llx cmdbuf %p", (unsigned long long)arg_x(c, 1),
+                        (unsigned long long)arg_x(c, 2), (unsigned long long)arg_x(c, 3), (void *)cmd_of(c));
+    }
 }
 // void nvnCommandBufferUpdateUniformBuffer(NVNcommandBuffer *cmd, NVNbufferAddress buffer, size_t buffer_size,
 // ptrdiff_t offset, size_t size, const void *data): the data is copied at record time (the caller may change it
@@ -625,6 +870,11 @@ NVN_API(nvnCommandBufferUpdateUniformBuffer) {
     r->dst = dst;
     r->size = n;
     memcpy(r->data, data, n);
+    if (diag_watch_range(dst, n)) {
+        diag_watch_mark_cmd(cmd_of(c));
+        diag_watch_note("update UpdateUniformBuffer %#llx+%#llx cmdbuf %p", (unsigned long long)dst,
+                        (unsigned long long)n, (void *)cmd_of(c));
+    }
 }
 
 // ---------- CommandBuffer: render state, payloads of nvn_obj.h
@@ -678,35 +928,19 @@ NVN_API(nvnCommandBufferSetViewport) {
     float v[4] = {(float)(int)arg_x(c, 1), (float)(int)arg_x(c, 2), (float)(int)arg_x(c, 3), (float)(int)arg_x(c, 4)};
     set_viewports(cmd_of(c), 0, 1, v);
 }
-// void nvnCommandBufferSetViewportSwizzles(NVNcommandBuffer *cmd, int first, int count, const NVNviewportSwizzle *swizzles)
-NVN_API(nvnCommandBufferSetViewportSwizzles) {
-    (void)cmd_of(c);
-    int first = (int)arg_x(c, 1), n = (int)arg_x(c, 2);
-    const uint32_t *sw = arg_p(c, 3);
-    for (int i = 0; i < n; i++) {
-        if (sw[4 * i + 0] != NVN_VIEWPORT_SWIZZLE_POSITIVE_X || sw[4 * i + 1] != NVN_VIEWPORT_SWIZZLE_POSITIVE_Y ||
-            sw[4 * i + 2] != NVN_VIEWPORT_SWIZZLE_POSITIVE_Z || sw[4 * i + 3] != NVN_VIEWPORT_SWIZZLE_POSITIVE_W) {
-            static int once;
-            if (!once++)
-                rt_log("nvn: SetViewportSwizzles non-identity [%d] (%u,%u,%u,%u) ignored", first + i, sw[4 * i + 0],
-                       sw[4 * i + 1], sw[4 * i + 2], sw[4 * i + 3]);
-        }
-    }
-}
-static void set_scissor(cmd_t *o, int index, int x, int y, int w, int h) {
-    *REC(o, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h, index, 0};
-}
+static void set_scissor(cmd_t *o, int x, int y, int w, int h) { *REC(o, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
 // void nvnCommandBufferSetScissor(NVNcommandBuffer *cmd, int x, int y, int w, int h)
 NVN_API(nvnCommandBufferSetScissor) {
-    set_scissor(cmd_of(c), 0, (int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), (int)arg_x(c, 4));
+    set_scissor(cmd_of(c), (int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), (int)arg_x(c, 4));
 }
-// void nvnCommandBufferSetScissors(NVNcommandBuffer *cmd, int first, int n, const int *xywh)
+// void nvnCommandBufferSetScissors(NVNcommandBuffer *cmd, int first, int n, const int *xywh): one per viewport
 NVN_API(nvnCommandBufferSetScissors) {
     int first = (int)arg_x(c, 1), n = (int)arg_x(c, 2);
     const int *r = arg_p(c, 3);
     if (first < 0 || n < 0 || first + n > 16) rt_fatal("nvn: SetScissors first %d n %d", first, n);
     cmd_t *o = cmd_of(c);
-    for (int i = 0; i < n; i++) set_scissor(o, first + i, r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
+    for (int i = 0; i < n; i++)
+        *REC(o, OP_SCISSOR, p_scissor) = (p_scissor){r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3], first + i};
 }
 static void set_depth_range(cmd_t *o, float n, float f) { *REC(o, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 // void nvnCommandBufferSetDepthRange(NVNcommandBuffer *cmd, float near, float far)
@@ -728,14 +962,14 @@ NVN_API(nvnCommandBufferSetDepthClamp) { REC(cmd_of(c), OP_DEPTH_CLAMP, p_flag)-
 NVN_API(nvnCommandBufferSetRenderEnable) { REC(cmd_of(c), OP_RENDER_ENABLE, p_flag)->value = nvn_arg_bool(c, 1) != 0; }
 // Rasterizer discard runs vertex work without rasterising; with no transform feedback that equals not drawing.
 NVN_API(nvnCommandBufferSetRasterizerDiscard) { REC(cmd_of(c), OP_RASTER_DISCARD, p_flag)->value = nvn_arg_bool(c, 1) != 0; }
-// void nvnCommandBufferSetPrimitiveRestart(NVNcommandBuffer *cmd, NVNboolean enable, int index): TOTK draws its
-// terrain and cliff strips with 16-bit indices and restart at 0xffff; the replay applies it per indexed draw (op_draw_idx)
+// void nvnCommandBufferSetPrimitiveRestart(NVNcommandBuffer *cmd, NVNboolean enable, int index): games draw
+// strips with 16-bit indices and restart at 0xffff; the replay applies it per indexed draw (op_draw_idx)
 NVN_API(nvnCommandBufferSetPrimitiveRestart) {
     *REC(cmd_of(c), OP_PRIM_RESTART, p_prim_restart) = (p_prim_restart){nvn_arg_bool(c, 1) != 0, (uint32_t)arg_x(c, 2)};
 }
 // void nvnCommandBufferSetRenderEnableConditional(NVNcommandBuffer *cmd, NVNconditionalRenderMode mode,
 // NVNbufferAddress counters): rendering is enabled when the two NVNcounterData.counter values at addr / addr+16
-// compare equal (mode 0) or not equal (mode 1). TOTK gates most of its ClearColor commands with it; the replay
+// compare equal (mode 0) or not equal (mode 1). a game may gate its ClearColor commands with it; the replay
 // evaluates it in GPU order.
 NVN_API(nvnCommandBufferSetRenderEnableConditional) {
     int m = (int)arg_x(c, 1);
@@ -768,43 +1002,46 @@ NVN_API(nvnCommandBufferSetPointSize) {
     r->kind = 6;
     memcpy(r->bytes, &s, sizeof s);
 }
-// void nvnCommandBufferSetAlphaRef(NVNcommandBuffer *cmd, float ref): recorded as bind-state kind 7 (spirv_alpha_test)
-NVN_API(nvnCommandBufferSetAlphaRef) {
-    p_bind_state *r = REC(cmd_of(c), OP_BIND_STATE, p_bind_state);
-    float s = arg_s(c, 0);
-    r->kind = 7;
-    memcpy(r->bytes, &s, sizeof s);
-}
 // void nvnCommandBufferBindVertexAttribState(NVNcommandBuffer *cmd, int n, const NVNvertexAttribState *states)
 NVN_API(nvnCommandBufferBindVertexAttribState) {
     cmd_t *o = cmd_of(c);
     int n = (int)arg_x(c, 1);
     if (n < 0 || n > 16) { rt_log("nvn: BindVertexAttribState n %d", n); return; }
+    hw_size(o, 68);   // the driver always writes all 16 attribute formats: 17 words
     p_bind_vattr *r = RECN(o, OP_BIND_VATTR, p_bind_vattr, st, n);
     r->first = 0;
     r->n = n;
     memcpy(r->st, arg_p(c, 2), 4 * (size_t)n);
-    hw_fix(o, 68);   // the driver always writes all 16 attribute formats: 17 words
 }
 // void nvnCommandBufferBindVertexStreamState(NVNcommandBuffer *cmd, int n, const NVNvertexStreamState *states)
 NVN_API(nvnCommandBufferBindVertexStreamState) {
     cmd_t *o = cmd_of(c);
     int n = (int)arg_x(c, 1);
     if (n < 0 || n > 16) { rt_log("nvn: BindVertexStreamState n %d", n); return; }
+    hw_size(o, 4 * (16 + (size_t)n));
     p_bind_vstream *r = RECN(o, OP_BIND_VSTREAM, p_bind_vstream, st, n);
     r->first = 0;
     r->n = n;
     memcpy(r->st, arg_p(c, 2), 8 * (size_t)n);
-    hw_fix(o, 4 * (16 + (size_t)n));
 }
+// NVN has 16 vertex streams. MTF clears 32 before each model: the streams below 16 are bound and a null range past 15 is dropped, as
+// nothing can read it. Dropping the whole call left the streams below 16 holding the previous model's buffers.
 static void bind_vertex_buffers(cmd_t *o, int first, int n, const NVNbufferRange *rg) {
-    if (first >= 16 && n >= 0 && first + n <= 32) return;
-    if (first < 0 || n < 0 || first + n > 16) { rt_log("nvn: BindVertexBuffers first %d n %d", first, n); return; }
+    if (first < 0 || n < 0) { rt_log("nvn: BindVertexBuffers first %d n %d", first, n); return; }
+    for (int i = first + n > 16 ? (first > 16 ? first : 16) : first + n; i < first + n; i++)
+        if (rg[i - first].address || rg[i - first].size) {
+            static volatile int32_t logged;
+            if (plat_inc32(&logged) <= 8)
+                rt_log("[RED] nvn: BindVertexBuffers: stream %d (past the 16 NVN has) gets %#llx+%#llx: dropped", i,
+                       (unsigned long long)rg[i - first].address, (unsigned long long)rg[i - first].size);
+        }
+    if (first >= 16) return;
+    if (first + n > 16) n = 16 - first;
+    hw_size(o, 24 * (size_t)n);
     p_bind_vbuf *r = RECN(o, OP_BIND_VBUF, p_bind_vbuf, r, n);
     r->first = first;
     r->n = n;
     memcpy(r->r, rg, sizeof *rg * (size_t)n);
-    hw_fix(o, 24 * (size_t)n);
 }
 // void nvnCommandBufferBindVertexBuffers(NVNcommandBuffer *cmd, int first, int n, const NVNbufferRange *ranges)
 NVN_API(nvnCommandBufferBindVertexBuffers) { bind_vertex_buffers(cmd_of(c), (int)arg_x(c, 1), (int)arg_x(c, 2), arg_p(c, 3)); }
@@ -813,69 +1050,49 @@ NVN_API(nvnCommandBufferBindVertexBuffer) {
     NVNbufferRange r = {arg_x(c, 2), arg_x(c, 3)};
     bind_vertex_buffers(cmd_of(c), (int)arg_x(c, 1), 1, &r);
 }
+// MTF_WATCH: a buffer bind whose range reaches the watched block.
+static void watch_bind(cmd_t *o, uint32_t op, int st, int index, uint64_t addr, uint64_t size, const char *how) {
+    if (!diag_watch_on) return;
+    if (op == OP_BIND_UBO) diag_watch_uniform(index, addr, size);
+    if (!diag_watch_hits(addr, size)) return;
+    diag_watch_mark_cmd(o);
+    diag_watch_note("bind %s%s stage %d index %d %#llx+%#llx cmdbuf %p", op == OP_BIND_UBO ? "uniform" : "storage", how,
+                    st, index, (unsigned long long)addr, (unsigned long long)size, (void *)o);
+}
 // Uniform and storage buffers: one record per binding (CB_SIZE/ADDRESS 4 words + CB_BIND 1 on hardware).
 static void bind_buffers(const Cpu *c, uint32_t op) {   // (cmd, stage, first, n, const NVNbufferRange *ranges)
     cmd_t *o = cmd_of(c);
     int st = (int)arg_x(c, 1), first = (int)arg_x(c, 2), n = (int)arg_x(c, 3);
     const NVNbufferRange *rg = arg_p(c, 4);
     for (int i = 0; i < n; i++) {
+        hw_size(o, 20);
         *REC(o, op, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
-        hw_fix(o, 20);
+        watch_bind(o, op, st, first + i, rg[i].address, rg[i].size, "");
     }
 }
 static void bind_buffer(const Cpu *c, uint32_t op) {    // (cmd, stage, index, NVNbufferAddress address, size_t size)
     cmd_t *o = cmd_of(c);
+    hw_size(o, 20);
     *REC(o, op, p_bind_buf) = (p_bind_buf){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
-    hw_fix(o, 20);
+    watch_bind(o, op, (int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4), "");
 }
 NVN_API(nvnCommandBufferBindUniformBuffer) { bind_buffer(c, OP_BIND_UBO); }
 NVN_API(nvnCommandBufferBindUniformBuffers) { bind_buffers(c, OP_BIND_UBO); }
 NVN_API(nvnCommandBufferBindStorageBuffer) { bind_buffer(c, OP_BIND_SSBO); }
 NVN_API(nvnCommandBufferBindStorageBuffers) { bind_buffers(c, OP_BIND_SSBO); }
-// void nvnCommandBufferPush{Graphics,Compute}Constants(NVNcommandBuffer *, int table, int offset, int bytes,
-// const void *data), NVN 2. The driver (sdk+0x5d34b0 graphics, sdk+0x5d3a30 compute) clamps bytes to 0x100, drops
-// calls under 4 bytes and writes words: graphics as SET_ROOT_TABLE_SELECTOR (method 0x504, table & 7 | offset << 8)
-// plus LOAD_ROOT_TABLE (0x508), compute through MME macro 0x53. Graphics shaders read table 0 as constant bank 24:
-// the full-screen blits get their texel size and size this way (1/w, 1/h, w, h at 0x0..0xc in Bananza's runs). Where
-// compute shaders read their pushes is not known yet; no Bananza compute stage reads bank 24.
-// The Deferred entry points (sdk+0x5d3670 graphics, sdk+0x5d3df0 compute) have the same five arguments, but store the
-// direct data pointer and the low byte of offset without reading data. The submit interpreter reloads that pointer.
-// Keep the host's 256-byte table bound for both pipelines; the deferred compute helper itself does not clamp bytes.
-static void push_constants(const Cpu *c, int compute, int deferred) {
-    cmd_t *o = cmd_of(c);
-    int table = (int)(arg_x(c, 1) & 7), offset = deferred ? (uint8_t)arg_x(c, 2) : (int)arg_x(c, 2);
-    uint32_t bytes = (uint32_t)arg_x(c, 3);
-    if (bytes > 0x100) bytes = 0x100;
-    if (bytes < 4) return;
-    if (offset < 0 || offset + bytes > 0x100 || (offset & 3)) {
-        rt_log("nvn: Push%sConstants offset %#x bytes %#x past the 256-byte root table", compute ? "Compute" : "Graphics",
-               offset, bytes);
-        return;
-    }
-    uint32_t n = bytes / 4;
-    p_push_const *r = RECN(o, OP_PUSH_CONST, p_push_const, w, n);   // holds only n words of w: set fields one by one
-    r->compute = compute, r->table = table, r->offset = offset, r->bytes = (int32_t)(n * 4);
-    r->src = deferred ? arg_x(c, 4) : 0;
-    if (!deferred) memcpy(r->w, arg_p(c, 4), n * 4);
-    hw_fix(o, 4 * ((size_t)n + 2));   // method header, selector or macro parameter, n words
-}
-NVN_API(nvnCommandBufferPushGraphicsConstants) { push_constants(c, 0, 0); }
-NVN_API(nvnCommandBufferPushComputeConstants) { push_constants(c, 1, 0); }
-NVN_API(nvnCommandBufferPushGraphicsConstantsDeferred) { push_constants(c, 0, 1); }
-NVN_API(nvnCommandBufferPushComputeConstantsDeferred) { push_constants(c, 1, 1); }
 // Texture, image and separate handle binds. A deferred bind (NVN 55 *Deferred entry points, the fallback of the inline
 // fast paths) keeps the pointer to the game's handle array: the original driver (sdk+0x46cc00 BindTexturesDeferred)
 // reads the handles when the command buffer is submitted, and the game fills its material handle tables after
 // recording and before the submit (nvn_submit_prepare). hw_bytes: the hardware size of the plain variant.
 static void bind_handles(cmd_t *o, uint32_t op, int st, int first, int n, const uint64_t *h, int deferred, size_t hw_bytes) {
     if (n < 0 || n > 32) { rt_log("nvn: bind of %d handles", n); return; }
+    hw_size(o, hw_bytes ? hw_bytes : 16 + 4 * (size_t)n);   // macro 7 + method 0x1a2c + CB_POS + one word per binding
     p_bind_handles *r = RECN(o, op, p_bind_handles, h, n);
     r->stage = st;
     r->first = first;
     r->n = n;
     r->src = deferred ? (uint64_t)(uintptr_t)h : 0;
     memcpy(r->h, h, 8 * (size_t)n);
-    hw_fix(o, hw_bytes ? hw_bytes : 16 + 4 * (size_t)n);   // macro 7 + method 0x1a2c + CB_POS + one word per binding
 }
 static void bind_handle_array(const Cpu *c, uint32_t op, int deferred, int wide) {   // (cmd, stage, first, n, handles)
     int n = (int)arg_x(c, 3);
@@ -904,17 +1121,26 @@ NVN_API(nvnCommandBufferBindImagesDeferred) { bind_handle_array(c, OP_BIND_IMG, 
 NVN_API(nvnCommandBufferBindSeparateTexturesDeferred) { bind_handle_array(c, OP_BIND_TEX, 1, 1); }
 NVN_API(nvnCommandBufferBindSeparateSamplersDeferred) { bind_handle_array(c, OP_BIND_SAMP, 1, 1); }
 // void nvnCommandBufferBind{Uniform,Storage}BuffersDeferred(NVNcommandBuffer *cmd, NVNshaderStage stage, int first,
-// int n, const NVNbufferRange *ranges): buffer ranges still bind at record time
-NVN_API(nvnCommandBufferBindUniformBuffersDeferred) {
-    static int once;
-    if (!once++) NVN_LOG("BindUniformBuffersDeferred: buffer ranges bind at record time");
-    bind_buffers(c, OP_BIND_UBO);
+// int n, const NVNbufferRange *ranges): as with the deferred handle binds, the console driver keeps the pointer to the
+// game's range array and reads it at the submit (resolve_deferred), so a range the game changes after recording is the
+// one bound. Measured in MTF so far: no range changes between recording and submit (the "deferred binds at submit"
+// log line). MTF_DEFERRED_BUFS=0 binds the ranges as recorded.
+static void bind_buffers_deferred(const Cpu *c, uint32_t op) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DEFERRED_BUFS", "1") != 0;
+    if (!on) return bind_buffers(c, op);
+    cmd_t *o = cmd_of(c);
+    int st = (int)arg_x(c, 1), first = (int)arg_x(c, 2), n = (int)arg_x(c, 3);
+    const NVNbufferRange *rg = arg_p(c, 4);
+    for (int i = 0; i < n; i++) {
+        hw_size(o, 20);
+        *REC(o, op, p_bind_buf_def) =
+            (p_bind_buf_def){{st, first + i, rg[i].address, rg[i].size}, (uint64_t)(uintptr_t)&rg[i]};
+        watch_bind(o, op, st, first + i, rg[i].address, rg[i].size, " (deferred)");
+    }
 }
-NVN_API(nvnCommandBufferBindStorageBuffersDeferred) {
-    static int once;
-    if (!once++) NVN_LOG("BindStorageBuffersDeferred: buffer ranges bind at record time");
-    bind_buffers(c, OP_BIND_SSBO);
-}
+NVN_API(nvnCommandBufferBindUniformBuffersDeferred) { bind_buffers_deferred(c, OP_BIND_UBO); }
+NVN_API(nvnCommandBufferBindStorageBuffersDeferred) { bind_buffers_deferred(c, OP_BIND_SSBO); }
 // void nvnCommandBufferSetStencil{ValueMask,Mask,Ref}(NVNcommandBuffer *cmd, NVNface face, int value)
 NVN_API(nvnCommandBufferSetStencilValueMask) {
     *REC(cmd_of(c), OP_STENCIL, p_stencil) = (p_stencil){(int)arg_x(c, 1), (int)arg_x(c, 2), 0, 0, 0};
@@ -925,9 +1151,6 @@ NVN_API(nvnCommandBufferSetStencilMask) {
 NVN_API(nvnCommandBufferSetStencilRef) {
     *REC(cmd_of(c), OP_STENCIL, p_stencil) = (p_stencil){(int)arg_x(c, 1), 0, 0, (int)arg_x(c, 2), 2};
 }
-// void nvnCommandBufferSetStencilCullCriteria(NVNcommandBuffer *, NVNstencilFunc, int ref, int mask): a hint for the
-// hardware's stencil culling; the stencil test itself still decides, so the Vulkan replay needs nothing (Bananza)
-NVN_API(nvnCommandBufferSetStencilCullCriteria) { (void)c; }
 // void nvnCommandBufferSetPolygonOffsetClamp(NVNcommandBuffer *cmd, float factor, float units, float clamp)
 NVN_API(nvnCommandBufferSetPolygonOffsetClamp) {
     *REC(cmd_of(c), OP_POLY_OFFSET, p_poly_offset) = (p_poly_offset){arg_s(c, 0), arg_s(c, 1), arg_s(c, 2)};
@@ -947,47 +1170,45 @@ NVN_API(nvnCommandBufferDrawArraysInstanced) {
 // NVNbufferAddress indices)
 NVN_API(nvnCommandBufferDrawElements) {
     cmd_t *o = cmd_of(c);
+    hw_size(o, 48);
     *REC(o, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), 0, 0, 1, arg_x(c, 4)};
-    hw_fix(o, 48);
 }
 // void nvnCommandBufferDrawElementsBaseVertex(..., NVNbufferAddress indices, int base_vertex)
 NVN_API(nvnCommandBufferDrawElementsBaseVertex) {
     cmd_t *o = cmd_of(c);
+    hw_size(o, 44);
     *REC(o, OP_DRAW_IDX, p_draw_idx) =
         (p_draw_idx){(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), (int)arg_x(c, 5), 0, 1, arg_x(c, 4)};
-    hw_fix(o, 44);
 }
 // void nvnCommandBufferDrawElementsInstanced(..., NVNbufferAddress indices, int base_vertex, int base_instance,
 // int instances): assumed to use the 6-parameter draw macro of the base-vertex form (unverified)
 NVN_API(nvnCommandBufferDrawElementsInstanced) {
     cmd_t *o = cmd_of(c);
+    hw_size(o, 44);
     *REC(o, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3),
                                                     (int)arg_x(c, 5), (int)arg_x(c, 6), (int)arg_x(c, 7), arg_x(c, 4)};
-    hw_fix(o, 44);
 }
 // void nvnCommandBufferDrawElementsIndirect(NVNcommandBuffer *cmd, NVNdrawPrimitive prim, NVNindexType type,
 // NVNbufferAddress indices, NVNbufferAddress indirect): the arguments at indirect are often GPU-written, so the replay
-// draws with vkCmdDrawIndexedIndirect from the pool buffer (nxnative hle_nvn.c, SavageWindRecomp cmdbuf.c)
+// draws with vkCmdDrawIndexedIndirect from the pool buffer
 NVN_API(nvnCommandBufferDrawElementsIndirect) {
     *REC(cmd_of(c), OP_DRAW_IDX_IND, p_draw_idx_ind) = (p_draw_idx_ind){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
 }
 // void nvnCommandBufferDrawArraysIndirect(NVNcommandBuffer *cmd, NVNdrawPrimitive prim, NVNbufferAddress indirect)
 NVN_API(nvnCommandBufferDrawArraysIndirect) {
-    *REC(cmd_of(c), OP_DRAW_IND_MULTI, p_draw_ind_multi) =
-        (p_draw_ind_multi){.prim = (int)arg_x(c, 1), .ind = arg_x(c, 2), .max_draws = 1};
+    *REC(cmd_of(c), OP_DRAW_IND_MULTI, p_draw_ind_multi) = (p_draw_ind_multi){(int)arg_x(c, 1), -1, 0, arg_x(c, 2), 0, 1, 0};
 }
-// void nvnCommandBufferMultiDrawArraysIndirectCount(cmd, prim, indirect, parameter, maxDraws, stride)
+// void nvnCommandBufferMultiDrawArraysIndirectCount(NVNcommandBuffer *cmd, NVNdrawPrimitive prim,
+// NVNbufferAddress indirect, NVNbufferAddress count, int max_draws, ptrdiff_t stride)
 NVN_API(nvnCommandBufferMultiDrawArraysIndirectCount) {
     *REC(cmd_of(c), OP_DRAW_IND_MULTI, p_draw_ind_multi) =
-        (p_draw_ind_multi){.prim = (int)arg_x(c, 1), .ind = arg_x(c, 2), .count = arg_x(c, 3),
-                           .max_draws = (int)arg_x(c, 4), .stride = (int64_t)arg_x(c, 5)};
+        (p_draw_ind_multi){(int)arg_x(c, 1), -1, 0, arg_x(c, 2), arg_x(c, 3), (int)arg_x(c, 4), (int)arg_x(c, 5)};
 }
-// void nvnCommandBufferMultiDrawElementsIndirectCount(cmd, prim, type, indices, indirect, parameter, maxDraws, stride)
+// void nvnCommandBufferMultiDrawElementsIndirectCount(NVNcommandBuffer *cmd, NVNdrawPrimitive prim, NVNindexType type,
+// NVNbufferAddress indices, NVNbufferAddress indirect, NVNbufferAddress count, int max_draws, ptrdiff_t stride)
 NVN_API(nvnCommandBufferMultiDrawElementsIndirectCount) {
-    *REC(cmd_of(c), OP_DRAW_IND_MULTI, p_draw_ind_multi) =
-        (p_draw_ind_multi){.prim = (int)arg_x(c, 1), .indexed = 1, .itype = (int)arg_x(c, 2), .ibuf = arg_x(c, 3),
-                           .ind = arg_x(c, 4), .count = arg_x(c, 5), .max_draws = (int)arg_x(c, 6),
-                           .stride = (int64_t)arg_x(c, 7)};
+    *REC(cmd_of(c), OP_DRAW_IND_MULTI, p_draw_ind_multi) = (p_draw_ind_multi){
+        (int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4), arg_x(c, 5), (int)arg_x(c, 6), (int)arg_x(c, 7)};
 }
 // void nvnCommandBufferDispatchCompute(NVNcommandBuffer *cmd, int x, int y, int z): caller = the game's return address
 NVN_API(nvnCommandBufferDispatchCompute) {
@@ -1015,16 +1236,8 @@ NVN_API(nvnCommandBufferSetColorReductionThresholds) { (void)c; }
 // void nvnCommandBufferBarrier(NVNcommandBuffer *cmd, int bits)
 NVN_API(nvnCommandBufferBarrier) { REC(cmd_of(c), OP_BARRIER, p_barrier)->bits = (int)arg_x(c, 1); }
 // void nvnCommandBufferSetTexturePool / SetSamplerPool(NVNcommandBuffer *cmd, const NVNtexturePool / NVNsamplerPool *)
-NVN_API(nvnCommandBufferSetTexturePool) {
-    dpool_ref pool;
-    if (!nvn_dpool_snapshot(arg_p(c, 1), 1u << 20, &pool)) rt_fatal("nvn: invalid texture descriptor pool");
-    REC(cmd_of(c), OP_SET_TEX_POOL, p_set_pool)->pool = pool;
-}
-NVN_API(nvnCommandBufferSetSamplerPool) {
-    dpool_ref pool;
-    if (!nvn_dpool_snapshot(arg_p(c, 1), 1u << 12, &pool)) rt_fatal("nvn: invalid sampler descriptor pool");
-    REC(cmd_of(c), OP_SET_SAMP_POOL, p_set_pool)->pool = pool;
-}
+NVN_API(nvnCommandBufferSetTexturePool) { REC(cmd_of(c), OP_SET_TEX_POOL, p_set_pool)->pool = arg_p(c, 1); }
+NVN_API(nvnCommandBufferSetSamplerPool) { REC(cmd_of(c), OP_SET_SAMP_POOL, p_set_pool)->pool = arg_p(c, 1); }
 // void nvnCommandBufferCopyBufferToTexture(NVNcommandBuffer *cmd, NVNbufferAddress src, const NVNtexture *dst,
 // const NVNtextureView *view, const NVNcopyRegion *region, int flags)
 NVN_API(nvnCommandBufferCopyBufferToTexture) {
@@ -1073,8 +1286,7 @@ NVN_API(nvnCommandBufferCopyTextureToTexture) {
 }
 // void nvnCommandBufferDownsample(NVNcommandBuffer *cmd, const NVNtexture *src, const NVNtexture *dst): level 0 of src
 // into level 0 of dst, whole extents, filtered. Recorded as a linear-filter texture copy: copy_t2t resolves a
-// multisample source into an equal-size target and blits (2x2 average at half size) between sizes. As nxnative
-// hle_nvn.c and SavageWindRecomp cmdbuf.c record it; docs/maxwell.md 1.19.
+// multisample source into an equal-size target and blits (2x2 average at half size) between sizes.
 NVN_API(nvnCommandBufferDownsample) {
     p_copy_t2t *o = REC(cmd_of(c), OP_COPY_T2T, p_copy_t2t);
     o->src = tex_pin(arg_p(c, 1));
@@ -1085,91 +1297,33 @@ NVN_API(nvnCommandBufferDownsample) {
 }
 // void nvnCommandBufferSetCopyRowStride(NVNcommandBuffer *cmd, ptrdiff_t stride)
 NVN_API(nvnCommandBufferSetCopyRowStride) { REC(cmd_of(c), OP_COPY_STRIDE, p_copy_stride)->stride = (int64_t)arg_x(c, 1); }
-// void nvnCommandBufferSetCopyImageStride(NVNcommandBuffer *cmd, ptrdiff_t stride)
-NVN_API(nvnCommandBufferSetCopyImageStride) { REC(cmd_of(c), OP_COPY_IMAGE_STRIDE, p_copy_stride)->stride = (int64_t)arg_x(c, 1); }
-// ptrdiff_t nvnCommandBufferGetCopyImageStride(const NVNcommandBuffer *cmd)
-NVN_API(nvnCommandBufferGetCopyImageStride) { (void)c; ret_x(c, 0); }
+// void nvnCommandBufferSetCopyImageStride(NVNcommandBuffer *cmd, ptrdiff_t stride) (NVN2): bytes between the layers or
+// slices of the buffer side of a buffer <-> texture copy; 0 is tightly packed (row stride x rows)
+NVN_API(nvnCommandBufferSetCopyImageStride) {
+    REC(cmd_of(c), OP_COPY_IMAGE_STRIDE, p_copy_stride)->stride = (int64_t)arg_x(c, 1);
+}
 // void nvnCommandBufferSetBlendColor(NVNcommandBuffer *cmd, const float *rgba)
 NVN_API(nvnCommandBufferSetBlendColor) { memcpy(REC(cmd_of(c), OP_BLEND_COLOR, p_blend_color)->rgba, arg_p(c, 1), 16); }
 
-// void nvnCommandBufferWaitSync(NVNcommandBuffer *cmd, const NVNsync *sync): the SDK retains the pointer at record
-// time and reads the sync's current producer at submit. Preparation fulfils the wait before consumer CPU snapshots.
-NVN_API(nvnCommandBufferWaitSync) {
-    cmd_t *o = cmd_of(c);
-    REC(o, OP_WAIT_SYNC, p_wait_sync)->sync = arg_p(c, 1);
-    hw_fix(o, 0);   // the SDK records a CPU control entry here; GPU wait commands are emitted at submit
-}
-// Commands without an effect on this replay (hle_nvn.c g_nops). WaitEvent still relies on in-order replay; shader
-// scratch memory has no host counterpart the replay needs.
-// void nvnCommandBufferWaitEvent(cmd, const NVNevent *event,
+// Commands without an effect on this replay (hle_nvn.c g_nops): WaitSync and WaitEvent order work against other queues
+// or the CPU, and every submit replays in order on one queue; shader scratch memory and the tessellation patch size
+// have no host counterpart the replay needs.
+// void nvnCommandBufferWaitSync(NVNcommandBuffer *cmd, const NVNsync *sync), WaitEvent(cmd, const NVNevent *event,
 // NVNeventWaitMode mode, uint32_t value), SetShaderScratchMemory(cmd, const NVNmemoryPool *pool, ptrdiff_t offset,
 // size_t size), SetPatchSize(cmd, int size)
+NVN_API(nvnCommandBufferWaitSync) { (void)c; }
 NVN_API(nvnCommandBufferWaitEvent) { (void)c; }
 NVN_API(nvnCommandBufferSetShaderScratchMemory) { (void)c; }
-NVN_API(nvnCommandBufferSetPatchSize) { REC(cmd_of(c), OP_PATCH_SIZE, p_patch_size)->size = (int)arg_x(c, 1); }
+// The control points of a patch (NVN_DRAW_PRIMITIVE_PATCHES): the tessellation pipeline's patchControlPoints (p_flag).
+NVN_API(nvnCommandBufferSetPatchSize) { REC(cmd_of(c), OP_PATCH_SIZE, p_flag)->value = (int32_t)arg_x(c, 1); }
 
 // ---------- submit
 // What the console reads at the submit call is read here, on the game thread: every handle must be a live recording,
-// and deferred binds and pushes take the data the game's arrays hold now (the game fills its tables for the next frame
-// as soon as the submit returns). The result is written into the recording copy.
-static uint64_t def_reads, def_changed, n_clones;
+// and deferred binds take the handles the game's arrays hold now (the game fills its tables for the next frame as soon
+// as the submit returns). The result is written into the recording copy.
+static uint64_t def_reads, def_changed, def_buf_changed, n_clones;
 
-// Only QueueFenceSync and window acquire currently produce syncs: both name work outside this submission that is
-// already queued (or complete). Recorded FenceSync and imported/external producers remain unimplemented.
-// Waiting for their maximum before the whole batch is conservative: it orders CPU completion callbacks as well
-// as GPU work before *any* deferred read or backend snapshot, including those before a wait in another handle.
-static uint64_t wait_target(const uint8_t *p, int depth) {
-    uint64_t target = 0;
-    for (;;) {
-        op_hdr h;
-        memcpy(&h, p, sizeof h);
-        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_)
-            rt_fatal("nvn: corrupt recording at %p while preparing WaitSync (op %u size %u)", (const void *)p, h.op, h.size);
-        if (h.op == OP_END) return target;
-        if (h.op == OP_JUMP) {
-            if (h.size < 16) rt_fatal("nvn: short WaitSync jump record at %p", (const void *)p);
-            memcpy(&p, p + 8, 8);
-            continue;
-        }
-        uint64_t value = 0;
-        if (h.op == OP_CALL) {
-            if (h.size < 16) rt_fatal("nvn: short WaitSync call record at %p", (const void *)p);
-            uint64_t called;
-            memcpy(&called, p + 8, 8);
-            if (depth >= 16) rt_fatal("nvn: WaitSync preparation: call depth over 16");
-            value = wait_target((const uint8_t *)(uintptr_t)called, depth + 1);
-        } else if (h.op == OP_WAIT_SYNC) {
-            if (h.size < 8 + sizeof(p_wait_sync)) rt_fatal("nvn: short WaitSync record at %p", (const void *)p);
-            const sync_t *source = ((const p_wait_sync *)(const void *)(p + 8))->sync;
-            if (!source) rt_fatal("nvn: CommandBufferWaitSync with a null sync");
-            sync_t snapshot;
-            memcpy(&snapshot, source, sizeof snapshot);   // one value-at-submit read; never reread while waiting
-            if (snapshot.magic != MAGIC('S', 'Y', 'N', 'C') ||
-                (snapshot.fenced != 0 && snapshot.fenced != 1 && snapshot.fenced != 3))
-                rt_fatal("nvn: CommandBufferWaitSync with an invalid sync state");
-            if (snapshot.fenced) value = snapshot.fence;   // an unfenced SDK sync emits no GPU wait
-        }
-        if (value > target) target = value;
-        p += h.size;
-    }
-}
-
-static void wait_submission(const uint64_t *handles, int n) {
-    uint64_t target = 0;
-    for (int i = 0; i < n; i++) {
-        uint64_t value = wait_target((const uint8_t *)(uintptr_t)handles[i], 0);
-        if (value > target) target = value;
-    }
-    if (!target) return;
-    const GfxBackend *b = gfx_backend();
-    // No copy/backend lock is held here. QueueSubmitCommands has given its virtual core up. The async front
-    // submit lock does not stop an already-enqueued producer: replay/completion never acquire that lock.
-    // fence_done/fence_wait include completion callbacks, unlike the raw Vulkan timeline.
-    if (b->fence_done() < target && !b->fence_wait(target, UINT64_MAX))
-        rt_fatal("nvn: CommandBufferWaitSync could not reach producer fence %llu", (unsigned long long)target);
-}
-
-static int resolve_deferred(const uint8_t *p, int depth) {   // returns the number of deferred binds and pushes
+static int resolve_deferred(const uint8_t *p, int depth) {   // returns the number of deferred binds
     int nd = 0;
     for (;;) {
         op_hdr h;
@@ -1187,16 +1341,6 @@ static int resolve_deferred(const uint8_t *p, int depth) {   // returns the numb
             memcpy(&t, p + 8, 8);
             if (depth >= 16) rt_fatal("nvn: deferred bind resolution: call depth over 16");
             nd += resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1);
-        } else if (h.op == OP_PUSH_CONST) {
-            if (h.size < 8 + offsetof(p_push_const, w)) rt_fatal("nvn: short push-constant record at %p", (const void *)p);
-            p_push_const *b = (p_push_const *)(uintptr_t)(p + 8);
-            if (b->src) {
-                if (b->bytes <= 0 || b->bytes > (int)sizeof b->w || (b->bytes & 3) ||
-                    h.size < 8 + offsetof(p_push_const, w) + (size_t)b->bytes)
-                    rt_fatal("nvn: invalid deferred push-constant record at %p", (const void *)p);
-                nd++;
-                memcpy(b->w, (const void *)(uintptr_t)b->src, (size_t)b->bytes);
-            }
         } else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
             p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
             if (b->src && b->n > 0 && b->n <= 32) {
@@ -1211,47 +1355,66 @@ static int resolve_deferred(const uint8_t *p, int depth) {   // returns the numb
                     memcpy(b->h, cur, 8 * (size_t)b->n);
                 }
             }
+        } else if ((h.op == OP_BIND_UBO || h.op == OP_BIND_SSBO) && h.size >= 8 + sizeof(p_bind_buf_def)) {
+            p_bind_buf_def *b = (p_bind_buf_def *)(uintptr_t)(p + 8);   // a deferred range: the game's entry now
+            if (b->src) {
+                nd++;
+                NVNbufferRange cur;
+                memcpy(&cur, (const void *)(uintptr_t)b->src, sizeof cur);
+                __atomic_fetch_add(&def_reads, 1, __ATOMIC_RELAXED);
+                if (cur.address != b->b.addr || cur.size != b->b.size) {
+                    if (__atomic_fetch_add(&def_buf_changed, 1, __ATOMIC_RELAXED) < 6)
+                        NVN_LOG("deferred %s bind read a new range at submit: stage %d slot %d, %#llx+%#llx at record "
+                                "-> %#llx+%#llx", h.op == OP_BIND_UBO ? "uniform" : "storage", b->b.stage, b->b.index,
+                                (unsigned long long)b->b.addr, (unsigned long long)b->b.size,
+                                (unsigned long long)cur.address, (unsigned long long)cur.size);
+                    b->b.addr = cur.address, b->b.size = cur.size;
+                }
+            }
         }
         p += h.size;
     }
 }
 
+static void deferred_summary(uint64_t now) {
+    if (now % 3600) return;
+    rt_log("nvn: deferred binds at submit %llu: %llu reads, %llu handle arrays and %llu buffer ranges changed since "
+           "recording", (unsigned long long)now, (unsigned long long)__atomic_load_n(&def_reads, __ATOMIC_RELAXED),
+           (unsigned long long)__atomic_load_n(&def_changed, __ATOMIC_RELAXED),
+           (unsigned long long)__atomic_load_n(&def_buf_changed, __ATOMIC_RELAXED));
+}
+
 void nvn_submit_prepare(const uint64_t *handles, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
-    nvn_mode_trace(NVN_MODE_PREPARE, 0, 0, (uint32_t)n, now);
-    for (int i = 0; i < n; i++) {
-        uint64_t handle = handles[i];
-        copy_touch(handle, now, "QueueSubmitCommands");
-        nvn_mode_trace(NVN_MODE_HANDLE, 0, handle, (uint32_t)i, now);
-    }
-    wait_submission(handles, n);
+    for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
     for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
+    deferred_summary(now);
 }
 
 // Asynchronous replay. A copy a queued submission still reads keeps that submission's deferred binds: when it holds
 // deferred binds (or is not known to hold none), this submission gets a clone, resolved here and freed after its replay.
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
-    nvn_mode_trace(NVN_MODE_PREPARE, 0, 0, (uint32_t)n, now);
     uint64_t replayed = gfx_replayed_submits();
     plat_mutex_lock(&copy_lock);
     if (nzombies) zombie_sweep(replayed);
     for (int i = 0; i < n; i++) {
-        uint64_t handle = handles[i];
-        copy_prefix *pf = copy_find(handle);
+        copy_prefix *pf = copy_find(handles[i]);
         if (!pf) {
             plat_mutex_unlock(&copy_lock);
             rt_fatal("nvn: QueueSubmitCommands: command handle %#llx is not a live recording (released or never recorded)",
-                     (unsigned long long)handle);
+                     (unsigned long long)handles[i]);
         }
-        nvn_mode_trace(NVN_MODE_HANDLE, 0, handle, (uint32_t)i, now);
-        out[i] = handle;
+        out[i] = handles[i];
         if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
-            size_t sz = sizeof *pf + pf->bytes;
-            copy_prefix *cl = copy_block(sz);
-            uint64_t block = cl->block;
-            memcpy(cl, pf, sz);
-            cl->block = block;
+            copy_prefix *cl = copy_block(pf->bytes, 0, "recording clone");   // copy_lock held
+            size_t cap = cl->cap;
+            memcpy(cl, pf, sizeof *pf + pf->bytes);
+            cl->cap = cap;
+            cl->pin_v = NULL;
+            if (pf->pin_v && (cl->pin_v = malloc(sizeof *cl->pin_v * pf->pins)))
+                memcpy((void *)cl->pin_v, (const void *)pf->pin_v, sizeof *cl->pin_v * pf->pins);
+            copy_pins_ref(cl, 1);
             cl->magic = 0;   // not a live handle: the game never sees it
             cl->used_at = now;
             zombie_add(cl);
@@ -1262,7 +1425,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         }
     }
     plat_mutex_unlock(&copy_lock);
-    wait_submission(out, n);
+    dead_free();
     for (int i = 0; i < n; i++) {
         int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
         if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
@@ -1281,8 +1444,8 @@ const char *nvn_op_name(uint32_t op) {
         "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "STENCIL", "POLY_OFFSET", "DRAW",
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
-        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CONST", "WAIT_SYNC",
-        "COPY_IMAGE_STRIDE", "PATCH_SIZE", "DRAW_IND_MULTI",
+        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMAGE_STRIDE",
+        "PATCH_SIZE", "DRAW_IND_MULTI",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

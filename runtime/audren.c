@@ -1,10 +1,8 @@
-// Adapted from MacNativeGames games/totk/runtime/audio_renderer.c @ b75be8c (MIT, Copyright (c) 2026
-// MacNativeGames contributors). Its voice lifetime (play state, wave buffer release, flush) is ported from
-// Ryujinx.Audio VoiceInfo / DataSourceHelper (MIT, Copyright (c) Ryujinx Team and Contributors).
 // audren:u. The SDK's nn::audio client builds RequestUpdate input unchanged; this
 // service validates every section against the header, keeps server-side voice state, advances it in real time (one
 // frame of sample_count / sample_rate seconds per render tick, signalling the renderer's event) and writes the output
 // status the client expects. The mixer behind it is audio_mixer.c.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,8 +14,6 @@
 #include "platform/platform.h"
 
 static volatile int32_t g_live;
-
-long audren_renderers_live(void) { return plat_cas32(&g_live, 0, 0); }
 
 static int revision_number(uint32_t rev) { return (int)(rev >> 24) - '0'; }
 
@@ -96,7 +92,7 @@ static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
     v->use_float_biquads = 0;
     if (!in->in_use) return;
     need(in->wave_buffer_index < 4, "wave buffer index");
-    // The play state as the DSP keeps it (Ryujinx VoiceInfo.UpdatePlayState): Stop on a voice that is not stopped
+    // The play state as the DSP keeps it: Stop on a voice that is not stopped
     // becomes Stopping, which the next render frame turns into Stopped after giving back every queued buffer.
     if (in->play_state == PLAY_STARTED) v->state = SV_STARTED;
     else if (in->play_state == PLAY_PAUSED) v->state = SV_PAUSED;
@@ -134,7 +130,7 @@ static void skip_empty(AudioRenderer *r, ServerVoice *v) {
     }
 }
 
-// Each render frame, before mixing (Ryujinx VoiceInfo.UpdateParametersForCommandGeneration): flush, stop, start.
+// Each render frame, before mixing: flush, stop, start.
 static void voices_prepare(AudioRenderer *r) {
     for (int k = 0; k < r->param.voice_count; k++) {
         ServerVoice *v = &r->voices[k];
@@ -252,11 +248,6 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
             }
         } else
             memcpy(&v, voices + i * voice_stride, sizeof v);
-        // A record that is not in use can be all zero, id included (Bananza leaves the records of voices it never used
-        // untouched). Its id then names voice 0 and the reset below would wipe that voice on every update, silencing
-        // the left half of a stereo pair (#63). Eglantine audio_core/renderer/behavior/info_updater.cpp,
-        // InfoUpdater::UpdateVoices, skips such a record; here it applies to the slot it occupies.
-        if (!v.in_use) v.id = (uint32_t)i;
         update_voice(r, &v);
         ServerVoice *server = &r->voices[v.id];
         server->use_float_biquads = (uint8_t)float_voices;
@@ -323,11 +314,9 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
 
 // ---- render tick: one frame each time the output device has taken the ring below its target (audio_mixer_pace_ns),
 // or every sample_count / sample_rate seconds of the host clock without a device, while stopped or while it stalls
-static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds) {
+static void advance_voice(AudioRenderer *r, ServerVoice *v) {
     if (!v->in.in_use || v->state != SV_STARTED || !v->in.sample_rate) return;
-    double want = v->fraction + out_seconds * v->in.sample_rate * (v->in.pitch > 0 ? v->in.pitch : 1.0);
-    uint64_t samples = (uint64_t)want;
-    v->fraction = want - (double)samples;
+    uint64_t samples = audio_voice_consumed(r, v, (int)r->param.sample_count);
     while (samples && v->valid[v->index]) {
         AudrenWaveBuffer *b = &v->buffers[v->index];
         uint64_t length = (uint64_t)(b->end - b->start), left = length - v->offset;
@@ -359,12 +348,28 @@ static void render_thread(void *p) {
     plat_thread_priority(PLAT_PRIO_HIGHEST);
     const uint64_t frame_ns = (uint64_t)r->param.sample_count * 1000000000ull / (uint64_t)r->param.sample_rate;
     const double frame = (double)r->param.sample_count / r->param.sample_rate;
-    uint64_t next = kern_now_ns();
+    // When the device pulls a period (1024 samples on PipeWire, 4-5 frames) the ring drops below its target
+    // and the frames would otherwise render back to back. On hardware the DSP renders one frame every 5 ms and
+    // the game's audio thread works in between; AUX effects need that time to fill the return ring, or mix_aux
+    // reads stale samples and the frame clicks at its seams. Device-paced frames stay at least 4/5 of a frame
+    // apart, which still refills a period well before the device drains it. Linux only: on Windows SDL pulls
+    // 480-sample periods, and a sink dump (MTF_AUDIO_DUMP) of the bursts there showed no more seam spikes than
+    // chance, so a wait on this thread buys nothing.
+#ifdef __linux__
+    const uint64_t gap_ns = frame_ns * 4 / 5;
+#else
+    const uint64_t gap_ns = 0;
+#endif
+    uint64_t next = kern_now_ns(), last = 0;
     while (plat_cas32(&r->running, 0, 0)) {
         uint64_t now = kern_now_ns();
         int64_t pace = audio_mixer_pace_ns(r, now);
         if (pace > 0) {
             plat_wait_ns((uint64_t)pace);
+            continue;
+        }
+        if (pace == 0 && last && now - last < gap_ns) {
+            plat_wait_ns(gap_ns - (now - last));
             continue;
         }
         if (pace == 0) {
@@ -374,11 +379,12 @@ static void render_thread(void *p) {
             else if (now - next > 100000000ull) next = now;   // fell far behind (debugger, sleep): resynchronise
             next += frame_ns;
         }
+        last = kern_now_ns();
         plat_mutex_lock(&r->lock);
         if (r->state == 0) {
             voices_prepare(r);
             audio_mixer_render(r, frame);
-            for (int i = 0; i < r->param.voice_count; i++) advance_voice(r, &r->voices[i], frame);
+            for (int i = 0; i < r->param.voice_count; i++) advance_voice(r, &r->voices[i]);
             r->elapsed_frames++;
             uint64_t given = r->stop_released + r->empty_played + r->flushed;
             if ((rt_trace & RT_TRACE_IPC) && given != r->logged_released && r->elapsed_frames % 1000 == 0) {
@@ -398,8 +404,6 @@ static IpcBuffer pick(const IpcBuffer *a, unsigned na, const IpcBuffer *b, unsig
     IpcBuffer x = i < na ? a[i] : (IpcBuffer){0}, y = i < nb ? b[i] : (IpcBuffer){0};
     return x.size ? x : y;
 }
-
-static float voice_drop = 1.0f;   // IAudioRenderer 12/13
 
 static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     AudioRenderer *r = s->state;
@@ -438,11 +442,6 @@ static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
     case 7: rs->copy[rs->ncopy++] = kern_event_readable(r->event); return;   // QuerySystemEvent
     case 8: r->time_limit = IPC_ARG(rq, uint32_t, 0); return;                // SetRenderingTimeLimit
     case 9: { uint32_t v = r->time_limit ? r->time_limit : 100; IPC_OUT(rs, v); return; }   // GetRenderingTimeLimit
-    // [15.0.0+] Set/GetVoiceDropParameter (a float, as nn::audio::SetAudioRendererVoiceDropParameter takes): the host
-    // mixer drops no voices, so the value is only kept for the getter. One renderer is open at a time.
-    case 12: voice_drop = IPC_ARG(rq, float, 0); return;
-    case 13: { float v = voice_drop; IPC_OUT(rs, v); return; }
-    case 14: return;   // [23.0.0+] SetAsyncMemoryPoolControlEnabled(bool): memory pools are always synchronous here
     default: ipc_unimplemented(s, rq);
     }
 }
@@ -458,18 +457,6 @@ static void renderer_close(void *p) {
     kern_handle_close(r->event);
     rt_log("audren: renderer closed after %llu frames", (unsigned long long)r->elapsed_frames);
     renderer_free(r);
-}
-
-// ---- aud:u, nn::audio::IUserClientSession (Switch 2): the SDK reaches the audio managers through it
-// (nn::audio::CreateUserClientSessionByHipc) instead of opening audren:u itself. Switchbrew, "Audio services": command
-// 2 returns an IAudioRendererManager. 0 (IAudioInManager), 1 (IAudioOutManager), 3 and 4 are not served yet.
-void aud_user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-    switch (rq->cmd) {
-    case 2:
-        rs->move[rs->nmove++] = ipc_session_new("audren:u", audren_manager_handler, NULL, NULL);
-        return;
-    default: ipc_unimplemented(s, rq);
-    }
 }
 
 // ---- IAudioRendererManager

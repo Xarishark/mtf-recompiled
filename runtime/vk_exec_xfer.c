@@ -10,11 +10,11 @@
 //
 // Events and counters are CPU-visible side effects. Their values go into guest memory on the completion thread through
 // vk_completion_add, in submit order, as gfx_null.c does: event WRITE / ADD, counter {0, timestamp} for every type but
-// samples passed. A timestamp report puts 0 in the counter word: TOTK gates its clears on two such words being unequal.
+// samples passed. A timestamp report puts 0 in the counter word: A game may gate its clears on two such words being unequal.
 //
 // Samples passed (NVN_COUNTER_TYPE_SAMPLES_PASSED) is a running count on the queue: RESET_COUNTER zeroes it, every
 // draw after it adds the samples that passed the depth and stencil tests, REPORT_COUNTER writes the running value.
-// TOTK resets and reports it 3 to 8 times a frame in the field and its CPU reads the results back (f_70010c3298); a 0
+// A game may reset and report it several times a frame and read the results back with the CPU; a 0
 // there culls what the query tested. The replay counts with Vulkan occlusion queries ("occlusion counts" below).
 //
 // Conditional rendering is a CPU-side skip, not VK_EXT_conditional_rendering: the extension compares one 32-bit word
@@ -22,21 +22,20 @@
 // from guest memory; a counter reported by an earlier submission that is not done yet counts as 0 if it is a timestamp,
 // as unknown if it is samples passed. An unknown count renders: the report usually sits in the command buffer being
 // recorded, so its value cannot be waited for, and the word in memory still holds an older query's count. Rendering
-// costs at most the work the condition would have saved (MacNativeGames nvn_mtl.m decides the same); in the field
-// TOTK conditions only on timestamp reports. The condition sets VkExec.render_disabled, which vk_exec.c honours for
+// costs at most the work the condition would have saved; games mostly
+// condition on timestamp reports. The condition sets VkExec.render_disabled, which vk_exec.c honours for
 // clears and vk_exec_draw.c for draws and dispatches. A condition that cannot be read (address outside every pool)
 // renders.
-// Copies and CLEAR_TEX are not conditional (as in MacNativeGames, nvn_mtl.m).
+// Copies and CLEAR_TEX are not conditional.
 //
 // The copy semantics (region and layer arithmetic, row and image strides, whole-level clears, copy / blit / resolve
-// choice) follow MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m:10080-10368, 10618-10642, 1700-1725
-// (https://github.com/ly05010419/MacNativeGames @ b75be8cfa704df3701e86130c8ced268e79d6b11, MIT, Copyright (c) 2026
-// jhaizhou) and LAS Recomp runtime/nvn/vulkan/exec.c:3045-3235 (https://github.com/peiikai/LASRecomp @
-// da35b83a9611d046a9a681aae668d7085954d37f, MIT, Copyright (c) 2026 Peiikai).
+// choice) are adapted code: THIRD_PARTY_NOTICES.md.
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "cfg.h"
 
 #include "host.h"
 #include "nvn_api.h"
@@ -73,6 +72,7 @@ static void guest_written_cb(void *arg) {
 // The GPU wrote [addr, addr+size) of CPU-visible memory: tell the texture cache once the fence is reached.
 static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
     vk_usnap_drop(addr, size);
+    vk_exec_ub_foreign(ex, addr, size);
     if (nvn_gpu_only(addr)) return;
     Range *r = malloc(sizeof *r);
     if (!r) rt_fatal("vk: out of memory");
@@ -90,41 +90,71 @@ static void event_cb(void *arg) {
     free(e);
 }
 
-// NVNcounterData = {counter, timestamp}; timestamps are guest counter ticks (the base of GetSystemTick, rt_tick_hz).
-static void write_counter_at(uint64_t addr, uint64_t counter, uint64_t ticks) {
-    uint64_t rec[2] = {counter, ticks};
+// NVNcounterData = {counter, timestamp}; timestamps are 31.25 MHz ticks (the base of GetSystemTick).
+static void write_counter(uint64_t addr, uint64_t counter) {
+    uint64_t rec[2] = {counter, kern_now_ns() / 32};
     memcpy((void *)(uintptr_t)addr, rec, sizeof rec);
 }
-static void write_counter(uint64_t addr, uint64_t counter) {
-    write_counter_at(addr, counter, rt_ns_to_ticks(kern_now_ns()));
-}
 
-// A timestamp report. On the console the GPU runs a submission as soon as the game submits it and its work takes a few
-// milliseconds; here the replay comes first (up to a frame later with TOTK_REPLAY_ASYNC), and the completion is seen
-// later still, so "now" at completion is mostly the replay's delay. Bananza paces itself on (end-of-frame timestamp -
-// CPU frame start): with that delay in it, it measured every frame as longer than 1/60 s and dropped to a longer present
-// interval. For a Switch 2 game the report keeps that existing entry-tick approximation, copied into its callback
-// payload before work can complete. It does not measure GPU execution: TOP and END in one submit still share a tick.
-// Concurrent callers may capture entry ticks in a different order from queueing; no global monotonicity is implied.
-typedef struct { uint64_t addr, submitted_ticks; } CounterWrite;
 static void counter_cb(void *arg) {
-    CounterWrite *w = arg;
-    if (!rt_game_version) write_counter_at(w->addr, 0, w->submitted_ticks);
-    else write_counter(w->addr, 0);
-    free(w);
+    uint64_t *addr = arg;
+    write_counter(*addr, 0);
+    free(addr);
 }
 
-// Reports queued by the replay that the GPU has not finished. The condition of RENDER_COND reads a timestamp one as 0
-// and a samples-passed one as unknown.
-#define PENDING 256
-static struct { uint64_t addr, fence; int unknown; } pending[PENDING];
-static unsigned pending_head;
+// Reports queued by the replay that the GPU has not finished, by address. The condition of RENDER_COND reads a timestamp
+// one as 0 and a samples-passed one as unknown. All of them have to be found: a game reports hundreds of counters a frame
+// (433 in the fly-over of the Academy courts, more in Adventure) and conditions on them later in the same submission. A
+// report that had dropped out of a list of the last 256 read the counter's old 0 from memory, so the object was culled,
+// and its own draws, which are its occlusion test for the next frame, reported 0 again: courts missing, and shadows that
+// came and went with the number of reports in the frame. An entry whose fence is done is free to reuse.
+#define PENDING_BITS 16
+#define PENDING_N (1u << PENDING_BITS)
+#define PENDING_PROBES 256u
+static struct { uint64_t addr, fence; int unknown; } pending[PENDING_N];
+static uint64_t pending_lost;   // the newest fence of a report that found no entry: until it is done, a miss is unknown
+
+static unsigned pending_home(uint64_t addr) {
+    return (unsigned)(((addr >> 3) * 0x9E3779B97F4A7C15ull) >> (64 - PENDING_BITS));
+}
+
+static void pending_add(uint64_t addr, uint64_t fence, int unknown) {
+    uint64_t done = vk_sync_fence_done();
+    unsigned i = pending_home(addr), slot = PENDING_N;
+    for (unsigned n = 0; n < PENDING_PROBES; n++, i = (i + 1) & (PENDING_N - 1)) {
+        if (pending[i].addr == addr) {
+            slot = i;
+            break;
+        }
+        if (slot == PENDING_N && pending[i].fence <= done) slot = i;   // free, or its report is done
+        if (!pending[i].addr) break;                                   // the end of this address's run
+    }
+    if (slot == PENDING_N) {   // PENDING_PROBES live reports in a row: not seen in practice, and safe (a miss renders)
+        pending_lost = fence;
+        return;
+    }
+    pending[slot].addr = addr, pending[slot].fence = fence, pending[slot].unknown = unknown;
+}
+
+// 1: a report to addr is not done yet (*unknown: a samples-passed one, or one the table had no room for)
+static int pending_find(uint64_t addr, int *unknown) {
+    uint64_t done = vk_sync_fence_done();
+    unsigned i = pending_home(addr);
+    for (unsigned n = 0; n < PENDING_PROBES && pending[i].addr; n++, i = (i + 1) & (PENDING_N - 1))
+        if (pending[i].addr == addr) {
+            if (pending[i].fence <= done) break;
+            *unknown = pending[i].unknown;
+            return 1;
+        }
+    *unknown = 1;
+    return pending_lost > done;
+}
 
 // ---- occlusion counts (samples passed)
 //
 // After a SAMPLES_PASSED reset, the first draw of a pass begins an occlusion query (precise when the device has
 // occlusionQueryPrecise); the query ends with the pass, or at the next report or reset of the counter, and the next
-// draw begins another. A Vulkan query begun inside a render pass must end inside it. TOTK always resets, draws the
+// draw begins another. A Vulkan query begun inside a render pass must end inside it. A game resets, draws the
 // tested proxies, reports, so counting stops at a report and restarts at the next reset: queries cover only the draws
 // between the two, not every pass of the frame. Once the game reports twice without a reset in between, counting stays
 // on for good (cumulative NVN semantics; that one report misses the draws since the previous one). The queries closed since the last
@@ -138,8 +168,6 @@ static unsigned pending_head;
 static VkQueryPool oq_pool;
 static int oq_state;                     // 0 not set up, 1 counting available, -1 unavailable
 static VkQueryControlFlags oq_flags;
-static int oq_inherit;                   // inheritedQueries: a secondary command buffer may run inside the query
-static int oq_outside;                   // the open query began before its pass and ends after it (sliced passes)
 static volatile uint8_t oq_busy[OQ_N];   // from begin until the completion thread read and reset the slot
 static uint32_t oq_next;                 // replay: next ring slot
 static int oq_counting;                  // replay: draws are counted (a reset since the last report, or oq_keep)
@@ -148,7 +176,7 @@ static int oq_keep;                      // replay: the game reported twice with
 static int oq_open = -1;                 // replay: the slot whose query is active in the open pass
 static uint32_t *oq_seg;                 // replay: slots closed since the last report or reset
 static uint32_t oq_nseg, oq_capseg;
-static int oq_lost;                      // replay: the segment missed a draw (ring full)
+static int oq_lost;                      // replay: the segment missed a draw (ring full, or vk_exec_oq_dropped)
 static uint64_t oq_count;                // completion thread: samples since the last reset
 
 typedef struct { uint64_t addr; int reset, lost; uint32_t n; uint32_t q[]; } OqSegment;
@@ -174,7 +202,6 @@ static int oq_ready(void) {
     }
     vkResetQueryPool(v->device, oq_pool, 0, OQ_N);
     oq_flags = f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
-    oq_inherit = f2.features.inheritedQueries != 0;
     oq_state = 1;
     return 1;
 }
@@ -192,6 +219,14 @@ static void oq_close(VkExec *ex) {
     oq_open = -1;
 }
 
+// A draw between a reset and its report that the replay leaves out for a reason of its own (an empty scissor, a shader or
+// pipeline still building) says nothing about the tested object: the count is at least 1 and the object stays visible.
+// The game's own disable is not one of these: it adds no samples, as on the console.
+void vk_exec_oq_dropped(VkExec *ex) {
+    (void)ex;
+    if (oq_counting) oq_lost = 1;
+}
+
 void vk_exec_oq_draw(VkExec *ex) {
     if (!oq_counting || oq_open >= 0) return;
     uint32_t q = oq_next % OQ_N;
@@ -207,41 +242,7 @@ void vk_exec_oq_draw(VkExec *ex) {
     oq_open = (int)q;
 }
 
-void vk_exec_oq_pass_end(VkExec *ex) {
-    if (!oq_outside) oq_close(ex);
-}
-int vk_exec_oq_idle(void) { return !oq_counting && oq_open < 0; }
-
-// Sliced passes (vk_exec.c par_start): a pass of secondary command buffers takes no query command, so its query begins
-// before vkCmdBeginRendering and ends after vkCmdEndRendering (vk_exec_oq_pass_ended), and the slices inherit it.
-// 0: draws are not counted now; 1: the query is open, *flags its control flags (a full ring also gives 1 with *open 0:
-// the draws go uncounted as on the plain path); -1: the device cannot inherit queries, the pass must not be sliced.
-int vk_exec_oq_begin_outside(VkExec *ex, VkQueryControlFlags *flags, int *open) {
-    *open = 0;
-    if (!oq_counting) return 0;
-    if (!oq_inherit) return -1;
-    if (oq_open < 0) vk_exec_oq_draw(ex);
-    *flags = oq_flags, *open = oq_open >= 0;
-    oq_outside = oq_open >= 0;
-    return 1;
-}
-
-void vk_exec_oq_pass_ended(VkExec *ex) {
-    if (!oq_outside) return;
-    oq_outside = 0;
-    oq_close(ex);
-}
-
-int vk_exec_oq_counting(void) { return oq_counting; }
-// Whether a sliced pass can run now: draws are not counted, or the device inherits queries into secondary buffers.
-int vk_exec_oq_sliceable(void) { return !oq_counting || oq_inherit; }
-
-void vk_exec_xfer_shutdown(void) {
-    if (oq_state > 0) vkDestroyQueryPool(vk_ctx()->device, oq_pool, NULL);
-    oq_pool = VK_NULL_HANDLE, oq_state = 0, oq_next = 0, oq_counting = oq_reported = oq_keep = 0, oq_open = -1;
-    oq_nseg = 0, oq_lost = 0, oq_count = 0;
-    memset((void *)oq_busy, 0, sizeof oq_busy);
-}
+void vk_exec_oq_pass_end(VkExec *ex) { oq_close(ex); }
 
 static void oq_cb(void *arg) {
     OqSegment *s = arg;
@@ -273,7 +274,9 @@ static void oq_cb(void *arg) {
     else {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
-        if (s->addr) write_counter(s->addr, oq_count);
+        static int all_visible = -1;   // MTF_OQ_ALL_VISIBLE=1 (diagnosis): every samples-passed report counts as visible
+        if (all_visible < 0) all_visible = cfg_bool("MTF_OQ_ALL_VISIBLE");
+        if (s->addr) write_counter(s->addr, all_visible && oq_count < 1000000 ? 1000000 : oq_count);
     }
     free(s);
 }
@@ -315,6 +318,12 @@ static void signal_event(VkExec *ex, const p_signal_event *p) {
 }
 
 static void report_counter(VkExec *ex, const p_report_counter *p) {
+    {   // which counter types the game reports, logged at the 1st, 100th and 10000th report of each
+        static volatile int32_t seen[32];
+        uint32_t t = p->type < 32 ? p->type : 31;
+        int32_t n = __atomic_add_fetch(&seen[t], 1, __ATOMIC_RELAXED);
+        if (n == 1 || n == 100 || n == 10000) rt_log("vk: counter type %u reported %d times", t, n);
+    }
     int samples = p->type == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_ready();
     if (nvn_gpu_only(p->addr)) {   // CPU-invisible pool: no host memory behind it
         if (samples) oq_report(ex, 0);
@@ -326,23 +335,32 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
     vk_mem_count(m.cls, VK_MUSE_GPU_WRITE, sizeof(NVNcounterData));
     if (samples) oq_report(ex, p->addr);
     else {
-        CounterWrite *a = malloc(sizeof *a);
+        uint64_t *a = malloc(sizeof *a);
         if (!a) rt_fatal("vk: out of memory");
-        *a = (CounterWrite){p->addr, ex->submitted_ticks};
+        *a = p->addr;
         vk_completion_add(ex->fence, counter_cb, a);
     }
-    pending[pending_head++ % PENDING] = (typeof(pending[0])){p->addr, ex->fence, samples};
+    pending_add(p->addr, ex->fence, samples);
 }
 
 // ---- conditional rendering
 
+// How often each kind turned rendering off (logged at 1, 100, 10000); MTF_RENDER_ALWAYS=1 (diagnosis) ignores both
+static void cond_note(VkExec *ex, const char *what) {
+    static int always = -1;
+    static volatile int32_t off[2], on[2];
+    if (always < 0) always = cfg_bool("MTF_RENDER_ALWAYS");
+    int k = what[15] == 'C';
+    int32_t n = __atomic_add_fetch(ex->render_disabled ? &off[k] : &on[k], 1, __ATOMIC_RELAXED);
+    if (n == 1 || n == 100 || n == 10000)
+        rt_log("vk: %s turned rendering %s %d times", what, ex->render_disabled ? "off" : "on", n);
+    if (always) ex->render_disabled = 0;
+}
+
 // 1: *v read, 0: not readable, 2: a samples-passed report not done yet (unknown)
 static int counter_word(uint64_t addr, uint64_t *v) {
-    uint64_t done = vk_sync_fence_done();
-    for (unsigned k = 1; k <= PENDING; k++) {   // newest first: the last report to addr decides
-        unsigned i = (pending_head - k) % PENDING;
-        if (pending[i].addr == addr && pending[i].fence > done) return *v = 0, pending[i].unknown ? 2 : 1;
-    }
+    int unknown;
+    if (pending_find(addr, &unknown)) return *v = 0, unknown ? 2 : 1;
     VkMemSpan m;
     if (nvn_gpu_only(addr) || !vk_mem_resolve(addr, sizeof *v, &m)) return 0;
     memcpy(v, (const void *)(uintptr_t)addr, sizeof *v);
@@ -366,7 +384,6 @@ static int cond_enabled(const p_render_cond *c) {
 typedef struct {
     const VkTexImage *img;
     VkImageAspectFlags aspect;
-    TexVkFormat f;
     uint32_t level, layer0;
     int bpb, bw, bh;
     int32_t x, y, z;           // region origin
@@ -375,16 +392,14 @@ typedef struct {
 
 // Resolves tex, its view and a copy region to image coordinates. 0 (warned) when the copy cannot be replayed.
 static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopyRegion *r, int defaults_to_level,
-                       int allow_decoded, Sub *s) {
+                       Sub *s) {
     memset(s, 0, sizeof *s);
     if (!t) return 0;
     TexVkFormat f;
-    if (!tex_vk_format(t->d.format, &f)) return 0;
-    if (!allow_decoded && (f.vk != f.ideal || f.expand_rgb || f.astc_bw)) {
+    if (!tex_vk_format(t->d.format, &f) || f.vk != f.ideal || f.expand_rgb || f.astc_bw) {
         warn_once(W_FORMAT, "copy of format %#x texture (decoded or expanded on upload): skipped", t->d.format);
         return 0;
     }
-    s->f = f;
     s->bpb = nvn_fmt_bpb(t->d.format, &s->bw, &s->bh);
     s->img = vk_texture_get(t);
     if (!s->img || !s->bpb) {
@@ -401,7 +416,7 @@ static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopy
     s->level = has_v && v->set_levels ? v->base_level : 0;
     s->layer0 = has_v && v->set_layers ? v->min_layer : 0;
     uint32_t lw = max1(img->width >> s->level), lh = max1(img->height >> s->level);
-    int k = img->scale > 1 ? img->scale : 1;
+    int k = img->scale > 1 ? img->scale : 1;   // a larger shadow map: the game's region in its texels
     s->x = r->xoffset * k, s->y = r->yoffset * k, s->z = r->zoffset;
     s->nz = r->depth > 0 ? (uint32_t)r->depth : 1;
     s->w = r->width > 0 ? (uint32_t)r->width * k : defaults_to_level ? (s->x < (int32_t)lw ? lw - (uint32_t)s->x : 0) : 0;
@@ -465,7 +480,11 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     Sub s;
-    if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, to_image, &s)) return;
+    if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
+    if (s.img->scale > 1) {   // the buffer holds the game's texel count, the image more
+        warn_once(W_REGION, "buffer copy of a shadow map enlarged by MTF_SHADOW_SCALE: skipped");
+        return;
+    }
     uint64_t size;
     VkBufferImageCopy c;
     VkMemSpan m;
@@ -473,138 +492,17 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     vk_mem_count(m.cls, to_image ? VK_MUSE_COPY_SRC : VK_MUSE_GPU_WRITE, size);
     vk_exec_pass_end(ex);
     vk_exec_barrier(ex);
-    int written = 0;
-    if (to_image && s.f.astc_bw && vk_astc_gpu()) {
-        uint32_t wb = (s.w + (uint32_t)s.bw - 1) / (uint32_t)s.bw, hb = (s.h + (uint32_t)s.bh - 1) / (uint32_t)s.bh;
-        uint64_t tight_row = (uint64_t)wb * (uint64_t)s.bpb;
-        // vk_astc_record takes tight block rows (no row pitch); fall back to the skip warning on non-tight rows or layer strides.
-        if ((ex->copy_stride > 0 && (uint64_t)ex->copy_stride != tight_row) ||
-            (c.bufferRowLength && c.bufferRowLength != wb * (uint32_t)s.bw) ||
-            (c.bufferImageHeight && c.bufferImageHeight != hb * (uint32_t)s.bh)) {
-            warn_once(W_FORMAT, "copy of format %#x texture (non-tight stride): skipped", p->tex->d.format);
-            return;
-        }
-        VkAstcRegion *ar = calloc(s.nz, sizeof *ar);
-        if (!ar) return;
-        uint64_t img_bytes = tight_row * (uint64_t)hb;
-        int is3d = s.img->type == VK_IMAGE_TYPE_3D;
-        for (uint32_t z = 0; z < s.nz; z++) {
-            ar[z] = (VkAstcRegion){
-                .src = m.offset + z * img_bytes,
-                .w = s.w,
-                .h = s.h,
-                .slices = 1,
-                .level = s.level,
-                .layer = is3d ? 0 : s.layer0 + (uint32_t)s.z + z,
-                .offset = (VkOffset3D){s.x, s.y, is3d ? s.z + (int32_t)z : 0}
-            };
-        }
-        written = vk_astc_record(ex->cb, m.buffer, size, ar, (int)s.nz, s.f.astc_bw, s.f.astc_bh, s.f.astc_srgb, s.f.astc_bc,
-                                 s.img->image, s.aspect, VK_NULL_HANDLE);
-        free(ar);
-        if (!written) {
-            warn_once(W_FORMAT, "ASTC compute copy of format %#x texture failed to record: skipped", p->tex->d.format);
-            return;
-        }
-        vk_exec_draw_new_cb(ex);
-        ex->dirty = VK_EXEC_DIRTY_ALL;
-        vk_exec_barrier(ex);
-    } else if (to_image && (s.f.vk != s.f.ideal || s.f.expand_rgb || s.f.astc_bw)) {
-        warn_once(W_FORMAT, "copy of format %#x texture (decoded or expanded on upload): skipped", p->tex->d.format);
-        return;
-    } else if (to_image) {
-        vkCmdCopyBufferToImage(ex->cb, m.buffer, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-        written = 1;
-    } else {
-        if (s.f.vk != s.f.ideal || s.f.expand_rgb || s.f.astc_bw) {
-            warn_once(W_FORMAT, "readback of format %#x texture (decoded or expanded on upload): skipped", p->tex->d.format);
-            return;
-        }
-        vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, m.buffer, 1, &c);
-        written = 1;
-    }
+    if (to_image) vkCmdCopyBufferToImage(ex->cb, m.buffer, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    else vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, m.buffer, 1, &c);
     ex->recorded++;
-    if (to_image) {
-        if (written) vk_texture_gpu_written(p->tex);
-    } else {
-        vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
-    }
-}
-
-// Decoded ASTC copies operate on host RGBA8 texels, not on the guest's compressed blocks. Keep their view and
-// block-edge checks separate from the native-format path, which also supports blits, resolves and other targets.
-static int decoded_astc_sub(const tex_t *t, const view_t *v, int has_v, const NVNcopyRegion *r,
-                            const TexVkFormat *f, const VkTexImage *img, Sub *s) {
-    if (!img || (t->d.target != NVN_TEXTURE_TARGET_2D && t->d.target != NVN_TEXTURE_TARGET_2D_ARRAY) ||
-        img->type != VK_IMAGE_TYPE_2D || img->samples != 1 || img->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
-        img->format != f->vk || !img->image || img->bound ||
-        (img->usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) !=
-            (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    if (has_v && (v->set_format || v->set_target || v->set_swizzle || v->set_dsmode)) return 0;
-    memset(s, 0, sizeof *s);
-    s->img = img, s->aspect = VK_IMAGE_ASPECT_COLOR_BIT, s->f = *f;
-    s->level = has_v && v->set_levels ? v->base_level : 0;
-    s->layer0 = has_v && v->set_layers ? v->min_layer : 0;
-    uint32_t levels = has_v && v->set_levels ? v->nlevels : img->levels;
-    uint32_t layers = has_v && v->set_layers ? v->nlayers : img->layers;
-    // Validate before shifting, and bound the complete view as well as the one selected mip/region.
-    if (s->level >= img->levels || s->level >= 32 || !levels || levels > img->levels - s->level ||
-        s->layer0 >= img->layers || !layers || layers > img->layers - s->layer0 ||
-        r->xoffset < 0 || r->yoffset < 0 || r->zoffset < 0 || r->width < 0 || r->height < 0 || r->depth < 0) return 0;
-    uint32_t w = max1(img->width >> s->level), h = max1(img->height >> s->level);
-    s->x = r->xoffset, s->y = r->yoffset, s->z = r->zoffset;
-    if ((uint32_t)s->x >= w || (uint32_t)s->y >= h) return 0;
-    s->w = r->width ? (uint32_t)r->width : w - (uint32_t)s->x;
-    s->h = r->height ? (uint32_t)r->height : h - (uint32_t)s->y;
-    s->nz = r->depth ? (uint32_t)r->depth : 1;
-    if ((uint64_t)s->x + s->w > w || (uint64_t)s->y + s->h > h || (uint64_t)s->z + s->nz > layers) return 0;
-    // An incomplete ASTC block is legal only at that mip's edge on both sides of the copy.
-    if (s->x % f->astc_bw || s->y % f->astc_bh ||
-        (s->w % f->astc_bw && (uint32_t)s->x + s->w != w) ||
-        (s->h % f->astc_bh && (uint32_t)s->y + s->h != h)) return 0;
-    return 1;
-}
-
-// Returns one for decoded-ASTC sources, including deliberate unsupported skips. Native ASTC and all other source
-// formats continue through copy_t2t unchanged. In create_tex, !bound means a separate vmaCreateImage allocation;
-// different guest ranges alone would not prove nonaliasing for images bound into a pool.
-static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
-    if (!p->src || p->src->d.format < 0x79 || p->src->d.format > 0x94) return 0;
-    TexVkFormat f;
-    if (!tex_vk_format(p->src->d.format, &f) || !f.astc_bw) return 0;
-    if (!p->dst || p->src->d.format != p->dst->d.format || f.astc_bc || p->flags ||
-        (f.vk != VK_FORMAT_R8G8B8A8_UNORM && f.vk != VK_FORMAT_R8G8B8A8_SRGB)) {
-        warn_once(W_COPY, "decoded ASTC copy requires matching RGBA8 formats and no copy flags: skipped");
-        return 1;
-    }
-    uint64_t sa = (uintptr_t)p->src->mem, da = (uintptr_t)p->dst->mem;
-    if (!sa || !da || !p->src->L.size || !p->dst->L.size ||
-        (sa <= da ? da - sa < p->src->L.size : sa - da < p->dst->L.size)) {
-        warn_once(W_COPY, "decoded ASTC copy between overlapping guest storage: skipped");
-        return 1;
-    }
-    const VkTexImage *si = vk_texture_get(p->src), *di = vk_texture_get(p->dst);
-    Sub s, d;
-    if (!decoded_astc_sub(p->src, &p->sv, p->has_sv, &p->sr, &f, si, &s) ||
-        !decoded_astc_sub(p->dst, &p->dv, p->has_dv, &p->dr, &f, di, &d) || si->image == di->image ||
-        s.w != d.w || s.h != d.h || s.nz != d.nz) {
-        warn_once(W_COPY, "decoded ASTC copy requires distinct non-bound 2D images, valid views/block regions and equal extents: skipped");
-        return 1;
-    }
-    vk_exec_pass_end(ex);
-    vk_exec_barrier(ex);
-    VkImageCopy cp = {sub_layers(&s), sub_offset(&s), sub_layers(&d), sub_offset(&d), sub_extent(&s)};
-    vkCmdCopyImage(ex->cb, si->image, VK_IMAGE_LAYOUT_GENERAL, di->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-    ex->recorded++;
-    vk_texture_gpu_written(p->dst);
-    return 1;
+    if (to_image) vk_texture_gpu_written(p->tex);
+    else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
 }
 
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
-    if (copy_decoded_astc(ex, p)) return;
     Sub s, d;
-    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, 0, &s)) return;
-    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, 0, &d)) return;
+    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
+    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) return;
     d.nz = s.nz;
     int same_size = s.w == d.w && s.h == d.h;
     int same_format = s.img->format == d.img->format;
@@ -721,12 +619,12 @@ static int int_format(VkFormat f) {
 }
 
 // Whole levels only (vkCmdClear*Image has no rectangle); partial regions, channel masks and a view that reinterprets
-// the format are skipped (MacNativeGames does not replay them either, nvn_mtl.m).
+// the format are skipped.
 static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     const tex_t *t = p->tex;
     if (!t) return;
     Sub s;
-    if (!sub_resolve(t, &p->view, p->has_view, &p->r, 1, 0, &s)) return;
+    if (!sub_resolve(t, &p->view, p->has_view, &p->r, 1, &s)) return;
     const VkTexImage *img = s.img;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     uint32_t lw = max1(img->width >> s.level), lh = max1(img->height >> s.level);
@@ -763,6 +661,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
 }
 
 void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
+    if (op != OP_RENDER_ENABLE && op != OP_SIGNAL_EVENT) vk_contact_flush(ex);
     switch (op) {
     case OP_COPY_B2B: copy_b2b(ex, payload); break;
     case OP_COPY_B2T: copy_buffer_image(ex, payload, 1); break;
@@ -773,11 +672,12 @@ void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
     case OP_REPORT_COUNTER: report_counter(ex, payload); break;
     case OP_RESET_COUNTER: reset_counter(ex, payload); break;
     case OP_CLEAR_BUF: clear_buf(ex, payload); break;
-    case OP_RENDER_ENABLE: ex->render_disabled = !((const p_flag *)payload)->value; break;
+    case OP_RENDER_ENABLE: ex->render_disabled = !((const p_flag *)payload)->value; cond_note(ex, "SetRenderEnable"); break;
     case OP_RENDER_COND:
         ex->render_cond = *(const p_render_cond *)payload;
         ex->has_render_cond = 1;
         ex->render_disabled = !cond_enabled(payload);
+        cond_note(ex, "SetRenderEnableConditional");
         break;
     default: rt_fatal("vk: op %s is not a transfer", nvn_op_name(op));
     }

@@ -1,6 +1,6 @@
-// AMD FidelityFX Super Resolution 1 on the present path (vk_present.c present_image): when the window is larger than
+// AMD FidelityFX Super Resolution 1 on the present path (gfx_present.c present_image): when the window is larger than
 // the game's output, EASU scales the game's crop rectangle to the swapchain size and RCAS sharpens it, in place of the
-// bilinear vkCmdBlitImage. TOTK_UPSCALER=fsr|bilinear picks it (dlss counts as fsr), TOTK_SHARPNESS (0..100, 0 = no RCAS pass) sets RCAS;
+// bilinear vkCmdBlitImage. MTF_UPSCALER=fsr|bilinear picks it, MTF_SHARPNESS (0..100, 0 = no RCAS pass) sets RCAS;
 // both apply at the next frame.
 //
 // Per frame: EASU reads the source through a view of its own format (the same colour conversion the blit does) and
@@ -20,6 +20,7 @@
 #include "cfg.h"
 #include "fsr_easu_spv.h"
 #include "fsr_rcas_spv.h"
+#include "area_down_spv.h"
 #include "host.h"
 
 #define SLOTS 8
@@ -29,14 +30,14 @@ static struct {
     PFN_vkCmdPushDescriptorSetKHR push;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
-    VkPipeline easu, rcas;
+    VkPipeline easu, rcas, area;   // area: shrinks a picture larger than the window (shaders/area_down.comp)
     VkSampler sampler;
     VkImage img[2];                // EASU output, RCAS output
     VmaAllocation alloc[2];
     VkImageView view[2];
     uint32_t w, h;                 // their size
     VkImageView src_view[SLOTS];   // the source view each slot's last frame read
-    int logged;
+    int logged, logged_area;
 } F;
 
 static VkPipeline make_pipeline(VkCtx *c, const uint32_t *code, size_t size) {
@@ -80,7 +81,8 @@ static int init(VkCtx *c) {
         vkCreatePipelineLayout(c->device, &li, NULL, &F.layout) != VK_SUCCESS ||
         vkCreateSampler(c->device, &si, NULL, &F.sampler) != VK_SUCCESS ||
         !(F.easu = make_pipeline(c, fsr_easu_spv, sizeof fsr_easu_spv)) ||
-        !(F.rcas = make_pipeline(c, fsr_rcas_spv, sizeof fsr_rcas_spv))) {
+        !(F.rcas = make_pipeline(c, fsr_rcas_spv, sizeof fsr_rcas_spv)) ||
+        !(F.area = make_pipeline(c, area_down_spv, sizeof area_down_spv))) {
         rt_log("vk: FSR off: its pipelines could not be created; the present scales bilinearly");
         return 0;
     }
@@ -160,8 +162,9 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
                   VkImage dst, const int out[4]) {
     int cw = crop[2], ch = crop[3];
     uint32_t dw = (uint32_t)out[2], dh = (uint32_t)out[3];
-    const char *up = cfg_value("TOTK_UPSCALER");   // dlss (vk_dlss.c) replaces the game's upscaler and keeps FSR here
-    if ((strcmp(up, "fsr") && strcmp(up, "dlss")) || (dw <= (uint32_t)cw && dh <= (uint32_t)ch) || !fmt) return 0;
+    if (strcmp(cfg_value("MTF_UPSCALER"), "fsr") || (dw == (uint32_t)cw && dh == (uint32_t)ch) || !fmt) return 0;
+    // a picture larger than the window (a 4K game resolution on a smaller display): the area filter, in place of the blit
+    int shrink = (uint64_t)dw * dh < (uint64_t)cw * ch;
     VkCtx *c = vk_ctx();
     if (!F.tried) init(c);
     if (!F.ok || !ensure_images(c, dw, dh)) return 0;
@@ -176,12 +179,12 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
         F.src_view[slot] = VK_NULL_HANDLE;
         return 0;
     }
-    int sharp = cfg_int("TOTK_SHARPNESS");
+    int sharp = cfg_int("MTF_SHARPNESS");
     if (sharp < 0) sharp = 0;
     if (sharp > 100) sharp = 100;
-    if (!F.logged) {
-        F.logged = 1;
-        rt_log("vk: FSR upscales %dx%d to %ux%u (sharpness %d)", cw, ch, dw, dh, sharp);
+    if (shrink ? !F.logged_area : !F.logged) {
+        if (shrink) F.logged_area = 1, rt_log("vk: the area filter shrinks %dx%d to %ux%u", cw, ch, dw, dh);
+        else F.logged = 1, rt_log("vk: FSR upscales %dx%d to %ux%u (sharpness %d)", cw, ch, dw, dh, sharp);
     }
     const VkPipelineStageFlags2 CS = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, XF = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     // the game's writes to the source become visible to the compute read; the earlier frame's reads of the
@@ -193,10 +196,10 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     uint32_t gx = (dw + 15) / 16, gy = (dh + 15) / 16;
     float easu[8] = {(float)cw, (float)ch, (float)sw, (float)sh, (float)dw, (float)dh, (float)crop[0], (float)crop[1]};
-    bind_pass(cb, F.easu, F.src_view[slot], F.view[0], easu);
+    bind_pass(cb, shrink ? F.area : F.easu, F.src_view[slot], F.view[0], easu);
     vkCmdDispatch(cb, gx, gy, 1);
     int last = 0;
-    if (sharp > 0) {
+    if (sharp > 0 && !shrink) {
         barrier(cb, F.img[0], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, CS, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 CS, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         float rcas[8] = {(float)dw, (float)dh, (float)(100 - sharp) / 50.0f, 0, 0, 0, 0, 0};
@@ -225,6 +228,7 @@ void vk_fsr_release(void) {
         if (F.src_view[i]) vkDestroyImageView(c->device, F.src_view[i], NULL);
     if (F.easu) vkDestroyPipeline(c->device, F.easu, NULL);
     if (F.rcas) vkDestroyPipeline(c->device, F.rcas, NULL);
+    if (F.area) vkDestroyPipeline(c->device, F.area, NULL);
     if (F.sampler) vkDestroySampler(c->device, F.sampler, NULL);
     if (F.layout) vkDestroyPipelineLayout(c->device, F.layout, NULL);
     if (F.dsl) vkDestroyDescriptorSetLayout(c->device, F.dsl, NULL);

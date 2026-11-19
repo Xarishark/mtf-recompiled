@@ -1,4 +1,4 @@
-# Adapted from LAS Recomp tools/gen.py @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
+# Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 """Generate C for the ExeFS modules: function discovery, then parallel emission into chunked C files.
 
 Usage: gen.py --exefs build/extracted/v121/exefs --out generated/v121 [--modules main,subsdk0,sdk] [--jobs N]
@@ -55,7 +55,7 @@ TERMINATORS = ('b', 'br', 'ret', 'trap')
 MUSTTAIL = '__attribute__((musttail)) return'
 
 # Estimated bytes of C per instruction, by class, for chunking (estimate_sizes()).
-# Least squares over every function of main, subsdk0 and sdk (1.2.1) gives 62 / 75 / 48 bytes per instruction, 38
+# Least squares over every function of main, subsdk0 and sdk of a large game gives 62 / 75 / 48 bytes per instruction, 38
 # per function and 4.5 per instruction of a function with a `br` (switches; the all-label fallback costs about 60
 # per instruction but is rare); the median error per function is 7 %.
 EST_INT = 62
@@ -607,7 +607,7 @@ def _emit_chunk(task):
     name, number, path, fns = task
     t0 = time.perf_counter()
     # Test hook: a pool wider than this raises the MemoryError a busy machine does, so the retry can be exercised.
-    limit = os.environ.get('TOTK_LIFT_TEST_OOM_ABOVE')
+    limit = os.environ.get('MTF_LIFT_TEST_OOM_ABOVE')
     if limit and _W['jobs'] > int(limit) and number % 2 == 1:
         raise MemoryError
     e = _emitter(name)
@@ -663,7 +663,7 @@ def remove_stale(moddir, name, nchunks, errors):
     return removed
 
 
-# Peak memory of one emit worker on 1.4.3 is 1.3 GiB (1.5 GiB with margin); the parent holds about 0.7 GiB.
+# Peak memory of one emit worker on a large module is 1.3 GiB (1.5 GiB with margin); the parent holds about 0.7 GiB.
 WORKER_MEM = 1536 << 20
 MEM_SHARE = 0.8  # of the free memory the workers may take, the rest is for the system and other programs
 
@@ -672,14 +672,14 @@ def pick_jobs(requested):
     """Worker count and the reason for it: --jobs if given, else the CPU count capped by the free memory."""
     if requested:
         return requested, '--jobs'
-    env = os.environ.get('TOTK_LIFT_JOBS', '').strip()
+    env = os.environ.get('MTF_LIFT_JOBS', '').strip()
     if env:
         try:
             if int(env) >= 1:
-                return int(env), 'TOTK_LIFT_JOBS'
+                return int(env), 'MTF_LIFT_JOBS'
         except ValueError:
             pass
-        print(f'ignoring TOTK_LIFT_JOBS={env!r}: not a positive integer', file=sys.stderr, flush=True)
+        print(f'ignoring MTF_LIFT_JOBS={env!r}: not a positive integer', file=sys.stderr, flush=True)
     cpus = os.cpu_count() or 4
     free = hostmem.available_ram()
     if free is None:
@@ -693,7 +693,6 @@ def main():
     ap.add_argument('--exefs', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--modules', default='main,subsdk0,sdk')
-    ap.add_argument('--nro', action='append', default=[], help='extra NRO module as name=path (e.g. nro0=build/nro/x.nro)')
     ap.add_argument('--jobs', type=int, help='emit workers (default: by free memory and CPU count)')
     ap.add_argument('--limit', type=int, default=0, help='emit only the first N functions of each module')
     ap.add_argument('--chunk-fns', type=int, default=3000, help='functions per chunk at most')
@@ -710,14 +709,7 @@ def main():
     opts = {'reg_locals': args.reg_locals, 'callee_saved': not args.no_callee_saved_trust}
 
     t0 = time.perf_counter()
-    nros = []
-    for spec in args.nro:
-        if '=' not in spec:
-            raise SystemExit(f'--nro expects name=path, got {spec!r}')
-        n, p = spec.split('=', 1)
-        nros.append((n, Path(p)))
-    nro_map = dict(nros)
-    mods = layout(args.exefs, nros)
+    mods = layout(args.exefs)
     write_layout(mods, args.out)
     table = patches.load(args.patches, mods) if args.patches else patches.Table()
     write_if_changed(args.out / 'patches.h', patches.header_text(table, GENERATED_MARKER))
@@ -731,7 +723,7 @@ def main():
         if name not in want:
             continue
         t = time.perf_counter()
-        path = nro_map.get(name, args.exefs / name)
+        path = args.exefs / name
         mod = Module(name, path, base, 'c')
         patches.check(table, mod, name)
         starts, dstats = discover(mod)

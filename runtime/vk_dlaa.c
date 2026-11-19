@@ -74,6 +74,7 @@ int vk_dlaa_scene_share(void) {
 }
 
 void ov_resolution_sizes(unsigned out[2], unsigned scene[2]);   // ov_resolution.c
+void res_sizes(unsigned out[2], unsigned scene[2]) { ov_resolution_sizes(out, scene); }
 int res_dlss_mode(const char *m) {
     (void)m;
     static int told;
@@ -1204,7 +1205,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     // picture in its place showed the top left two thirds of the scene enlarged and washed out.
     if (dst != t && !ldr) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;
     ex->recorded += 4;
-    vk_exec_draw_new_cb(ex);   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
+    vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image;
     next_jitter(w, ow);
     if (++D.evals == 1 || D.evals == 300 || D.evals % 3600 == 0 ||   // 300: one early line with the frames counted

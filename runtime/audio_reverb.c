@@ -1,7 +1,6 @@
-// Adapted from MacNativeGames games/totk/runtime/audio_reverb.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames contributors).
-/* Compatible 3D reverb network, based on Ryujinx.Audio's Reverb3dState/Command,
-   DelayLine3d and DecayDelay. Copyright (c) Ryujinx Team and Contributors.
-   MIT license: third_party/licenses/Ryujinx-Audio.txt. Samples are normalized floats. */
+// The 3D reverb network of the audio renderer's effects (state, command, delay lines, decay delays); samples are
+// normalized floats.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include "audio_reverb.h"
 #include "host.h"
 #include <math.h>
@@ -24,8 +23,8 @@ static void delay_set(Delay *d, unsigned n) { if (n > d->cap) rt_fatal("reverb d
 static void delay_init(Delay *d, unsigned khz, float ms) { d->cap = samples(khz, ms); d->data = calloc(d->cap + 1, sizeof(float)); if (!d->data) rt_fatal("reverb delay allocation"); delay_set(d, d->cap); }
 static float delay_update(Delay *d, float v) {
     d->data[d->write++] = v; float out = d->data[d->read++];
-    if (d->read >= d->cap) d->read = 0;
-    if (d->write >= d->cap) d->write = 0;
+    if (d->read > d->cap) d->read = 0;
+    if (d->write > d->cap) d->write = 0;
     return out;
 }
 static float delay_tap(const Delay *d, unsigned at) { int i = (int)d->write - (int)at - 1; if (i < 0) i += (int)d->cap + 1; return d->data[i]; }

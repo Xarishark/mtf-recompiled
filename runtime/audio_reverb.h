@@ -1,7 +1,7 @@
-// Adapted from MacNativeGames games/totk/runtime/audio_reverb.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
-// contributors), based on Ryujinx.Audio (MIT, Copyright (c) Ryujinx Team and Contributors).
-#ifndef TOTK_AUDIO_REVERB_H
-#define TOTK_AUDIO_REVERB_H
+// The 3D reverb effect's parameters and state (audio_reverb.c).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
+#ifndef MTF_AUDIO_REVERB_H
+#define MTF_AUDIO_REVERB_H
 #include <stdint.h>
 typedef struct {
     uint8_t input[6], output[6]; uint16_t channel_max, channels;

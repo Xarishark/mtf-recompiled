@@ -1,15 +1,16 @@
-// Adapted from LAS Recomp runtime/hle.h and runtime/dispatch.c @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
 // Host functions at synthetic guest addresses: the HOST_OVERRIDE / HOST_OBSERVER
 // linker tables, the registry behind them, and the calls between host and guest (rt_call, rt_original).
 //
 // Every registered function dispatches through hostfn_entry, which counts the call, traces the first one
-// (TOTK_TRACE=host) and tail-calls the real function. The registry is fixed by hostfn_seal, which builds the dispatch
+// (MTF_TRACE=host) and tail-calls the real function. The registry is fixed by hostfn_seal, which builds the dispatch
 // table; guest threads start after that, so lookups need no lock.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "host.h"
+#include "platform/platform.h"
 
 #define MAX_HOSTFN 4096   // dispatch.c holds HOST_CAP / 2 host functions
 #define MAX_ADDED 64
@@ -20,40 +21,46 @@ __attribute__((section(".ovr$a"), used)) static const RtHostEntry ovr_start[1];
 __attribute__((section(".ovr$z"), used)) static const RtHostEntry ovr_stop[1];
 __attribute__((section(".obs$a"), used)) static const RtHostEntry obs_start[1];
 __attribute__((section(".obs$z"), used)) static const RtHostEntry obs_stop[1];
-#elif defined(__APPLE__)
-// Mach-O: ld64 defines section$start$<segment>$<section> and section$end$<segment>$<section> around a section that
-// at least one object file fills. Weak, so a build without observers has NULL bounds on both ends.
-extern const RtHostEntry mach_ovr_start[] __asm__("section$start$__DATA$__totk_ovr") __attribute__((weak));
-extern const RtHostEntry mach_ovr_stop[] __asm__("section$end$__DATA$__totk_ovr") __attribute__((weak));
-extern const RtHostEntry mach_obs_start[] __asm__("section$start$__DATA$__totk_obs") __attribute__((weak));
-extern const RtHostEntry mach_obs_stop[] __asm__("section$end$__DATA$__totk_obs") __attribute__((weak));
-#define ovr_start mach_ovr_start
-#define ovr_stop mach_ovr_stop
-#define obs_start mach_obs_start
-#define obs_stop mach_obs_stop
 #else
 // ELF: the linker defines __start_<section> and __stop_<section> around a section named like a C identifier. Weak: a
 // build without observers has no such section, and both bounds are then NULL.
-extern const RtHostEntry __start_totk_ovr[] __attribute__((weak)), __stop_totk_ovr[] __attribute__((weak));
-extern const RtHostEntry __start_totk_obs[] __attribute__((weak)), __stop_totk_obs[] __attribute__((weak));
-#define ovr_start __start_totk_ovr
-#define ovr_stop __stop_totk_ovr
-#define obs_start __start_totk_obs
-#define obs_stop __stop_totk_obs
+extern const RtHostEntry __start_mtf_ovr[] __attribute__((weak)), __stop_mtf_ovr[] __attribute__((weak));
+extern const RtHostEntry __start_mtf_obs[] __attribute__((weak)), __stop_mtf_obs[] __attribute__((weak));
+#define ovr_start __start_mtf_ovr
+#define ovr_stop __stop_mtf_ovr
+#define obs_start __start_mtf_obs
+#define obs_stop __stop_mtf_obs
 #endif
 
 typedef struct {
     const char *name;
     GuestFn fn;
     uint64_t original;   // observers: the guest definition rt_original calls
-    uint64_t calls;
+    uint64_t calls;      // with MTF_TRACE=host only (hostfn_report)
     int blocking;        // runs with the virtual core given up (hostfn_blocking)
+    HostUserFn ufn;      // hostfn_register_user: fn is user_entry, which calls ufn(c, user)
+    void *user;
 } Slot;
 static Slot slots[MAX_HOSTFN];
 static int nslots;
 static RtHostEntry added[MAX_ADDED];
 static int nadded;
 static int sealed;
+
+// The call count (hostfn_calls): one counter per calling thread, each on its own cache line, written only by that
+// thread. A locked add on a per-function counter beside the read-mostly slot fields made the game threads share and
+// bounce those lines on every host call (about 1% of the game threads' time in hostfn_entry in one test).
+#define MAX_COUNTERS 4096
+typedef struct { _Alignas(64) uint64_t n; } Counter;
+static Counter counters[MAX_COUNTERS];
+static uint32_t ncounters;
+static uint64_t shared_calls;   // the threads past MAX_COUNTERS, counted with an atomic add
+static __thread uint64_t *thread_calls;
+
+__attribute__((noinline)) static uint64_t *counter_new(void) {
+    uint32_t i = __atomic_fetch_add(&ncounters, 1, __ATOMIC_RELAXED);
+    return thread_calls = i < MAX_COUNTERS ? &counters[i].n : &shared_calls;
+}
 
 static GuestFn table_find(const RtHostEntry *start, const RtHostEntry *stop, const char *name) {
     __asm__("" : "+r"(start), "+r"(stop));   // separate objects: keep the compiler from reasoning about them
@@ -87,27 +94,35 @@ const char *hostfn_table_name(int observers, int i) {
     return NULL;
 }
 
-void hostfn_add_override(const char *name, GuestFn fn) {
-    if (ldr_count()) rt_fatal("hostfn_add_override(%s) after ldr_load", name);
-    if (nadded == MAX_ADDED) rt_fatal("hostfn_add_override: more than %d", MAX_ADDED);
-    added[nadded++] = (RtHostEntry){name, fn};
-}
-
 static void hostfn_entry(Cpu *c);
 
 static uint64_t slot_addr(int i) { return RT_HOSTFN_BASE + 16ull * (uint64_t)i; }
 
+// Slots after the seal: the dispatch table is built once (hostfn_seal), so it already maps LATE_SLOTS addresses past
+// the registered ones to hostfn_entry. A module loaded at run time (the NRO, ro.c) binds its imports to overrides and
+// unresolved stubs through them. A slot is written completely before nslots publishes it, and its address reaches
+// guest code only after hostfn_register returns, so hostfn_entry never reads a half-written slot.
+#define LATE_SLOTS 2048   // host functions registered after the seal
+static int late_end;
+static PlatMutex late_lock = PLAT_MUTEX_INIT;
+
 uint64_t hostfn_register(const char *name, GuestFn fn) {
-    if (sealed) rt_fatal("hostfn_register(%s) after hostfn_seal", name);
     if (!name || !fn) rt_fatal("hostfn_register: empty entry");
-    for (int i = 0; i < nslots; i++)
-        if (slots[i].fn == fn && !strcmp(slots[i].name, name)) return slot_addr(i);
-    if (nslots == MAX_HOSTFN) rt_fatal("hostfn_register: more than %d host functions", MAX_HOSTFN);
-    uint64_t a = slot_addr(nslots);
+    if (sealed) plat_mutex_lock(&late_lock);
+    int n = __atomic_load_n(&nslots, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++)
+        if (slots[i].fn == fn && !strcmp(slots[i].name, name)) {
+            if (sealed) plat_mutex_unlock(&late_lock);
+            return slot_addr(i);
+        }
+    if (n == MAX_HOSTFN || (sealed && n == late_end))
+        rt_fatal("hostfn_register(%s): more than %d host functions", name, sealed ? late_end : MAX_HOSTFN);
+    uint64_t a = slot_addr(n);
     if (a >= RT_RET_HOST) rt_fatal("hostfn_register: host-function window full");
-    slots[nslots] = (Slot){.name = name, .fn = fn, .blocking = !strncmp(name, "_ZN2nn2fs", 9)};
-    rt_register_host(a, hostfn_entry);
-    nslots++;
+    slots[n] = (Slot){.name = name, .fn = fn, .blocking = !strncmp(name, "_ZN2nn2fs", 9)};
+    if (!sealed) rt_register_host(a, hostfn_entry);
+    __atomic_store_n(&nslots, n + 1, __ATOMIC_RELEASE);
+    if (sealed) plat_mutex_unlock(&late_lock);
     return a;
 }
 
@@ -132,7 +147,7 @@ __attribute__((noinline, noreturn, cold)) static void bad_entry(Cpu *c) {
 }
 
 // kern_host_track: the call counted in the thread's host depth. Not a tail call, so the host stack holds this frame
-// while fn runs; longjmp out of fn (ExitThread) leaves the depth raised on a thread that ends.
+// while fn runs; the jump out of fn (ExitThread) leaves the depth raised on a thread that ends.
 __attribute__((noinline)) static void hostfn_tracked(Cpu *c, GuestFn fn) {
     void *t = c->thread;
     int *d = kern_host_depth(t);
@@ -144,7 +159,7 @@ __attribute__((noinline)) static void hostfn_tracked(Cpu *c, GuestFn fn) {
 }
 
 // nn::fs: the call waits for the disk and the OS, and on the Switch it is an IPC request that blocks its thread, so
-// the thread gives its virtual core up for it. TOTK_CORE_DIAG found the game's loader threads (priority 58) holding
+// the thread gives its virtual core up for it. MTF_CORE_DIAG found the game's loader threads (priority 58) holding
 // a core through CloseFile and CreateCacheStorage while job workers and better threads waited 2-6 ms for it.
 __attribute__((noinline)) static void hostfn_blocking(Cpu *c, GuestFn fn) {
     int away = kern_core_away();
@@ -155,10 +170,13 @@ __attribute__((noinline)) static void hostfn_blocking(Cpu *c, GuestFn fn) {
 
 static void hostfn_entry(Cpu *c) {
     uint64_t i = (c->pc - RT_HOSTFN_BASE) >> 4;
-    if (__builtin_expect((c->pc & 15) || i >= (uint64_t)nslots, 0)) bad_entry(c);
+    if (__builtin_expect((c->pc & 15) || i >= (uint64_t)__atomic_load_n(&nslots, __ATOMIC_ACQUIRE), 0)) bad_entry(c);
     Slot *s = &slots[i];
-    uint64_t n = __atomic_fetch_add(&s->calls, 1, __ATOMIC_RELAXED);
-    if (__builtin_expect(!n && (rt_trace & RT_TRACE_HOSTCALL), 0)) {
+    uint64_t *k = thread_calls;
+    if (__builtin_expect(!k, 0)) k = counter_new();
+    if (__builtin_expect(k == &shared_calls, 0)) __atomic_fetch_add(k, 1, __ATOMIC_RELAXED);
+    else __atomic_store_n(k, *k + 1, __ATOMIC_RELAXED);
+    if (__builtin_expect(rt_trace & RT_TRACE_HOSTCALL, 0) && !__atomic_fetch_add(&s->calls, 1, __ATOMIC_RELAXED)) {
         char lr[96];
         rt_log("host call %s from %s", s->name, ldr_describe(c->x[30] - 4, lr, sizeof lr));
     }
@@ -183,30 +201,18 @@ void hostfn_seal(void) {
     static RtModule mods[16];   // kept by the dispatcher
     if (sealed) return;
     rt_register_host(RT_RET_HOST, return_sentinel);
+    late_end = nslots + LATE_SLOTS > MAX_HOSTFN ? MAX_HOSTFN : nslots + LATE_SLOTS;
+    for (int i = nslots; i < late_end && slot_addr(i) < RT_RET_HOST; i++) rt_register_host(slot_addr(i), hostfn_entry);
     sealed = 1;
     int n = rt_linked_modules(mods, 16);
     rt_dispatch_init(mods, n);
 }
 
 uint64_t hostfn_calls(void) {
-    uint64_t n = 0;
-    for (int i = 0; i < nslots; i++) n += __atomic_load_n(&slots[i].calls, __ATOMIC_RELAXED);
+    uint32_t m = __atomic_load_n(&ncounters, __ATOMIC_RELAXED);
+    uint64_t n = __atomic_load_n(&shared_calls, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < m && i < MAX_COUNTERS; i++) n += __atomic_load_n(&counters[i].n, __ATOMIC_RELAXED);
     return n;
-}
-
-static int by_calls(const void *a, const void *b) {
-    uint64_t x = (*(const Slot *const *)a)->calls, y = (*(const Slot *const *)b)->calls;
-    return x < y ? 1 : x > y ? -1 : 0;
-}
-
-void hostfn_report(void) {
-    static const Slot *order[MAX_HOSTFN];
-    int n = 0;
-    for (int i = 0; i < nslots; i++)
-        if (__atomic_load_n(&slots[i].calls, __ATOMIC_RELAXED)) order[n++] = &slots[i];
-    qsort(order, n, sizeof *order, by_calls);
-    rt_log("host calls: %llu in %d of %d host functions", (unsigned long long)hostfn_calls(), n, nslots);
-    for (int i = 0; i < n; i++) rt_log("  %10llu  %s", (unsigned long long)order[i]->calls, order[i]->name);
 }
 
 uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {

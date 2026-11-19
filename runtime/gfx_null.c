@@ -4,7 +4,6 @@
 // ticks, counter 0), buffer-to-buffer copies and uniform updates.
 // It is the CPU-side gate for the NVN front end. Also the back-end choice (gfx_backend) and the statistics (gfx_stats).
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "gfx.h"
@@ -13,19 +12,7 @@
 
 GfxStats gfx_counters;
 
-GfxStats gfx_stats(void) {
-    GfxStats s;
-    s.frames = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    s.nvn_calls = __atomic_load_n(&gfx_counters.nvn_calls, __ATOMIC_RELAXED);
-    s.nvn_distinct = __atomic_load_n(&gfx_counters.nvn_distinct, __ATOMIC_RELAXED);
-    s.unimplemented = __atomic_load_n(&gfx_counters.unimplemented, __ATOMIC_RELAXED);
-    s.validation_errors = __atomic_load_n(&gfx_counters.validation_errors, __ATOMIC_RELAXED);
-    s.shader_failures = __atomic_load_n(&gfx_counters.shader_failures, __ATOMIC_RELAXED);
-    s.draws_skipped = __atomic_load_n(&gfx_counters.draws_skipped, __ATOMIC_RELAXED);
-    return s;
-}
-
-// TOTK_GPU=null|vulkan, default vulkan (rt_config); chosen once.
+// MTF_GPU=null|vulkan, default vulkan (rt_config); chosen once.
 const GfxBackend *gfx_backend(void) {
     static const GfxBackend *chosen;
     const GfxBackend *b = __atomic_load_n(&chosen, __ATOMIC_ACQUIRE);
@@ -36,20 +23,18 @@ const GfxBackend *gfx_backend(void) {
     return b;
 }
 
-int gfx_shader_tool(int tool) { return gfx_backend()->shader_tool(tool); }
-
 static uint64_t fence;
 
 static int null_pool_init(pool_t *p) { (void)p; return 1; }
 static void null_pool_fini(pool_t *p) { (void)p; }
 static int null_pool_map_virtual(pool_t *v, int n, const void *requests) { (void)v, (void)n, (void)requests; return 1; }
-static void null_texture_register(const dpool_ref *pool, int id, const tex_t *t, const view_t *v) { (void)pool, (void)id, (void)t, (void)v; }
-static void null_sampler_register(const dpool_ref *pool, int id, const samp_par *s) { (void)pool, (void)id, (void)s; }
+static void null_texture_register(int id, const tex_t *t, const view_t *v) { (void)id, (void)t, (void)v; }
+static void null_sampler_register(int id, const samp_par *s) { (void)id, (void)s; }
 static void null_texture_release(const tex_t *t) { (void)t; }
 static void null_program_release(const prog_t *p) { (void)p; }
 
-// The CPU-visible side effects of one op stream, in stream order (MNG nvn_mtl.m mtl_exec and the commit handler:
-// 10618-10642, 1677-1678, 1960-1985). Everything else (draws, dispatches, clears, texture copies) has no effect here.
+// The CPU-visible side effects of one op stream, in stream order. Everything else (draws, dispatches, clears,
+// texture copies) has no effect here.
 // Addresses of CPU-invisible pools (the GPU window) hold no host memory, so those writes are dropped.
 static void *null_cpu_addr(uint64_t addr, uint64_t size, const char *what) {
     if (nvn_gpu_only(addr)) return NULL;
@@ -58,12 +43,12 @@ static void *null_cpu_addr(uint64_t addr, uint64_t size, const char *what) {
     return (void *)(uintptr_t)addr;
 }
 
-// NVNcounterData = {counter, timestamp}. Timestamps are guest counter ticks (rt_tick_hz), the base of GetSystemTick; every counter
+// NVNcounterData = {counter, timestamp}. Timestamps are 31.25 MHz ticks, the base of GetSystemTick; every counter
 // type the null GPU cannot measure (all but the timestamps, samples passed included) reports 0.
 static void null_report(uint64_t addr) {
     NVNcounterData *d = null_cpu_addr(addr, sizeof *d, "counter report");
     if (!d) return;
-    uint64_t rec[2] = {0, rt_ns_to_ticks(kern_now_ns())};
+    uint64_t rec[2] = {0, kern_now_ns() / 32};
     memcpy(d, rec, sizeof rec);
 }
 
@@ -72,7 +57,6 @@ static void null_replay(uint64_t handle) {
         const void *a = nvn_op_payload(h);
         switch (h->op) {
         case OP_END: return;
-        case OP_WAIT_SYNC: break;   // fulfilled by submit preparation; never reread its source here
         case OP_SIGNAL_EVENT: {
             const p_signal_event *e = a;
             if (e->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(e->val, e->value, __ATOMIC_RELEASE);
@@ -103,8 +87,8 @@ static void null_replay(uint64_t handle) {
     }
 }
 
-static uint64_t null_submit(const uint64_t *handles, int n, uint64_t submitted_ticks) {
-    (void)submitted_ticks;   // the null back end keeps its immediate CPU-side counter behavior
+static uint64_t null_submit(const uint64_t *handles, int n) {
+    nvn_pins_sweep(nvn_submit_count(), NULL, 0);   // no replay state outlives a submission here
     for (int i = 0; i < n; i++) null_replay(handles[i]);
     return __atomic_add_fetch(&fence, 1, __ATOMIC_ACQ_REL);
 }
@@ -139,27 +123,6 @@ static void null_guest_written(uint64_t addr, uint64_t size) { (void)addr, (void
 static void null_guest_read(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
 static void null_cpu_synced(uint64_t fence) { (void)fence; }
 
-// The host side: no device, so nothing to warm, save or release, no thumbnails, no counters to grow and no driver to
-// name.
-static void null_nothing(void) {}
-static int null_zero(void) { return 0; }
-static int null_shader_tool(int tool) {
-    (void)tool;
-    rt_logf("the shader tools need a graphics device: TOTK_GPU=null has none\n");
-    return 1;
-}
-static void null_thumbs_enable(int n) { (void)n; }
-static int null_thumbs_read(uint64_t frame, uint8_t *rgba) { (void)frame, (void)rgba; return 0; }
-static const char *null_present_mode(void) { return "none"; }
-static const GfxExecFrame *null_exec_frame(void) {
-    static const GfxExecFrame none;
-    return &none;
-}
-static int null_device_text(char *buf, size_t n) {
-    int k = snprintf(buf, n, "GPU: none (TOTK_GPU=null has no device)\n");
-    return k > 0 && (size_t)k < n;
-}
-
 const GfxBackend gfx_null_backend = {
     .name = "null",
     .pool_init = null_pool_init,
@@ -179,20 +142,4 @@ const GfxBackend gfx_null_backend = {
     .guest_written = null_guest_written,
     .guest_read = null_guest_read,
     .cpu_synced = null_cpu_synced,
-    .window_start = null_nothing,
-    .window_resize = null_nothing,
-    .present_mode = null_present_mode,
-    .window_hdr10 = null_zero,
-    .boot_async = null_nothing,
-    .boot_prewarm = null_nothing,
-    .save = null_nothing,
-    .exit_wait = null_nothing,
-    .exit_release = null_nothing,
-    .shader_tool = null_shader_tool,
-    .thumbs_enable = null_thumbs_enable,
-    .thumbs_read = null_thumbs_read,
-    .exec_frame = null_exec_frame,
-    .device_text = null_device_text,
-    .dump_request = null_nothing,
-    .capture_log_toggle = null_nothing,
 };

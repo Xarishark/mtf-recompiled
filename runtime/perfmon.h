@@ -17,6 +17,8 @@ extern "C" {
 typedef struct {
     // the game's frames (presents), over the last second
     float fps, frame_ms_avg, frame_ms_max;
+    // fps of the slowest 1% and 0.1% of the frames over the last ten seconds (-1: too few frames yet)
+    float low1_fps, low01_fps;
     float frame_ms[PERF_HISTORY];   // oldest first
     // CPU: the whole machine and this process, percent of all logical processors
     char cpu_name[64];
@@ -33,7 +35,7 @@ typedef struct {
     float replay_ms, gpu_ms, pipe_wait_ms, xlate_ms, tex_ms, tex_uploads;
 } PerfStats;
 
-// Overlay mode 0 off, 1 fps, 2 full (TOTK_PERF_OVERLAY), from the present path when the setting changes. Full starts
+// Overlay mode 0 off, 1 fps, 2 full (MTF_PERF_OVERLAY), from the present path when the setting changes. Full starts
 // the machine sampling thread (twice a second) and turns on the event counts and GPU timestamps; leaving full stops
 // them. Off: perf_present skips perfmon_frame and nothing samples.
 void perfmon_mode(int mode);

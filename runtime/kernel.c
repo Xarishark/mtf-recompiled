@@ -1,14 +1,10 @@
-// Adapted from MacNativeGames games/totk/runtime/threads.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
-// contributors; itself from d2r-mobile dm/host/hle_thread.c), d2r-mobile dm/host/thread.c @ 53e7c5b (MIT, Copyright
-// (c) 2026 jhaizhou) and LAS Recomp runtime/kernel.c @ da35b83 (MIT, Copyright (c) 2026 Peiikai); the preemption of
-// virtual cores from MacNativeGames threads.c @ 33e8fa8 (MIT, as above).
 // Threads, synchronization, virtual cores and fibers of the Horizon kernel.
 //
 // One guest thread = one Windows thread with a 256 MiB reserved host stack (every guest BL is a host call) and its own
 // Cpu. The SDK's nn::os runs as lifted code; only the kernel under it is the host. Every wait hangs on one global lock
 // G with one condition variable per thread; wake order is the kernel's: lower priority value first, then first come.
 // Semantics follow the public Horizon kernel (KConditionVariable, KAddressArbiter, KSynchronization).
-#include <setjmp.h>
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,10 +24,13 @@
 #define H_CUR_THREAD KERN_H_CURRENT_THREAD
 
 #define MAX_H 4096
-#define NCORE 6                          // Switch 2 applications run on cores 0-5 (Bananza main.npdm ACI0 ThreadInfo)
+// Application cores. The Switch 2 gives a game six (MTF's boot stub starts its six NRO decoder threads
+// on cores 0-5, main+0x8a0..0x9e0); the Switch 1 gave three.
+#define NCORE 6
+#define CORE_MASK ((1ull << NCORE) - 1)
 #define HOST_STACK (256ull << 20)        // reserved, committed on demand
 #define TLR_SIZE 0x200
-#define THREAD_OBJ_SIZE 0x400            // "current thread object" at TLR+0x1F8 (d2r-mobile thread.c)
+#define THREAD_OBJ_SIZE 0x400            // "current thread object" at TLR+0x1F8
 #define TLS_SIZE 0x2000
 #define MAIN_STACK (1ull << 20)          // main.npdm META+0x1C
 #define MAIN_PRIO 44                     // META+0xE
@@ -43,7 +42,7 @@ _Static_assert(O_EVENT_W < O_SESSION, "handle kinds");
 enum { W_NONE = KERN_WAIT_NONE, W_LOCK = KERN_WAIT_LOCK, W_CONDVAR = KERN_WAIT_CONDVAR, W_ADDRESS = KERN_WAIT_ADDRESS,
        W_SYNC = KERN_WAIT_SYNC };
 
-// Scheduler accounting states (TOTK_TRACE=sched).
+// Scheduler accounting states (MTF_TRACE=sched).
 enum { S_OFF, S_RUN, S_CORE, S_HOST, S_SLEEP, S_SYNC, S_CV, S_LOCK, S_ADDR, S_N };
 static const char *const s_name[S_N] = {"off", "run", "core", "host", "sleep", "sync", "cv", "lock", "addr"};
 
@@ -61,6 +60,7 @@ struct RtThread {
     int prio, core;
     uint64_t mask;
     int started, exited, closed, cancel, is_main;
+    int entered;               // reached its entry in guest code (kern_settle_started)
     PlatCond cv;
     // current wait
     int wkind, woke;
@@ -74,13 +74,13 @@ struct RtThread {
     uint64_t cseq;
     RtThread *cnext;
     uint8_t *tlr, *tls;
-    jmp_buf exit_jmp;          // the thread start; ExitThread longjmps to it
+    PlatJmp exit_jmp;          // the thread start; ExitThread jumps back to it
     // fibers
     PlatFiber *base_fiber;     // the host thread as a host fiber, after the first switch
     Fiber *fiber;              // current guest fiber, NULL on the thread's own context
     Fiber *leaving;            // fiber just switched away from, released by whoever resumes next
     int exit_pending;          // ExitThread on a fiber: unwind once back on the thread's own context
-    // TOTK_TRACE=sched accounting (holding G)
+    // MTF_TRACE=sched accounting (holding G)
     uint32_t tid;              // host thread id
     int st;                    // S_* state since st_since
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
@@ -90,19 +90,19 @@ struct RtThread {
     uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
     uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
     RtThread *target;          // as a core waiter: the owner core_kick asked to give its core up for it (holding G)
-    // TOTK_ASYNC_PREEMPT (holding G)
+    // MTF_ASYNC_PREEMPT (holding G)
     PlatIntr *hthr;            // the host thread, for plat_intr_stop / resume; open while it may own a core
     uint64_t ap_rip;           // the interrupted host rip kern_ap_stub returns to
     uint64_t ap_last;          // the last redirect attempt on this owner
     int ap_pending;            // redirected to kern_ap_stub, which has not reached kern_ap_yield yet
-    // TOTK_CORE_DIAG (holding G, except dg_host_end, which only the thread itself writes)
+    // MTF_CORE_DIAG (holding G, except dg_host_end, which only the thread itself writes)
     uint64_t dg_since;         // as a waiter: core wait start
     int dg_cls;                // as a waiter: DG_* class at the start of the wait
     uint64_t dg_kick;          // as an owner: the preempt request
     uint64_t dg_host_end;      // as an owner: the return from the host call or SVC it was in at the request
     uint64_t dg_pc, dg_lr;     // as an owner: guest pc and lr at the checkpoint that gave the core up
     int dg_host_kick;          // as an owner: in a host call or SVC at the request
-    uint32_t dg_svc;           // the thread's latest SVC (TOTK_CORE_DIAG: what an owner in a host call is in)
+    uint32_t dg_svc;           // the thread's latest SVC (MTF_CORE_DIAG: what an owner in a host call is in)
     struct DgRel { uint64_t kick, host_end, pc, lr; int host, pre, prio; uint32_t h; } dg_rel;   // as a waiter: the
                                                                                                  // owner that released
 };
@@ -121,9 +121,9 @@ static void unlock(void) { plat_mutex_unlock(&G); }
 
 uint64_t kern_now_ns(void) { return plat_now_ns(); }
 
-// ---- TOTK_CRIT=<first>-<last frame> with TOTK_TRACE=sched: every state change and wake of the guest threads and
-// every present over those frames, written to TOTK_CRIT_OUT (default crit.bin) at the last one, for
-// tools/crit_path.py, which walks the chain of waits back from each present (holding G). TOTK_CRIT=w<lo>-<hi> takes
+// ---- MTF_CRIT=<first>-<last frame> with MTF_TRACE=sched: every state change and wake of the guest threads and
+// every present over those frames, written to MTF_CRIT_OUT (default crit.bin) at the last one, for
+// tools/crit_path.py, which walks the chain of waits back from each present (holding G). MTF_CRIT=w<lo>-<hi> takes
 // world-clock seconds instead (frame_step_world_us): from the first present at or after lo to the first after hi, so a
 // session covers the same game time at any frame rate.
 typedef struct { uint64_t ts, obj; uint32_t a, b; uint16_t kind, st; uint32_t pad; } CritEv;
@@ -139,7 +139,7 @@ static void crit_add(int kind, uint32_t a, uint32_t b, int st, uint64_t obj, uin
     if (g_crit_n < CRIT_N) g_crit[g_crit_n++] = (CritEv){ts, obj, a, b, (uint16_t)kind, (uint16_t)st, 0};
 }
 
-// ---- TOTK_TRACE=sched accounting (holding G)
+// ---- MTF_TRACE=sched accounting (holding G)
 #define RW_N 32
 static RtThread *g_render;                               // the thread that presents (sched trace, core diag)
 typedef struct { int st; uint32_t waker; uint64_t obj, ns; } WaitRec;
@@ -288,12 +288,18 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
 }
 
 // ---- virtual cores
-// Horizon runs at most one thread per core, and TotK keys per-core data (allocators, job queues) by the current core
+// Horizon runs at most one thread per core, and games key per-core data (allocators, job queues) by the current core
 // number without locks. A guest thread therefore holds one of the three application cores while it runs guest code
 // and gives it up only where Horizon would switch threads (waits, sleep, yield, exit, blocking host calls); a free
 // core goes to the best waiting thread. A waiter better than a holder asks one holder to give its core up (core_kick),
 // which it does at its next SVC or indirect call (kern_checkpoint, rt_dispatch), as Horizon runs the better thread at
-// once; guest code without either keeps the core until it reaches one. TOTK_FREE_CORES=1 turns the gate off.
+// once; guest code without either keeps the core until it reaches one.
+//
+// free_cores = 1 (MTF_FREE_CORES) turns the gate off, for experiments only: the game does not run that way. A thread
+// that holds no core reports its ideal core to GetCurrentProcessorNumber, so the game's job workers all report core 0
+// and run its per-core code at once: in one game two of them add the same per-core NVN control memory, which retires the
+// command handle the other just recorded, and CallCommands finds no recording at start ; another corrupts a heap
+// in main+0x82e00 or hangs at the title menu. The start log and every crash report say so (kern_free_cores_note).
 static RtThread *g_core_owner[NCORE], *g_core_wait;
 static int g_cores_on = -1, g_held_max;
 
@@ -302,51 +308,56 @@ static void ap_init(void);
 
 static int cores_enabled(void) {
     if (g_cores_on < 0) {
-        g_cores_on = !cfg_bool("TOTK_FREE_CORES");   // "0" keeps the gate, like unset
+        g_cores_on = !cfg_bool("MTF_FREE_CORES");   // "0" keeps the gate, like unset
         if (!g_cores_on)
-            rt_log("kernel: virtual core gate off (TOTK_FREE_CORES): guest threads run without the limit of one per "
-                   "core that the game's per-core data needs; for experiments only, the game can fail");
+            rt_log("kernel: WARNING: free_cores = 1 (MTF_FREE_CORES) turns the virtual core gate off. This is an "
+                   "experimental mode and the game crashes or hangs in it, usually at start. Set free_cores = 0 in "
+                   "mtf.ini to play");
         diag_init();
         ap_init();
     }
     return g_cores_on;
 }
 
+void kern_free_cores_note(void) {
+    if (!g_cores_on)
+        rt_log("fatal: free_cores = 1 was on: the game crashes in this experimental mode; set free_cores = 0 in "
+               "mtf.ini before reporting this crash");
+}
+
 static int core_allowed(const RtThread *t, int c) { return (int)((t->mask >> c) & 1); }
 
-// ---- asynchronous preemption (TOTK_ASYNC_PREEMPT, on unless 0)
-// Adapted from MacNativeGames games/totk/runtime/threads.c @ 33e8fa8 (8bf0893, PR #488; MIT, Copyright (c) 2026
-// MacNativeGames contributors): Horizon gives a core to a strictly better thread the moment that thread is ready.
+// ---- asynchronous preemption (MTF_ASYNC_PREEMPT, on unless 0)
+// Horizon gives a core to a strictly better thread the moment that thread is ready.
 // Here a better waiter only marks the owner, which gives the core up at its next SVC or indirect call; an owner in a
-// stretch of game code with neither keeps it (TOTK_CORE_DIAG: 0.5-1.1 ms of thread-time per frame, waits to 16 ms and
-// more). With it on, three parts, all of which MacNativeGames found necessary:
+// stretch of game code with neither keeps it (MTF_CORE_DIAG: 0.5-1.1 ms of thread-time per frame, waits to 16 ms and
+// more). With it on, three parts, each of them needed:
 // - The waiter interrupts the owner (plat_intr_stop) when it has waited AP_FIRST_NS, then every
 //   millisecond: if the owner's host rip is in the lifted modules' code (g_gen_lo..g_gen_hi) and its host depth is 0
 //   (not in a host call or SVC, nor in game code a host call made), it holds no host lock, so its rip is moved to
 //   kern_ap_stub, which saves every volatile register, gives the core up like a checkpoint (kern_ap_yield) and jumps
 //   back. Otherwise it is only marked, as before.
 // - Priority inheritance (eff_prio): a thread owning a guest mutex counts at the priority of the best thread blocked on
-//   it, for granting, kicking, preempting and yielding. Without it MacNativeGames' game stopped at its first
+//   it, for granting, kicking, preempting and yielding. Without it a game was seen to stop at its first
 //   "Continue" (a better thread took the core of the low-priority owner of a mutex it then waited for).
-// - Horizon's preemption disable: the SDK's spin locks (1.2.1 sdk f_70051242a8, f_7005124360 and siblings) count
+// - Horizon's preemption disable: the SDK's spin locks count
 //   TLR+0x100 (disable_count) while they try or hold the lock, and after clearing it call SVC 0x36 when TLR+0x102
 //   (interrupt_flag) is set. Such an owner is not preempted, at a checkpoint either: interrupt_flag is set and the
-//   switch happens at that SVC. Preempting it anyway hung MacNativeGames' game at "Continue" (the lock holder lost its
+//   switch happens at that SVC. Preempting it anyway hung a game at "Continue" (the lock holder lost its
 //   core to a thread that then spun on that lock).
-// TOTK_ASYNC_PREEMPT=0 keeps the old scheduling exactly: raw priorities, no interruption, no disable_count; =2 keeps
+// MTF_ASYNC_PREEMPT=0 keeps the old scheduling exactly: raw priorities, no interruption, no disable_count; =2 keeps
 // inheritance and the preemption disable without interrupting owners.
 #define AP_FIRST_NS 250000ull   // the waiter spins this long before the first interruption (most waits end sooner)
 #define AP_GAP_NS 1000000ull    // and interrupts the same owner at most this often
-static int g_ap = -1, g_ap_int;   // g_ap_int: interrupt owners (TOTK_ASYNC_PREEMPT=2: inheritance and disable only)
+static int g_ap = -1, g_ap_int;   // g_ap_int: interrupt owners (MTF_ASYNC_PREEMPT=2: inheritance and disable only)
 static int g_ap_log;              // redirects logged so far (AP_LOG_N)
 #define AP_LOG_N 40
 static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first and last function start
-static uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;
 void kern_ap_stub(void);
 
 static void ap_init(void) {
     if (g_ap >= 0) return;
-    const char *e = cfg_value("TOTK_ASYNC_PREEMPT");
+    const char *e = cfg_value("MTF_ASYNC_PREEMPT");
     g_ap = strcmp(e, "0") != 0;
     g_ap_int = g_ap && strcmp(e, "2") != 0;
     if (g_ap) {
@@ -359,11 +370,8 @@ static void ap_init(void) {
                 if (f < lo) lo = f;
                 if (f > hi) hi = f;
             }
-        // The store exclusives must lie outside too: a thread stopped in one holds its granule (cpu.h, excl.c).
         const uintptr_t host[] = {(uintptr_t)kern_ap_stub, (uintptr_t)kern_checkpoint, (uintptr_t)rt_svc,
-                                  (uintptr_t)rt_dispatch, (uintptr_t)rt_call, (uintptr_t)excl_store8,
-                                  (uintptr_t)excl_store16, (uintptr_t)excl_store32, (uintptr_t)excl_store64,
-                                  (uintptr_t)excl_store128};
+                                  (uintptr_t)rt_dispatch, (uintptr_t)rt_call};
         int bad = !n || lo >= hi;
         for (unsigned i = 0; i < sizeof host / sizeof *host; i++) bad |= host[i] >= lo && host[i] <= hi;
         if (bad) {
@@ -377,7 +385,7 @@ static void ap_init(void) {
         }
     }
     rt_log("kernel: asynchronous preemption of virtual cores %s, priority inheritance and preemption disable %s; lifted "
-           "code exe+%#llx-exe+%#llx", g_ap_int ? "on" : "off", g_ap ? "on (TOTK_ASYNC_PREEMPT=0 turns all off)" : "off",
+           "code exe+%#llx-exe+%#llx", g_ap_int ? "on" : "off", g_ap ? "on (MTF_ASYNC_PREEMPT=0 turns all off)" : "off",
            (unsigned long long)(g_gen_lo ? g_gen_lo - plat_exe_base() : 0),
            (unsigned long long)(g_gen_hi ? g_gen_hi - plat_exe_base() : 0));
 }
@@ -393,7 +401,7 @@ static int eff_prio(const RtThread *o) {
     return p;
 }
 
-// The priority the virtual cores go by: raw with TOTK_ASYNC_PREEMPT=0, as before.
+// The priority the virtual cores go by: raw with MTF_ASYNC_PREEMPT=0, as before.
 static int prio_of(const RtThread *t) { return g_ap > 0 ? eff_prio(t) : t->prio; }
 
 // TLR+0x100 disable_count, +0x102 interrupt_flag (any thread may read them; the flag is set from outside as the
@@ -406,6 +414,18 @@ static int ap_disabled(const RtThread *t) { return g_ap > 0 && ap_tlr(t)[0]; }
 // in kern_ap_yield and jumps back to kern_ap_rip(), whose value it first stores in the return slot it reserved at
 // entry, so a stack walk sees the interrupted function as its caller. No ret: the jump keeps call/return pairs
 // balanced. The waiter never writes the owner's stack.
+// An x86-64-v2 build (no __AVX__) saves XMM0-15 with SSE moves into the same 32-byte slots instead: its game code
+// keeps nothing in the upper YMM halves, and the CPUs it is for have no VEX encoding, so a vmovdqa there faults with
+// an illegal instruction the first time a core is interrupted.
+#ifdef __AVX__
+#define AP_VMOV "vmovdqa"
+#define AP_V "%ymm"
+#define AP_VZEROUPPER "    vzeroupper\n"
+#else
+#define AP_VMOV "movdqa"
+#define AP_V "%xmm"
+#define AP_VZEROUPPER ""
+#endif
 #ifdef _WIN32
 __asm__(".text\n"
         ".globl kern_ap_stub\n"
@@ -437,48 +457,48 @@ __asm__(".text\n"
         ".seh_setframe %rbp, 0\n"
         ".seh_endprologue\n"
         "    andq $-32, %rsp\n"
-        "    subq $576, %rsp\n"   // 0: shadow space, 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15
-        "    vmovdqa %ymm0, 64(%rsp)\n"
-        "    vmovdqa %ymm1, 96(%rsp)\n"
-        "    vmovdqa %ymm2, 128(%rsp)\n"
-        "    vmovdqa %ymm3, 160(%rsp)\n"
-        "    vmovdqa %ymm4, 192(%rsp)\n"
-        "    vmovdqa %ymm5, 224(%rsp)\n"
-        "    vmovdqa %ymm6, 256(%rsp)\n"
-        "    vmovdqa %ymm7, 288(%rsp)\n"
-        "    vmovdqa %ymm8, 320(%rsp)\n"
-        "    vmovdqa %ymm9, 352(%rsp)\n"
-        "    vmovdqa %ymm10, 384(%rsp)\n"
-        "    vmovdqa %ymm11, 416(%rsp)\n"
-        "    vmovdqa %ymm12, 448(%rsp)\n"
-        "    vmovdqa %ymm13, 480(%rsp)\n"
-        "    vmovdqa %ymm14, 512(%rsp)\n"
-        "    vmovdqa %ymm15, 544(%rsp)\n"
+        "    subq $576, %rsp\n"   // 0: shadow space, 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15 (XMM0-15 without AVX)
+        "    " AP_VMOV " " AP_V "0, 64(%rsp)\n"
+        "    " AP_VMOV " " AP_V "1, 96(%rsp)\n"
+        "    " AP_VMOV " " AP_V "2, 128(%rsp)\n"
+        "    " AP_VMOV " " AP_V "3, 160(%rsp)\n"
+        "    " AP_VMOV " " AP_V "4, 192(%rsp)\n"
+        "    " AP_VMOV " " AP_V "5, 224(%rsp)\n"
+        "    " AP_VMOV " " AP_V "6, 256(%rsp)\n"
+        "    " AP_VMOV " " AP_V "7, 288(%rsp)\n"
+        "    " AP_VMOV " " AP_V "8, 320(%rsp)\n"
+        "    " AP_VMOV " " AP_V "9, 352(%rsp)\n"
+        "    " AP_VMOV " " AP_V "10, 384(%rsp)\n"
+        "    " AP_VMOV " " AP_V "11, 416(%rsp)\n"
+        "    " AP_VMOV " " AP_V "12, 448(%rsp)\n"
+        "    " AP_VMOV " " AP_V "13, 480(%rsp)\n"
+        "    " AP_VMOV " " AP_V "14, 512(%rsp)\n"
+        "    " AP_VMOV " " AP_V "15, 544(%rsp)\n"
         "    stmxcsr 32(%rsp)\n"
         "    movl $0x1f80, 36(%rsp)\n"
         "    ldmxcsr 36(%rsp)\n"
         "    cld\n"
-        "    vzeroupper\n"
+        AP_VZEROUPPER
         "    call kern_ap_rip\n"
         "    movq %rax, 72(%rbp)\n"   // the return slot: rbp + 8 pushes + pushfq
         "    call kern_ap_yield\n"
         "    ldmxcsr 32(%rsp)\n"
-        "    vmovdqa 64(%rsp), %ymm0\n"
-        "    vmovdqa 96(%rsp), %ymm1\n"
-        "    vmovdqa 128(%rsp), %ymm2\n"
-        "    vmovdqa 160(%rsp), %ymm3\n"
-        "    vmovdqa 192(%rsp), %ymm4\n"
-        "    vmovdqa 224(%rsp), %ymm5\n"
-        "    vmovdqa 256(%rsp), %ymm6\n"
-        "    vmovdqa 288(%rsp), %ymm7\n"
-        "    vmovdqa 320(%rsp), %ymm8\n"
-        "    vmovdqa 352(%rsp), %ymm9\n"
-        "    vmovdqa 384(%rsp), %ymm10\n"
-        "    vmovdqa 416(%rsp), %ymm11\n"
-        "    vmovdqa 448(%rsp), %ymm12\n"
-        "    vmovdqa 480(%rsp), %ymm13\n"
-        "    vmovdqa 512(%rsp), %ymm14\n"
-        "    vmovdqa 544(%rsp), %ymm15\n"
+        "    " AP_VMOV " 64(%rsp), " AP_V "0\n"
+        "    " AP_VMOV " 96(%rsp), " AP_V "1\n"
+        "    " AP_VMOV " 128(%rsp), " AP_V "2\n"
+        "    " AP_VMOV " 160(%rsp), " AP_V "3\n"
+        "    " AP_VMOV " 192(%rsp), " AP_V "4\n"
+        "    " AP_VMOV " 224(%rsp), " AP_V "5\n"
+        "    " AP_VMOV " 256(%rsp), " AP_V "6\n"
+        "    " AP_VMOV " 288(%rsp), " AP_V "7\n"
+        "    " AP_VMOV " 320(%rsp), " AP_V "8\n"
+        "    " AP_VMOV " 352(%rsp), " AP_V "9\n"
+        "    " AP_VMOV " 384(%rsp), " AP_V "10\n"
+        "    " AP_VMOV " 416(%rsp), " AP_V "11\n"
+        "    " AP_VMOV " 448(%rsp), " AP_V "12\n"
+        "    " AP_VMOV " 480(%rsp), " AP_V "13\n"
+        "    " AP_VMOV " 512(%rsp), " AP_V "14\n"
+        "    " AP_VMOV " 544(%rsp), " AP_V "15\n"
         "    movq %rbp, %rsp\n"
         "    popq %rbp\n"
         "    popq %r11\n"
@@ -492,68 +512,6 @@ __asm__(".text\n"
         "    leaq 8(%rsp), %rsp\n"
         "    jmpq *-8(%rsp)\n"
         ".seh_endproc\n");
-#elif defined(__aarch64__) && !defined(__APPLE__)
-#error "kern_ap_stub: the AArch64 version is written for Mach-O (macOS symbol names, plat_intr_return)"
-#elif defined(__aarch64__)
-// The AArch64 version, macOS. Apple's arm64 ABI keeps a 128-byte red zone below sp (Clang puts the locals of leaf functions
-// there, and lifted functions are leaves), so the frame goes below it. The frame is a PlatIntrCtx: every general
-// register, sp, the interrupted pc, NZCV, FPCR, FPSR and all 32 SIMD registers at their full 128 bits. AArch64 has no
-// jump through memory and the interrupted code may have any register live, x30 included (a leaf keeps its return
-// address there), so the stub does not jump back itself: plat_intr_return has the OS load the whole frame.
-_Static_assert(offsetof(PlatIntrCtx, sp) == 248 && offsetof(PlatIntrCtx, pc) == 256 &&
-                   offsetof(PlatIntrCtx, nzcv) == 264 && offsetof(PlatIntrCtx, fpcr) == 272 &&
-                   offsetof(PlatIntrCtx, q) == 288 && sizeof(PlatIntrCtx) == 800,
-               "kern_ap_stub frame layout");
-__asm__(".text\n"
-        ".globl _kern_ap_stub\n"
-        ".p2align 4\n"
-        "_kern_ap_stub:\n"
-        "    sub sp, sp, #928\n"       // 128 red zone + 800 PlatIntrCtx
-        "    stp x0, x1, [sp, #0]\n"
-        "    stp x2, x3, [sp, #16]\n"
-        "    stp x4, x5, [sp, #32]\n"
-        "    stp x6, x7, [sp, #48]\n"
-        "    stp x8, x9, [sp, #64]\n"
-        "    stp x10, x11, [sp, #80]\n"
-        "    stp x12, x13, [sp, #96]\n"
-        "    stp x14, x15, [sp, #112]\n"
-        "    stp x16, x17, [sp, #128]\n"
-        "    stp x18, x19, [sp, #144]\n"
-        "    stp x20, x21, [sp, #160]\n"
-        "    stp x22, x23, [sp, #176]\n"
-        "    stp x24, x25, [sp, #192]\n"
-        "    stp x26, x27, [sp, #208]\n"
-        "    stp x28, x29, [sp, #224]\n"
-        "    str x30, [sp, #240]\n"
-        "    add x9, sp, #928\n"
-        "    str x9, [sp, #248]\n"     // the interrupted sp
-        "    mrs x9, nzcv\n"
-        "    str x9, [sp, #264]\n"
-        "    mrs x9, fpcr\n"
-        "    mrs x10, fpsr\n"
-        "    stp x9, x10, [sp, #272]\n"
-        "    stp q0, q1, [sp, #288]\n"
-        "    stp q2, q3, [sp, #320]\n"
-        "    stp q4, q5, [sp, #352]\n"
-        "    stp q6, q7, [sp, #384]\n"
-        "    stp q8, q9, [sp, #416]\n"
-        "    stp q10, q11, [sp, #448]\n"
-        "    stp q12, q13, [sp, #480]\n"
-        "    stp q14, q15, [sp, #512]\n"
-        "    stp q16, q17, [sp, #544]\n"
-        "    stp q18, q19, [sp, #576]\n"
-        "    stp q20, q21, [sp, #608]\n"
-        "    stp q22, q23, [sp, #640]\n"
-        "    stp q24, q25, [sp, #672]\n"
-        "    stp q26, q27, [sp, #704]\n"
-        "    stp q28, q29, [sp, #736]\n"
-        "    stp q30, q31, [sp, #768]\n"
-        "    bl _kern_ap_rip\n"
-        "    str x0, [sp, #256]\n"     // the interrupted pc
-        "    bl _kern_ap_yield\n"
-        "    mov x0, sp\n"
-        "    bl _plat_intr_return\n"
-        "    brk #0x1\n");
 #else
 // The System V version: rsi and rdi are volatile there too, and the interrupted code may keep data in the 128 bytes
 // below its stack pointer (the red zone), so the return slot and the saves go below that. Without a red zone in the
@@ -578,48 +536,48 @@ __asm__(".text\n"
         "    pushq %rbp\n"
         "    movq %rsp, %rbp\n"
         "    andq $-32, %rsp\n"
-        "    subq $576, %rsp\n"   // 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15
-        "    vmovdqa %ymm0, 64(%rsp)\n"
-        "    vmovdqa %ymm1, 96(%rsp)\n"
-        "    vmovdqa %ymm2, 128(%rsp)\n"
-        "    vmovdqa %ymm3, 160(%rsp)\n"
-        "    vmovdqa %ymm4, 192(%rsp)\n"
-        "    vmovdqa %ymm5, 224(%rsp)\n"
-        "    vmovdqa %ymm6, 256(%rsp)\n"
-        "    vmovdqa %ymm7, 288(%rsp)\n"
-        "    vmovdqa %ymm8, 320(%rsp)\n"
-        "    vmovdqa %ymm9, 352(%rsp)\n"
-        "    vmovdqa %ymm10, 384(%rsp)\n"
-        "    vmovdqa %ymm11, 416(%rsp)\n"
-        "    vmovdqa %ymm12, 448(%rsp)\n"
-        "    vmovdqa %ymm13, 480(%rsp)\n"
-        "    vmovdqa %ymm14, 512(%rsp)\n"
-        "    vmovdqa %ymm15, 544(%rsp)\n"
+        "    subq $576, %rsp\n"   // 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15 (XMM0-15 without AVX)
+        "    " AP_VMOV " " AP_V "0, 64(%rsp)\n"
+        "    " AP_VMOV " " AP_V "1, 96(%rsp)\n"
+        "    " AP_VMOV " " AP_V "2, 128(%rsp)\n"
+        "    " AP_VMOV " " AP_V "3, 160(%rsp)\n"
+        "    " AP_VMOV " " AP_V "4, 192(%rsp)\n"
+        "    " AP_VMOV " " AP_V "5, 224(%rsp)\n"
+        "    " AP_VMOV " " AP_V "6, 256(%rsp)\n"
+        "    " AP_VMOV " " AP_V "7, 288(%rsp)\n"
+        "    " AP_VMOV " " AP_V "8, 320(%rsp)\n"
+        "    " AP_VMOV " " AP_V "9, 352(%rsp)\n"
+        "    " AP_VMOV " " AP_V "10, 384(%rsp)\n"
+        "    " AP_VMOV " " AP_V "11, 416(%rsp)\n"
+        "    " AP_VMOV " " AP_V "12, 448(%rsp)\n"
+        "    " AP_VMOV " " AP_V "13, 480(%rsp)\n"
+        "    " AP_VMOV " " AP_V "14, 512(%rsp)\n"
+        "    " AP_VMOV " " AP_V "15, 544(%rsp)\n"
         "    stmxcsr 32(%rsp)\n"
         "    movl $0x1f80, 36(%rsp)\n"
         "    ldmxcsr 36(%rsp)\n"
         "    cld\n"
-        "    vzeroupper\n"
+        AP_VZEROUPPER
         "    call kern_ap_rip\n"
         "    movq %rax, 88(%rbp)\n"   // the return slot: rbp + 10 pushes + pushfq
         "    call kern_ap_yield\n"
         "    ldmxcsr 32(%rsp)\n"
-        "    vmovdqa 64(%rsp), %ymm0\n"
-        "    vmovdqa 96(%rsp), %ymm1\n"
-        "    vmovdqa 128(%rsp), %ymm2\n"
-        "    vmovdqa 160(%rsp), %ymm3\n"
-        "    vmovdqa 192(%rsp), %ymm4\n"
-        "    vmovdqa 224(%rsp), %ymm5\n"
-        "    vmovdqa 256(%rsp), %ymm6\n"
-        "    vmovdqa 288(%rsp), %ymm7\n"
-        "    vmovdqa 320(%rsp), %ymm8\n"
-        "    vmovdqa 352(%rsp), %ymm9\n"
-        "    vmovdqa 384(%rsp), %ymm10\n"
-        "    vmovdqa 416(%rsp), %ymm11\n"
-        "    vmovdqa 448(%rsp), %ymm12\n"
-        "    vmovdqa 480(%rsp), %ymm13\n"
-        "    vmovdqa 512(%rsp), %ymm14\n"
-        "    vmovdqa 544(%rsp), %ymm15\n"
+        "    " AP_VMOV " 64(%rsp), " AP_V "0\n"
+        "    " AP_VMOV " 96(%rsp), " AP_V "1\n"
+        "    " AP_VMOV " 128(%rsp), " AP_V "2\n"
+        "    " AP_VMOV " 160(%rsp), " AP_V "3\n"
+        "    " AP_VMOV " 192(%rsp), " AP_V "4\n"
+        "    " AP_VMOV " 224(%rsp), " AP_V "5\n"
+        "    " AP_VMOV " 256(%rsp), " AP_V "6\n"
+        "    " AP_VMOV " 288(%rsp), " AP_V "7\n"
+        "    " AP_VMOV " 320(%rsp), " AP_V "8\n"
+        "    " AP_VMOV " 352(%rsp), " AP_V "9\n"
+        "    " AP_VMOV " 384(%rsp), " AP_V "10\n"
+        "    " AP_VMOV " 416(%rsp), " AP_V "11\n"
+        "    " AP_VMOV " 448(%rsp), " AP_V "12\n"
+        "    " AP_VMOV " 480(%rsp), " AP_V "13\n"
+        "    " AP_VMOV " 512(%rsp), " AP_V "14\n"
+        "    " AP_VMOV " 544(%rsp), " AP_V "15\n"
         "    movq %rbp, %rsp\n"
         "    popq %rbp\n"
         "    popq %r11\n"
@@ -648,12 +606,10 @@ static int ap_try(RtThread *w) {
     if (!o->hthr || o->ap_pending) return AP_RETRY;
     volatile uint16_t *tl = ap_tlr(o);
     if (__atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) > 0) {
-        g_ap_host++;
         return AP_RETRY;
     }
     if (tl[0]) {   // preemption disabled: SVC 0x36 switches
         tl[1] = 1;
-        g_ap_deferred++;
         return AP_RETRY;
     }
     uint64_t now = kern_now_ns();
@@ -661,28 +617,24 @@ static int ap_try(RtThread *w) {
     o->ap_last = now;
     uint64_t rip, rsp;
     if (!plat_intr_stop(o->hthr, &rip, &rsp)) {
-        g_ap_fail++;
         return AP_RETRY;
     }
     int r = AP_RETRY;
     uint64_t to = 0;
-    if (rip < g_gen_lo || rip > g_gen_hi)
-        g_ap_pc++;
-    else if (__atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) > 0)
-        g_ap_host++;
-    else if (tl[0]) {
-        tl[1] = 1;
-        g_ap_deferred++;
-    } else {
-        o->ap_rip = rip;
-        o->ap_pending = 1;
-        to = (uint64_t)(uintptr_t)kern_ap_stub;
+    // Redirected only when stopped in lifted game code, outside host calls and with preemption allowed; otherwise it
+    // resumes where it was (preemption disabled: the SVC 0x36 switch is asked for instead).
+    if (rip >= g_gen_lo && rip <= g_gen_hi && __atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) <= 0) {
+        if (tl[0]) {
+            tl[1] = 1;
+        } else {
+            o->ap_rip = rip;
+            o->ap_pending = 1;
+            to = (uint64_t)(uintptr_t)kern_ap_stub;
+        }
     }
     if (!plat_intr_resume(o->hthr, to)) {
         o->ap_pending = 0;
-        g_ap_fail++;
     } else if (to) {
-        g_ap_sent++;
         r = AP_SENT;
     }
     if (r == AP_SENT && g_ap_log < AP_LOG_N) {
@@ -693,15 +645,14 @@ static int ap_try(RtThread *w) {
     return r;
 }
 
-// ---- TOTK_CORE_DIAG=1: why ready threads wait for a virtual core, and for how long
+// ---- MTF_CORE_DIAG=1: why ready threads wait for a virtual core, and for how long
 // Each core wait is split into classes: the owner asked to give the core up ran game code (DG_GAME, the part an
 // asynchronous preemption would remove), was in a host call or SVC that kept the core (DG_HOST), every owner the waiter
 // may displace was of better or equal priority (DG_EQ: Horizon waits too), or the worse owners were claimed by better
 // waiters (DG_NOCORE). Per 60 presents: time per frame and a wait-length histogram per class, the owners that cost
 // most; a line per present over 25 ms; a line per wait with over 2 ms of DG_GAME (where the owner reached its
-// checkpoint), and one host RIP sample of the owner per such wait (exe RVA, for totk.map).
+// checkpoint), and one host RIP sample of the owner per such wait (exe RVA, for the linker map).
 enum { DG_GAME, DG_HOST, DG_EQ, DG_NOCORE, DG_N };
-static const char *const dg_name[DG_N] = {"game", "host", "eq", "nocore"};
 #define DG_NB 8   // wait lengths: < 0.05, 0.25, 1, 2, 4, 8, 16 ms, longer
 static const uint64_t dg_edge[DG_NB - 1] = {50000, 250000, 1000000, 2000000, 4000000, 8000000, 16000000};
 #define DG_LONG_LINES 400
@@ -720,15 +671,13 @@ static uint64_t g_dg_samples, g_dg_lines, g_sync36, g_sync36_flag;
 
 static void diag_init(void) {
     if (g_diag >= 0) return;
-    const char *e = cfg_get("TOTK_CORE_DIAG");
+    const char *e = cfg_get("MTF_CORE_DIAG");
     g_diag = e && *e && strcmp(e, "0");
     if (g_diag) {
         kern_host_track = 1;
-        rt_log("core-diag: on (TOTK_CORE_DIAG)");
+        rt_log("core-diag: on (MTF_CORE_DIAG)");
     }
 }
-
-int kern_core_diag_on(void) { return g_diag > 0; }
 
 // A tracked host call or SVC returned to depth 0 with a preempt request pending (host.h); on the thread itself.
 void kern_host_left(void *thread) {
@@ -825,80 +774,13 @@ static void dg_sample(RtThread *t) {
            t->dg_cls == DG_HOST ? "host" : "game", (kern_now_ns() - t->dg_since) / 1e6);
 }
 
-
-// perf_present, every present: a line for a present over 25 ms, the 60-present summary.
-void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns) {
-    if (g_ap > 0 && frame && frame % 600 == 0) {   // TOTK_ASYNC_PREEMPT counters since the start
-        lock();
-        uint64_t v[8] = {g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok, g_sync36};
-        unlock();
-        rt_log("kernel: frame %llu: asynchronous preemption: %llu interrupted, %llu cores given up there; refused: "
-               "%llu in a host call, %llu outside game code, %llu preemption disabled, %llu failed; %llu waits ended "
-               "in the first spin; SVC 0x36 %llu",
-               (unsigned long long)frame, (unsigned long long)v[0], (unsigned long long)v[1], (unsigned long long)v[2],
-               (unsigned long long)v[3], (unsigned long long)v[4], (unsigned long long)v[5], (unsigned long long)v[6],
-               (unsigned long long)v[7]);
-    }
-    if (g_diag <= 0) return;
-    DgWindow w;
-    uint64_t f[DG_N], fr[DG_N], s36, s36f;
-    lock();
-    g_render = tcur;
-    memcpy(f, g_dgf, sizeof f);
-    memcpy(fr, g_dgfr, sizeof fr);
-    memset(g_dgf, 0, sizeof g_dgf);
-    memset(g_dgfr, 0, sizeof g_dgfr);
-    int lng = interval_ns > 25000000ull;
-    if (lng) {
-        g_dgw.long_frames++;
-        if (f[DG_GAME] > 1000000) g_dgw.long_game_frames++;
-    }
-    int rep = frame && frame % 60 == 0;
-    if (rep) {
-        w = g_dgw;
-        memset(&g_dgw, 0, sizeof g_dgw);
-    }
-    s36 = g_sync36;
-    s36f = g_sync36_flag;
-    unlock();
-    if (lng)
-        rt_log("core-diag: frame %llu: %.1f ms; core wait game %.2f host %.2f eq %.2f nocore %.2f ms; render thread game "
-               "%.2f host %.2f eq %.2f nocore %.2f ms",
-               (unsigned long long)frame, interval_ns / 1e6, f[0] / 1e6, f[1] / 1e6, f[2] / 1e6, f[3] / 1e6,
-               fr[0] / 1e6, fr[1] / 1e6, fr[2] / 1e6, fr[3] / 1e6);
-    if (!rep) return;
-    char s[1024];
-    int o = 0;
-    for (int c = 0; c < DG_N; c++) {
-        o += snprintf(s + o, sizeof s - o, "%s %.3f ms/frame %llu waits [", dg_name[c], w.ns[c] / 60e6,
-                      (unsigned long long)w.n[c]);
-        for (int b = 0; b < DG_NB; b++)
-            o += snprintf(s + o, sizeof s - o, "%s%llu", b ? " " : "", (unsigned long long)w.hist[c][b]);
-        o += snprintf(s + o, sizeof s - o, "]%s", c < DG_N - 1 ? "; " : "");
-    }
-    rt_log("core-diag: frames %llu-%llu: %s; long frames %llu (game wait > 1 ms in %llu); SVC 0x36 %llu (flag set %llu)",
-           (unsigned long long)frame - 59, (unsigned long long)frame, s, (unsigned long long)w.long_frames,
-           (unsigned long long)w.long_game_frames, (unsigned long long)s36, (unsigned long long)s36f);
-    o = 0;
-    for (int k = 0; k < 6; k++) {
-        int bi = -1;
-        for (int i = 0; i < DG_OWN; i++)
-            if (w.own[i].ns && (bi < 0 || w.own[i].ns > w.own[bi].ns)) bi = i;
-        if (bi < 0) break;
-        o += snprintf(s + o, sizeof s - o, " %#x p%d %s %.3f;", w.own[bi].h, w.own[bi].prio, dg_name[w.own[bi].cls],
-                      w.own[bi].ns / 60e6);
-        w.own[bi].ns = 0;
-    }
-    if (o) rt_log("core-diag: owners (ms/frame):%s", s);
-}
-
 static void core_count(void) {
     int n = 0;
     for (int i = 0; i < NCORE; i++) n += g_core_owner[i] != NULL;
     if (n > g_held_max) g_held_max = n;
 }
 
-static struct DgRel g_dg_rel;   // TOTK_CORE_DIAG: the owner core_put is releasing, for core_grant
+static struct DgRel g_dg_rel;   // MTF_CORE_DIAG: the owner core_put is releasing, for core_grant
 
 static void core_grant(int c) {
     RtThread *b = NULL, **bp = NULL;
@@ -982,13 +864,7 @@ static void core_kick(void) {
         if (v < 0) continue;
         claimed |= 1 << v;
         RtThread *o = g_core_owner[v];
-        // A waiter that found no owner to interrupt sleeps without a timeout in core_take; it only calls ap_try again
-        // when woken. So a waiter whose target changes, or whose target is marked just now, is woken to interrupt it:
-        // otherwise an owner in game code with no SVC or indirect call (a long loop) keeps its core and the waiter
-        // sleeps for good.
-        int wake = g_ap_int && (w[k]->target != o || !o->preempt);
         w[k]->target = o;
-        if (wake) plat_cond_signal(&w[k]->cv);
         if (o->preempt) continue;
         if (rt_trace & RT_TRACE_SCHED) {
             o->pre_since = kern_now_ns();
@@ -1009,7 +885,7 @@ static void core_take(RtThread *t) {
         acct(t, S_RUN);
         return;
     }
-    if (!(t->mask & ((1u << NCORE) - 1)))
+    if (!(t->mask & CORE_MASK))
         rt_fatal("kernel: thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++)
@@ -1037,7 +913,6 @@ static void core_take(RtThread *t) {
         unlock();
         while (__atomic_load_n(&t->cur_core, __ATOMIC_RELAXED) < 0 && kern_now_ns() < end) plat_pause();
         lock();
-        if (t->cur_core >= 0) g_ap_spin_ok++;
     }
     int sampled = 0;
     while (t->cur_core < 0) {
@@ -1081,7 +956,7 @@ int kern_core_away(void) {
     lock();
     core_put(t);
     acct(t, S_HOST);
-    if (rt_trace & RT_TRACE_SCHED)   // the caller as an exe RVA (totk.map)
+    if (rt_trace & RT_TRACE_SCHED)   // the caller as an exe RVA (linker map)
         t->wobj = (uintptr_t)__builtin_return_address(0) - plat_exe_base();
     unlock();
     return 1;
@@ -1096,48 +971,25 @@ void kern_core_back(int *away) {
     *away = 0;
 }
 
-// ---- spin waits (recomp/patches.py `spin` lines, found by tools/spin_waits.py)
-// Adapted from MacNativeGames games/totk/runtime/threads.c runtime_spin_wait @ a038e6b and nxnative dm/host/hle_thread.c
-// dm_spin_wait @ 6d34984 (MIT, Copyright (c) 2026 MacNativeGames contributors, Copyright (c) 2026 seedds).
-// A pass of a guest loop that polls memory until another thread changes it. On the Switch it fills only its own core,
-// where a better thread pinned there preempts it; here it holds a virtual core and a host core, and pollers that take a
-// lock on every pass hand its cache line between their host cores so the thread whose item it is rarely gets it
-// (nxnative found this in Breath of the Wild's job queue). Every pass pauses the host core once. A wait is a run of
-// passes through the same loop at most SPIN_GAP_NS apart; once one has lasted TOTK_SPIN_HANDOFF_US (default 50) and a
-// thread waits for a virtual core, each pass gives the core to the waiter, whatever its priority, yields the host CPU
-// and takes a core again. Shorter waits keep the core: a lock held for a moment would otherwise make the next pass wait
-// for another thread's next SVC (MacNativeGames). TOTK_SPIN=0 keeps the core always (the gate's own cost only).
-#define SPIN_GAP_NS 20000ull
-static int g_spin_on = -1;
-static uint64_t g_spin_handoff_ns;
-static _Thread_local uint64_t sw_head, sw_t0, sw_last;
-
-void rt_spin_gate(Cpu *c, uint64_t head) {
-    (void)c;
-    plat_pause();
-    RtThread *t = tcur;
-    if (!t) return;
-    if (g_spin_on < 0) {
-        const char *e = cfg_get("TOTK_SPIN_HANDOFF_US");
-        g_spin_handoff_ns = (uint64_t)(e && *e ? atoll(e) : 50) * 1000;
-        g_spin_on = !(cfg_get("TOTK_SPIN") && !cfg_bool("TOTK_SPIN"));
-    }
-    t->sp_n++;
-    t->sp_site = head;
-    uint64_t now = kern_now_ns();
-    if (head != sw_head || now - sw_last > SPIN_GAP_NS) {   // a new wait
-        sw_head = head;
-        sw_t0 = now;
-    }
-    sw_last = now;
-    if (!g_spin_on || t->cur_core < 0 || now - sw_t0 < g_spin_handoff_ns ||
-        !__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED))   // a racy look: a waiter missed now is seen at the next pass
-        return;
-    t->sp_ho++;
+// Waits until every guest thread started so far has reached guest code, giving the caller's core away meanwhile, then
+// for about one service round trip; at most max_ns. On Horizon, connecting to a service takes the caller a few round
+// trips, and the threads it started on other cores run meanwhile: MTF's boot stub builds its last decoder
+// thread's arguments on its stack (main+0x97c), starts that thread, calls nn::ro::Initialize and then reuses the same
+// stack slots (main+0xa04). The host's Initialize returns at once, so ro.c calls this to keep that order.
+void kern_settle_started(uint64_t max_ns) {
+    uint64_t end = kern_now_ns() + max_ns;
     int away = kern_core_away();
-    plat_yield();
+    for (;;) {
+        int waiting = 0;
+        lock();
+        for (RtThread *t = g_all; t; t = t->all)
+            if (t->started && !t->entered && !t->exited) waiting = 1;
+        unlock();
+        if (!waiting || kern_now_ns() >= end) break;
+        plat_sleep_ms(1);
+    }
+    plat_sleep_ms(1);   // the round trip: the started threads read their arguments
     kern_core_back(&away);
-    sw_last = kern_now_ns();
 }
 
 // A pending preempt request, at an SVC or an indirect call. The core goes over only if a better thread still waits
@@ -1154,7 +1006,6 @@ void kern_checkpoint(void) {
     if (better && ap_disabled(t)) {   // preemption disabled: the switch comes at SVC 0x36
         ap_tlr(t)[1] = 1;
         t->preempt = 0;
-        g_ap_deferred++;
     } else if (better) {
         core_put(t);   // clears preempt (after the sched trace reads it)
         core_take(t);
@@ -1180,7 +1031,6 @@ void kern_ap_yield(void) {
             t->dg_pc = t->cur->pc;
             t->dg_lr = t->cur->x[30];
         }
-        g_ap_taken++;
         core_put(t);
         core_take(t);
     }
@@ -1197,34 +1047,18 @@ static void ap_sync(RtThread *t) {
     unlock();
 }
 
-void kern_core_stats(int *held_now, int *held_max) {
-    lock();
-    int n = 0;
-    for (int i = 0; i < NCORE; i++) n += g_core_owner[i] != NULL;
-    *held_now = n;
-    *held_max = g_held_max;
-    unlock();
-}
-
-void kern_core_stats_reset(void) {
-    lock();
-    g_held_max = 0;
-    core_count();
-    unlock();
-}
-
-// TOTK_TRACE=sched: every 120 presents, the time split of the busiest threads (running, waiting for a core, host
+// MTF_TRACE=sched: every 120 presents, the time split of the busiest threads (running, waiting for a core, host
 // calls) and of the render thread, the render and the main thread's longest waits by object and by the thread whose
 // signal ended them, and the preemption latency.
 #define REP_N 8
-// At each present (holding G): starts recording at TOTK_CRIT's first frame, stops and writes the file at its last.
+// At each present (holding G): starts recording at MTF_CRIT's first frame, stops and writes the file at its last.
 // File: "CRIT", thread count, event count (u32 each); per thread handle, priority, flags (1 main, 2 presents), host
 // tid (u32 each); then the CritEv records.
 static void crit_frame(RtThread *self, uint64_t frame) {
     static int parsed;
     if (!parsed) {
         parsed = 1;
-        const char *e = cfg_get("TOTK_CRIT");
+        const char *e = cfg_get("MTF_CRIT");
         unsigned long long lo, hi;
         double wl, wh;
         if (e && e[0] == 'w' && sscanf(e + 1, "%lf-%lf", &wl, &wh) == 2 && wl >= 0 && wl < wh &&
@@ -1251,7 +1085,7 @@ static void crit_frame(RtThread *self, uint64_t frame) {
     crit_add(CRIT_FRAME, self ? self->handle : 0, 0, 0, frame, kern_now_ns());
     if (frame < g_crit_hi) return;
     g_crit_on = 0;
-    const char *path = cfg_get("TOTK_CRIT_OUT");
+    const char *path = cfg_get("MTF_CRIT_OUT");
     FILE *f = fopen(path && *path ? path : "crit.bin", "wb");
     if (!f) {
         rt_log("crit: cannot write %s", path && *path ? path : "crit.bin");
@@ -1475,6 +1309,7 @@ static void thr_link(RtThread *t) {   // holding G
 }
 
 static void thr_free(RtThread *t) {   // holding G; t has exited and its handle is closed
+    if (g_created) g_created--;   // its slot of the thread limit is free again (GetInfo 24, free thread count)
     for (RtThread **p = &g_all; *p; p = &(*p)->all)
         if (*p == t) {
             *p = t->all;
@@ -1503,14 +1338,12 @@ static void thread_finish(RtThread *t) {
     unlock();
 }
 
-// ExitThread: back to the thread start with longjmp. On Windows the default MinGW setjmp records the stack frame,
-// which the CRT needs to validate the target when SetContextIpValidation is enabled. The non-SEH variant records a
-// null frame and longjmp fails with FAST_FAIL_INVALID_SET_OF_CONTEXT on such systems.
-// (__builtin_setjmp is not usable: on Win64 LLVM saves the frame address, which is not rbp when the frame register
-// is offset, and the landing code then reads its locals through the wrong base.)
-static __attribute__((noreturn)) void exit_now(RtThread *t) { longjmp(t->exit_jmp, 1); }
+// ExitThread: back to the thread start with plat_jmp_go, which unwinds nothing: no SEH unwinding through lifted
+// frames. (__builtin_setjmp is not usable: on Win64 LLVM saves the frame address, which is not rbp when the frame
+// register is offset, and the landing code then reads its locals through the wrong base.)
+static __attribute__((noreturn)) void exit_now(RtThread *t) { plat_jmp_go(&t->exit_jmp); }
 
-// The calling host thread, for ap_try (TOTK_ASYNC_PREEMPT) and dg_sample (TOTK_CORE_DIAG).
+// The calling host thread, for ap_try (MTF_ASYNC_PREEMPT) and dg_sample (MTF_CORE_DIAG).
 static PlatIntr *ap_open_self(void) {
     if (!cores_enabled() || (!g_ap_int && g_diag <= 0)) return NULL;
     PlatIntr *h = plat_intr_self();
@@ -1527,14 +1360,11 @@ static void thread_main(void *p) {
     t->hthr = self;
     while (!t->started) plat_cond_wait(&t->cv, &G);
     core_take(t);
+    t->entered = 1;
     unlock();
     Cpu *c = t->cpu;
     c->sp = t->stack_top & ~15ull;
-    if (!setjmp(t->exit_jmp)) {
-#ifdef _WIN32   // the CRT needs this frame to validate longjmp when SetContextIpValidation is enabled
-        if (!((_JUMP_BUFFER *)t->exit_jmp)->Frame)
-            rt_fatal("kernel: setjmp recorded no frame; ExitThread would fail fast");
-#endif
+    if (!plat_jmp_save(&t->exit_jmp)) {
         rt_call(c, t->entry, 1, t->arg);
         char d[128];
         rt_fatal("guest thread %#x: entry %s returned (Horizon threads end with ExitThread)", t->handle,
@@ -1544,6 +1374,7 @@ static void thread_main(void *p) {
     return;
 }
 
+// Threads alive or not yet freed (exited with an open handle): the process's thread limit counts these
 uint64_t kern_threads_created(void) {
     lock();
     uint64_t n = g_created;
@@ -1564,7 +1395,7 @@ uint32_t kern_main_thread(Cpu **cpu) {
     uint64_t stack = L->stack.base + L->stack.size - MAIN_STACK;
     if (!plat_mem_commit(stack, MAIN_STACK))
         rt_fatal("kernel: commit the main thread stack at %#llx failed", (unsigned long long)stack);
-    RtThread *t = thr_new(MAIN_PRIO, MAIN_CORE, 7);
+    RtThread *t = thr_new(MAIN_PRIO, MAIN_CORE, CORE_MASK);
     t->started = 1;
     t->is_main = 1;
     t->stack_top = stack + MAIN_STACK;
@@ -1594,13 +1425,7 @@ static void guest_main(void *p) {
     void (*fn)(Cpu *) = (void (*)(Cpu *))p;
     Cpu *c;
     kern_main_thread(&c);
-    if (!setjmp(tcur->exit_jmp)) {
-#ifdef _WIN32   // the CRT needs this frame to validate longjmp when SetContextIpValidation is enabled
-        if (!((_JUMP_BUFFER *)tcur->exit_jmp)->Frame)
-            rt_fatal("kernel: setjmp recorded no frame; ExitThread would fail fast");
-#endif
-        fn(c);
-    }
+    if (!plat_jmp_save(&tcur->exit_jmp)) fn(c);
     thread_finish(tcur);
     return;
 }
@@ -1638,14 +1463,6 @@ static int sig_obj(uint32_t h, int *bad) {   // 1 = signaled (holding G)
     case O_EVENT_R: return ((Event *)g_h[i].obj)->signaled;
     default: *bad = 1; return 0;
     }
-}
-
-int kern_thread_state(uint32_t h) {
-    lock();
-    RtThread *t = h_peek(h, O_THREAD);
-    int r = !t ? -1 : t->exited ? KERN_THREAD_EXITED : t->wkind;
-    unlock();
-    return r;
 }
 
 // CloseHandle: an event goes with its last end; a thread object once it has also exited.
@@ -1704,7 +1521,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
             x[0] = R_BAD_STATE;
             return 1;
         }
-        RtThread *t = thr_new(prio, core >= 0 ? core : MAIN_CORE, core >= 0 ? 1ull << core : ((1ull << NCORE) - 1));
+        RtThread *t = thr_new(prio, core >= 0 ? core : MAIN_CORE, core >= 0 ? 1ull << core : CORE_MASK);
         t->entry = x[1];
         t->arg = x[2];
         t->stack_top = x[3] & ~15ull;
@@ -1729,7 +1546,6 @@ int kern_svc(Cpu *c, uint32_t imm) {
             plat_cond_signal(&t->cv);
         }
         unlock();
-        if (t && plat_process_uptime_ns() < 2000000000ull) plat_wait_ns(10000000);
         x[0] = t ? R_OK : R_BAD_HANDLE;
         return 1;
     }
@@ -1877,8 +1693,8 @@ int kern_svc(Cpu *c, uint32_t imm) {
     case 0x1C: {   // WaitProcessWideKeyAtomic(x0 lock, x1 key, w2 tag, x3 timeout)
         // The key is set before the lock is released. The SDK's Signal reads the key in user mode and skips svc 0x1D
         // when it is 0, and user mode takes the lock without G: releasing first lets another thread take the lock,
-        // change the condition, read key 0 and wake nobody, after which this thread waits forever (MNG threads.c
-        // 439-446). Linking into the wait list happens in block, still holding G, so svc 0x1D cannot come between.
+        // change the condition, read key 0 and wake nobody, after which this thread waits forever.
+        // Linking into the wait list happens in block, still holding G, so svc 0x1D cannot come between.
         RtThread *t = cur(imm);
         uint64_t addr = x[0], key = x[1];
         lock();
@@ -1889,7 +1705,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
             t->wtag = (uint32_t)x[2];
             lock_handoff(addr);
             cv_hook();
-        } else {   // the probe's negative control: MNG's pre-fix order
+        } else {   // the probe's negative control: the order before the fix
             lock_handoff(addr);
             cv_hook();
             st32(key, 1);
@@ -1960,7 +1776,9 @@ int kern_svc(Cpu *c, uint32_t imm) {
         if (type != 0) {
             int32_t nv = val + 1;
             if (type == 2) {
-                if (cnt <= 0) nv = nw > 0 ? val - 1 : val + 1;
+                // Waking all (count <= 0) with waiters subtracts 2, not 1 (mesosphere
+                // KAddressArbiter::SignalAndModifyByWaitingCountIfEqual; other implementations agree).
+                if (cnt <= 0) nv = nw > 0 ? val - 2 : val + 1;
                 else nv = nw == 0 ? val + 1 : nw <= cnt ? val - 1 : val;
             }
             uint32_t e = (uint32_t)val;
@@ -2024,8 +1842,13 @@ int kern_svc(Cpu *c, uint32_t imm) {
         int idx = -1;
         lock();
         g_sync_calls++;
+        // Horizon's order (mesosphere KSynchronizationObject::Wait): a signalled object, then timeout 0, then a pending
+        // CancelSynchronization. The cancel is for the next wait that would block: a poll or a wait on a signalled
+        // object leaves it pending. A cancel that wakes this wait (CancelSynchronization wakes it with R_CANCELLED; a
+        // signal wakes it with -1 to look again) ends it cancelled, signalled objects or not.
+        uint32_t woke = 0;
         for (;;) {
-            if (t->cancel) {
+            if (woke == R_CANCELLED) {
                 t->cancel = 0;
                 r = R_CANCELLED;
                 break;
@@ -2041,6 +1864,15 @@ int kern_svc(Cpu *c, uint32_t imm) {
                 r = R_OK;
                 break;
             }
+            if (ns == 0) {
+                r = R_TIMEOUT;
+                break;
+            }
+            if (t->cancel) {
+                t->cancel = 0;
+                r = R_CANCELLED;
+                break;
+            }
             int64_t left = ns;
             if (ns > 0) {
                 uint64_t spent = kern_now_ns() - start;
@@ -2052,7 +1884,8 @@ int kern_svc(Cpu *c, uint32_t imm) {
             }
             t->wobj = n ? hs[0] | (uint64_t)n << 32 : 0;
             g_sync_blocks++;
-            if (block(t, W_SYNC, left) == R_TIMEOUT) {
+            woke = block(t, W_SYNC, left);
+            if (woke == R_TIMEOUT) {
                 r = R_TIMEOUT;
                 break;
             }
@@ -2067,7 +1900,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
         RtThread *t = h_get((uint32_t)x[0], O_THREAD);
         if (t) {
             t->cancel = 1;
-            if (t->wkind == W_SYNC) wake(t, (uint32_t)-1);
+            if (t->wkind == W_SYNC) wake(t, R_CANCELLED);
         }
         unlock();
         x[0] = t ? R_OK : R_BAD_HANDLE;
@@ -2094,14 +1927,6 @@ void *kern_handle_get(uint32_t h, int kind) {
     void *o = h_peek(h, kind);
     unlock();
     return o;
-}
-
-struct IpcSession *kern_session_acquire(uint32_t h) {
-    lock();
-    struct IpcSession *s = h_peek(h, O_SESSION);
-    if (s) ipc_session_retain(s);
-    unlock();
-    return s;
 }
 
 uint32_t kern_event_new(void) {
@@ -2136,9 +1961,18 @@ void kern_event_signal(uint32_t hw) {
 
 // System events of host services: the SDK's own nn::os::CreateSystemEvent creates the kernel event (SVC 0x45) on a
 // guest thread; the writable handle is kept, so any thread (host audio tick included) can signal it later.
+// The guest may destroy such an event and attach the same SystemEventType again: the game does that with the nfp
+// activate and deactivate events before each detection. nn::os::DestroySystemEvent zeroes the state byte at +0x28
+// (0 not initialised, 1 event, 2 inter-process event; nn::os::TryWaitSystemEvent aborts on 0) and closes both
+// handles, so a kept handle counts only while that byte is nonzero.
+#define SE_STATE 0x28
 static struct { uint64_t ev; uint32_t wh; } g_se[512];
 static int g_nse;
 static PlatMutex g_se_lock = PLAT_MUTEX_INIT;
+
+static int se_live(uint64_t ev) {
+    return __atomic_load_n((const uint8_t *)(uintptr_t)(ev + SE_STATE), __ATOMIC_RELAXED) != 0;
+}
 
 static uint32_t se_find(uint64_t ev) {
     plat_mutex_lock_shared(&g_se_lock);
@@ -2149,8 +1983,9 @@ static uint32_t se_find(uint64_t ev) {
     return wh;
 }
 
+// A bound event the guest destroyed since is created again and its table entry takes the new writable handle.
 void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
-    if (se_find(ev)) return;
+    if (se_find(ev) && se_live(ev)) return;
     if (!tcur || !c) rt_fatal("kern_bind_system_event(%#llx) on a host thread", (unsigned long long)ev);
     static uint64_t create, getw;
     if (!create) {
@@ -2162,20 +1997,36 @@ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
     if (r) rt_fatal("kern_bind_system_event: CreateSystemEvent(%#llx) failed %#x", (unsigned long long)ev, r);
     uint32_t wh = (uint32_t)rt_call(c, getw, 1, ev);
     plat_mutex_lock(&g_se_lock);
-    if (g_nse == (int)(sizeof g_se / sizeof *g_se)) rt_fatal("kern_bind_system_event: table full");
-    g_se[g_nse].ev = ev;
-    g_se[g_nse++].wh = wh;
+    int i = 0;
+    while (i < g_nse && g_se[i].ev != ev) i++;
+    if (i == g_nse) {
+        if (g_nse == (int)(sizeof g_se / sizeof *g_se)) rt_fatal("kern_bind_system_event: table full");
+        g_se[g_nse++].ev = ev;
+    }
+    g_se[i].wh = wh;
     plat_mutex_unlock(&g_se_lock);
 }
 
-// An event not bound yet is bound on the spot with manual clear, which needs a guest thread.
+// An event not bound yet is bound on the spot with manual clear, which needs a guest thread. A bound event the guest
+// destroyed is not signalled: its handles are closed and the kernel hands their numbers to new objects.
 void kern_signal_system_event(uint64_t ev) {
     uint32_t wh = se_find(ev);
+    if (wh && !se_live(ev)) return;
     if (!wh) {
         kern_bind_system_event(kern_cpu(), ev, 0);
         wh = se_find(ev);
     }
     kern_event_signal(wh);
+}
+
+// The host side of ClearEvent (SVC 0x12) on a bound system event; an unbound or destroyed one has nothing to clear.
+void kern_clear_system_event(uint64_t ev) {
+    uint32_t wh = se_find(ev);
+    if (!wh || !se_live(ev)) return;
+    lock();
+    Event *e = h_peek(wh, O_EVENT_W);
+    if (e) e->signaled = 0;
+    unlock();
 }
 
 // ---- fibers

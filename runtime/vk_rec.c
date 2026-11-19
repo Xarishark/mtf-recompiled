@@ -2,11 +2,11 @@
 // consumer (the recorder) share a ring of 64-bit words. A packet is a header word (op, length in words) and the
 // call's arguments; its pointers point into the packet itself, so the recorder passes the payload to the driver as
 // it is. A packet never wraps: one that does not fit before the end is preceded by a pad. The producer publishes head
-// after each packet, or every TOTK_REC_BATCH packets when that is set; the recorder makes the calls and advances tail, which the producer waits on when the ring is
-// full and in rec_drain. While a part is recorded the recorder spins on head; idle, it sleeps on an event.
-// Design: Savage Wind Recomp #189 and LAS Recomp runtime/nvn/vulkan/record.c (https://github.com/peiikai/LASRecomp
-// @ a4b53a3, MIT, Copyright (c) 2026 Peiikai); the code is ours.
+// after each packet; the recorder makes the calls and advances tail, which the producer waits on when the ring is
+// full and in rec_drain. While a part is recorded the recorder spins on head; idle, it sleeps on an event. Packets also
+// begin, end and submit the parts (rec_begin, rec_end_cb, rec_submit), so each part stays on the recorder throughout.
 #define VK_REC_IMPL
+#include <immintrin.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,361 +17,368 @@
 
 #define RING_WORDS (1u << 21)   // 16 MiB: a part of a submission is ~1-2 MiB of packets in the town
 static uint64_t ring[RING_WORDS];
-// head and tail each own a cache line: the recorder spins on head, so head must be written only when published and
-// share its line with nothing the producer writes per packet (put_h, unpub, RS_).
-typedef struct { _Alignas(64) volatile uint64_t v; } CacheLine;   // sizeof 64: nothing else shares the line
-static CacheLine head_line, tail_line;
-#define head head_line.v   // words published by the producer
-#define tail tail_line.v   // words consumed by the recorder
-static volatile int32_t sleeping;        // the recorder waits for wake_ev
+// The queue state, a cache line per writer. The recorder spins on head while it waits for packets, so a line the
+// producer writes on every packet and the recorder reads or writes goes back and forth between their cores each time:
+// with tail, Q.put_h, head and the producer's statistics in one line (the linker's order of these statics), handing
+// packets over took 6% of the replay thread in the fort, more than building the descriptors.
+static struct {
+    _Alignas(64) volatile uint64_t head;      // words published by the producer; the recorder reads it
+    _Alignas(64) volatile uint64_t tail;      // words consumed by the recorder; the producer reads it when it seems full
+    _Alignas(64) volatile int32_t sleeping;   // the recorder waits for wake_ev; written only around a sleep
+    _Alignas(64) uint64_t put_h;              // producer only: words written
+    uint64_t pub_h;                           // the last head published
+    uint64_t tail_seen;                       // tail as last read, at most the real one: the room it leaves is there
+    uint64_t pub_words;                       // MTF_REC_PUB: publish head once this many words wait (pub)
+} Q;
 static PlatEvent wake_ev;              // auto-reset
-static uint64_t put_h;                 // producer: words written (published up to head)
-static VkCommandBuffer rec_cb;         // the part being recorded: stored by the producer before its first packet
-static int rec_live;                   // producer: rec_begin started the recorder for rec_cb (stored atomically: OWNED
-                                       // is also asked from the helper translators, vk_spec.h)
+static VkCommandBuffer rec_cb;         // producer: the part being recorded, whose vkCmd* become packets
+static VkCommandBuffer r_cb;           // recorder: the command buffer its packets go into (set by a BeginCb packet)
+static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
+static int end_mode = -1;              // MTF_REC_END (rec_own)
+static int sub_pending;                // producer: the recorder ended a part that rec_submit has not handed over yet
+static volatile VkResult r_sub_res;    // recorder: the result of its last vkQueueSubmit2, read after the drain
 static PlatThread *rec_thread;
 static int rec_prio;                   // the submitting thread's priority, which the recorder takes
+static int rec_chk;                    // MTF_REC_CHECK (rec_check_handle)
+static uint64_t rec_delay_ns;          // MTF_REC_DELAY_US (rec_main)
+static volatile uint64_t part_h0;      // Q.put_h at rec_begin: where the packets of the part being recorded start
+static volatile uint64_t part_fence;   // the value of the part being recorded (rec_begin)
 
 // Producer statistics, logged by rec_stats_log.
-static struct { uint64_t packets, words, drains, fallbacks, drain_ns, full_waits, parts, parts_on; } RS_;
+static struct { _Alignas(64) uint64_t packets, words, drains, fallbacks, drain_ns, full_waits, parts, parts_on, submits; } RS_;
+// Consumer statistics (rec_main): time spinning for work, spins that found it, sleeps on the event, time recording.
+static struct { _Alignas(64) uint64_t spin_ns, spin_hits, sleeps, work_ns; } RC_;
 
 enum {
     R_PAD, R_BeginQuery, R_BeginRendering, R_BindDescriptorSets, R_BindIndexBuffer, R_BindPipeline, R_BindVertexBuffers2,
     R_BlitImage, R_ClearAttachments, R_ClearColorImage, R_ClearDepthStencilImage, R_CopyBuffer, R_CopyBufferToImage,
     R_CopyImage, R_CopyImageToBuffer, R_Dispatch, R_DispatchIndirect, R_Draw, R_DrawIndexed, R_DrawIndexedIndirect,
-    R_EndQuery, R_EndRendering, R_FillBuffer, R_PipelineBarrier2, R_PushConstants, R_ResetQueryPool, R_ResolveImage,
+    R_EndQuery, R_EndRendering, R_ExecuteCommands, R_FillBuffer, R_PipelineBarrier2, R_PushConstants, R_ResetQueryPool, R_ResolveImage,
     R_SetBlendConstants, R_SetCullMode, R_SetDepthBias, R_SetDepthBiasEnable, R_SetDepthCompareOp, R_SetDepthTestEnable,
     R_SetDepthWriteEnable, R_SetFrontFace, R_SetPrimitiveRestartEnable, R_SetPrimitiveTopology,
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
-    R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb, R_Crumb, R_Checkpoint, R_BeginCb,
-    R_Submit, R_Call,
+    R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb,
+    R_PassMark, R_BeginCb, R_Submit,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
 
 // ---- consumer
 
-static void exec_cb(VkCommandBuffer cb, uint32_t op, void *p);
-
-// Publishes how far the recorder got. The driver may write command buffers through a write-combined mapping (RADV
-// does, and AMD's Windows driver is the other place the recorder lost the device), and on x86 a release store does not
-// wait for write-combined stores: the producer could see tail, end and submit the part while its last commands are
-// still in the CPU's write-combining buffers. SFENCE drains them first; on ARM64 the release store already orders them.
-// Lead from mkw-recomp de006fc (vk_rec.c publish_tail), reported in #204.
-static inline void publish_tail(uint64_t t) {
-#if defined(__x86_64__) || defined(_M_X64)
-    __builtin_ia32_sfence();
-#endif
-    __atomic_store_n(&tail, t, __ATOMIC_RELEASE);
-}
+static void exec_packet(uint32_t op, void *p);
 
 static void rec_main(void *arg) {
     (void)arg;
     plat_thread_priority(rec_prio);
+    const char *spin_cfg = cfg_get("MTF_REC_SPIN");
+    const int spin = spin_cfg ? atoi(spin_cfg) : 4096;
     uint64_t t = 0;
     for (;;) {
-        uint64_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+        uint64_t h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
         if (t == h) {
-            for (int i = 0; i < 4096 && t == h; i++) plat_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+            uint64_t s0 = now_ns();
+            for (int i = 0; i < spin && t == h; i++) _mm_pause(), h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
+            RC_.spin_ns += now_ns() - s0;
             if (t == h) {
-                __atomic_store_n(&sleeping, 1, __ATOMIC_SEQ_CST);
-                h = __atomic_load_n(&head, __ATOMIC_SEQ_CST);
-                if (t == h) plat_event_wait_ns(&wake_ev, 2000000);   // a missed wake costs at most 2 ms
-                __atomic_store_n(&sleeping, 0, __ATOMIC_RELAXED);
+                __atomic_store_n(&Q.sleeping, 1, __ATOMIC_SEQ_CST);
+                h = __atomic_load_n(&Q.head, __ATOMIC_SEQ_CST);
+                if (t == h) plat_event_wait_ns(&wake_ev, 2000000), RC_.sleeps++;   // a missed wake costs at most 2 ms
+                __atomic_store_n(&Q.sleeping, 0, __ATOMIC_RELAXED);
                 continue;
             }
+            RC_.spin_hits++;
         }
+        uint64_t w0 = now_ns();
+        // MTF_REC_DELAY_US (debug): the recorder falls this far behind each batch it finds, as on a slow machine,
+        // so objects the replay lets go of meet packets it has not made yet (MTF_REC_CHECK).
+        if (rec_delay_ns) plat_sleep_ns(rec_delay_ns);
         for (int k = 0; t != h; k++) {
             uint64_t w = ring[t % RING_WORDS];
             uint32_t op = (uint32_t)(w & 0xffff), n = (uint32_t)(w >> 32);
-            if (op != R_PAD) exec_cb(__atomic_load_n(&rec_cb, __ATOMIC_RELAXED), op, &ring[t % RING_WORDS + 1]);
+            if (op != R_PAD) exec_packet(op, &ring[t % RING_WORDS + 1]);
             t += n;
-            if ((k & 63) == 63) publish_tail(t);
+            if ((k & 63) == 63) __atomic_store_n(&Q.tail, t, __ATOMIC_RELEASE);
         }
-        publish_tail(t);
+        __atomic_store_n(&Q.tail, t, __ATOMIC_RELEASE);
+        RC_.work_ns += now_ns() - w0;
     }
     return;
 }
 
 // ---- producer
 
-// TOTK_REC_BATCH=N (0 off): head is published every N packets, not after each, so the recorder's spin does not read a
-// cache line the producer rewrites constantly. Every wait or handoff (wait_space, rec_drain) publishes the rest.
-static int rec_batch;     // read once in rec_begin
-static int unpub;         // producer: packets written since head was last stored
-
 static void wake(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+    if (__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
 }
 
+// Room for need words: the tail read last leaves it in all but about one packet in 16 MiB of them.
 static void wait_space(uint64_t need) {
-    if (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) <= RING_WORDS) return;
+    if (Q.put_h + need - Q.tail_seen <= RING_WORDS) return;
+    Q.tail_seen = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
+    if (Q.put_h + need - Q.tail_seen <= RING_WORDS) return;
     RS_.full_waits++;
-    unpub = 0;
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    Q.pub_h = Q.put_h;
+    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
-    while (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) > RING_WORDS) plat_pause();
+    while (Q.put_h + need - (Q.tail_seen = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE)) > RING_WORDS) _mm_pause();
 }
 
 // Room for a packet of bytes of arguments; the caller fills it and calls pub().
-// ---- capture (vk_exec.c: the end of a sliced pass whose slices are still being recorded)
-// Between rec_capture_begin and rec_capture_end the packets of the part being recorded go to cap instead of the ring,
-// after the ones captured before, and rec_capture_play makes the words [lo, hi) later into a command buffer on the
-// calling thread, while the recorder is idle; rec_capture_reset empties cap once nothing captured is held. The packets'
-// pointers point into cap itself, which never moves. A call without a packet (FALLBACK) cannot be held back, nor a
-// packet that no longer fits: the capture spills (spill_fn, vk_exec.c par_spill), which makes what it held into the part
-// at once and ends the capture, and the call goes on as without one.
-#define CAP_WORDS (1u << 15)
-static uint64_t cap[CAP_WORDS];
-static uint64_t cap_n;
-static int capturing;
-static void (*spill_fn)(void);
-
-void rec_capture_spill(void (*fn)(void)) { spill_fn = fn; }
-int rec_capture_room(uint32_t words) { return cap_n + words <= CAP_WORDS; }
-
-static void spill(void) {
-    if (!spill_fn) rt_fatal("vk_rec: a held-back pass end cannot be captured and nothing can spill it");
-    spill_fn();   // it ends the capture (rec_capture_end)
-    if (capturing) rt_fatal("vk_rec: a spilled pass end is still captured");
-}
-
-uint32_t rec_capture_begin(void) {
-    capturing = 1;
-    return (uint32_t)cap_n;
-}
-uint32_t rec_capture_end(void) {
-    capturing = 0;
-    return (uint32_t)cap_n;
-}
-void rec_capture_reset(void) { cap_n = 0; }
-
-void rec_capture_play(VkCommandBuffer cb, uint32_t lo, uint32_t hi) {
-    for (uint64_t t = lo; t < hi;) {
-        uint32_t op = (uint32_t)(cap[t] & 0xffff), n = (uint32_t)(cap[t] >> 32);
-        exec_cb(cb, op, &cap[t + 1]);
-        t += n;
-    }
-}
-
-int rec_owns(VkCommandBuffer cb) { return rec_live && cb == rec_cb; }
-
 static void *put(uint32_t op, size_t bytes) {
-    uint64_t n = 1 + (bytes + 7) / 8, pos = put_h % RING_WORDS;
-    if (capturing && cap_n + n > CAP_WORDS) spill();
-    if (capturing) {
-        cap[cap_n] = (uint64_t)op | n << 32;
-        cap_n += n;
-        RS_.packets++, RS_.words += n;
-        return &cap[cap_n - n + 1];
-    }
+    uint64_t n = 1 + (bytes + 7) / 8, pos = Q.put_h % RING_WORDS;
     if (n > RING_WORDS / 4) rt_fatal("vk_rec: a packet of %llu bytes", (unsigned long long)bytes);
     if (pos + n > RING_WORDS) {
         uint64_t pad = RING_WORDS - pos;
         wait_space(pad);
         ring[pos] = (uint64_t)R_PAD | pad << 32;
-        put_h += pad, pos = 0;
+        Q.put_h += pad, pos = 0;
     }
     wait_space(n);
     ring[pos] = (uint64_t)op | n << 32;
-    put_h += n;
+    // Packers reserve room for optional arrays they may leave unwritten (BeginRendering's depth and stencil); with
+    // MTF_REC_CHECK those words would still hold handles from the ring's previous lap.
+    if (rec_chk) memset(&ring[pos + 1], 0, (n - 1) * 8);
+    Q.put_h += n;
     RS_.packets++, RS_.words += n;
     return &ring[pos + 1];
 }
 
+// After a packet: head moves once Q.pub_words words wait, so the recorder reads a line the producer is still filling
+// once per batch instead of once per packet. Whatever the producer waits for publishes everything first (wait_space,
+// rec_drain), and the packets that begin and end a part go out at once (pub_now), so the recorder begins and ends
+// command buffers as early as before; MTF_REC_CHECK publishes every packet, since rec_check_handle searches the ring
+// up to head.
+static void pub_now(void) {
+    Q.pub_h = Q.put_h;
+    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+}
+
 static void pub(void) {
-    if (capturing) return;
-    if (rec_batch) {
-        if (++unpub < rec_batch) return;
-        unpub = 0;
-        __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
-        wake();   // the recorder sleeps more often when batched; a missed wake costs up to 2 ms
-        return;
-    }
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
-    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+    if (Q.put_h - Q.pub_h >= Q.pub_words) pub_now();
 }
 
 void rec_drain(void) {
-    if (!rec_thread || __atomic_load_n(&tail, __ATOMIC_ACQUIRE) == put_h) return;
+    if (!rec_thread || __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) == Q.put_h) return;
     uint64_t t0 = now_ns();
-    unpub = 0;
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    Q.pub_h = Q.put_h;
+    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
-    for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) != put_h; i++)
-        if (i < 20000) plat_pause();
+    for (int i = 0; __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) != Q.put_h; i++)
+        if (i < 20000) _mm_pause();
         else plat_yield();
     RS_.drains++, RS_.drain_ns += now_ns() - t0;
 }
 
-void rec_begin(VkCommandBuffer cb) {
+static int rec_own(void) {
+    if (end_mode < 0) end_mode = rt_knob("REC_END", "1");
+    return end_mode;
+}
+
+// vkBeginCommandBuffer (one submission) and the breadcrumb, on the thread that records cb.
+static void begin_now(VkCommandBuffer cb, int crumb, uint64_t n) {
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(cb, &bi);
+    if (crumb) vk_crumb(cb, crumb, n);
+}
+
+// The command buffer the following packets go into; begin: the recorder begins it (MTF_REC_END=1).
+typedef struct { VkCommandBuffer cb; int begin, crumb; uint64_t n; } A_BeginCb;
+
+void rec_begin(VkCommandBuffer cb, uint64_t fence, int crumb, uint64_t n) {
     static int mode = -1;
     if (mode < 0) {
-        // Default on, except on AMD's own Windows driver. AMD drivers once lost the device with the recorder (issues
-        // #5 and #40); after vk_mem_note_recording kept objects alive until their submission completed and the
-        // recorder began ending its own parts (rec_end_cb), RDNA 1 and 2 cards ran with it on and off without a loss.
-        // Bananza still lost the device on AMD's proprietary driver, and TOTK_VK_RECORDER=0 stopped it for three
-        // players on three GPU generations: a Radeon 610M (#84), a ROG Xbox Ally X (#155) and an RX 9070 XT (#142).
-        // RADV keeps the recorder: its hangs (#122, #204) were not tested with it off.
-        mode = rt_knob("VK_RECORDER", vk_caps.amd && !vk_caps.radv ? "0" : "1");
+        // Default off on AMD GPUs. With the recorder those drivers lost the device or hung the GPU at startup on
+        // RDNA 2, 3 and 4, under AMD's Windows driver and under RADV (issues #5, #40, #277 and #283: a black screen,
+        // or VK_ERROR_DEVICE_LOST with a breadcrumb naming a part of a replay submission, and vk_recorder = 0 gets
+        // past it). Keeping objects until their submission completed and ending a part from the recorder
+        // (rec_end_cb) fixed the white scene on an RX 6700 XT, but not this: 0.2.8 turned the recorder on for every
+        // GPU and the AMD reports came back the same day. MTF_VK_RECORDER=1 turns it on for an A/B run.
+        const char *set = cfg_get("MTF_VK_RECORDER");
+        mode = rt_knob("VK_RECORDER", vk_caps.amd ? "0" : "1");
+        if (!mode && vk_caps.amd && !(set && *set))
+            rt_log("vk_rec: no recorder thread on AMD GPUs (MTF_VK_RECORDER=1 turns it on)");
         if (mode) {
-            rec_batch = cfg_int("TOTK_REC_BATCH");
-            if (rec_batch < 0) rec_batch = 0;
-            if (rec_batch > 64) rec_batch = 64;
-            if (rec_batch) rt_log("vk_rec: batched head publish every %d packets (TOTK_REC_BATCH=%d)", rec_batch, rec_batch);
             plat_event_init(&wake_ev, 0, 0);
             rec_prio = plat_thread_priority_get();
+            rec_chk = rt_knob("REC_CHECK", "0");   // debug switches, read before the recorder starts
+            const char *d = cfg_get("MTF_REC_DELAY_US");
+            rec_delay_ns = d && *d && atoi(d) > 0 ? (uint64_t)atoi(d) * 1000 : 0;
+            const char *pw = cfg_get("MTF_REC_PUB");   // words per publish (pub); 0: every packet
+            Q.pub_words = rec_chk ? 0 : pw && *pw ? (uint64_t)atoi(pw) : 64;
+            if (Q.pub_words > RING_WORDS / 8) Q.pub_words = RING_WORDS / 8;
             rec_thread = plat_thread_new(rec_main, NULL, "vk recorder");
             if (!rec_thread) {
                 rt_log("vk_rec: no recorder thread: the replay makes its Vulkan calls itself");
                 mode = 0;
             } else {
                 rt_log("vk_rec: the replay's Vulkan commands are made by a recorder thread%s",
-                       mode == 2 ? " in the B blocks (TOTK_AB)" : "");
+                       mode == 2 ? " in the B blocks (MTF_AB)" : "");
+                if (rec_chk) rt_log("vk_rec: MTF_REC_CHECK: deferred and destroyed objects are searched in the ring");
+                if (Q.pub_words != 64) rt_log("vk_rec: MTF_REC_PUB: head published every %llu words",
+                                              (unsigned long long)Q.pub_words);
+                if (rec_delay_ns) rt_log("vk_rec: MTF_REC_DELAY_US: the recorder waits %llu us before each batch",
+                                         (unsigned long long)(rec_delay_ns / 1000));
             }
         }
     }
     RS_.parts++;
-    if (!RT_KNOB_ON(mode)) return;
+    int on = RT_KNOB_ON(mode), own = on && rec_own();
+    if (!own) {
+        // The submitting thread begins cb. The part pool is the recorder's while it has packets (an A/B switch
+        // between parts): it finishes them first.
+        rec_drain();
+        begin_now(cb, crumb, n);
+        if (!on) return;
+    }
     RS_.parts_on++;
-    // The recorder made every call of the part before and at most still submits it (rec_submit), which reads no
-    // command buffer from here; it loads rec_cb for each packet, and cb's first packet is published after this store.
-    __atomic_store_n(&rec_cb, cb, __ATOMIC_RELAXED);
-    __atomic_store_n(&rec_live, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&part_h0, Q.put_h, __ATOMIC_RELEASE);
+    __atomic_store_n(&part_fence, fence, __ATOMIC_RELEASE);
+    A_BeginCb *a = put(R_BeginCb, sizeof *a);
+    *a = (A_BeginCb){cb, own, crumb, n};
+    pub_now();
+    rec_cb = cb;
+    rec_live = 1;
 }
 
 void rec_end(void) {
-    rec_drain();   // also when this part was not the recorder's: it may still submit the one before (rec_submit)
-    __atomic_store_n(&rec_live, 0, __ATOMIC_RELAXED);
+    if (!rec_live) return;
+    rec_drain();
+    rec_live = 0;
 }
 
-// TOTK_REC_END (default 1): the thread that recorded the part also ends it, after the breadcrumb crumb (kind 0: none)
-// that vk_sync.c writes at the end of a submission. On an RX 6700 XT (driver 26.10.1, issue #5) parts the recorder
-// recorded and the submitting thread ended broke when a submission was split (vk_sync.c vk_sync_split): the GPU hung
-// or the scene turned green, then white. The handoff in rec_drain orders the two threads, so Vulkan allows the old
-// split; the driver did not cope with it. TOTK_REC_END=0 brings the old split back.
+// MTF_REC_END (default 1): a part the recorder records is the recorder's from its begin to its submission: it begins
+// it, makes every command, ends it after the breadcrumb crumb (kind 0: none) that vk_sync.c writes at the end of a
+// submission, and submits it. The submitting thread touches the part pool only while the recorder is idle. Command
+// buffers are allocated once; only the recorder begins, records, ends and submits them. Before, the submitting thread began and submitted parts the
+// recorder recorded and, before that, also ended them. The handoff in rec_drain orders the two threads, so Vulkan
+// allows that split, but on an RX 6700 XT (driver 26.10.1) parts ended by the other thread broke when a
+// submission was split (vk_sync.c vk_sync_split): the GPU hung or the scene turned green, then white. Moving the end
+// fixed that; begin and submit followed. MTF_REC_END=0 brings the old split back: the submitting thread begins,
+// ends and submits every part.
+// The line is written only when a part was recorded by the recorder: with the recorder off (the default on AMD) the
+// switch changes nothing, and reports read an unconditional line as proof that the recorder was running (#315).
 typedef struct { int kind; uint64_t n; } A_EndCb;
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
-    static int mode = -1;
-    if (mode < 0) {
-        mode = rt_knob("REC_END", "1");
-        rt_log("vk_rec: a part the recorder records is ended by %s (TOTK_REC_END=%d)",
-               mode ? "the recorder" : "the submitting thread", mode);
+    static int said;
+    int own = rec_own();
+    if (rec_live && cb == rec_cb && !said) {
+        said = 1;
+        rt_log("vk_rec: a part the recorder records is begun, ended and submitted by %s (MTF_REC_END=%d)",
+               own ? "the recorder" : "the submitting thread", own);
     }
-    if (!rec_live || cb != rec_cb || !mode) {
+    if (!rec_live || cb != rec_cb || !own) {
         rec_end();
         if (crumb) vk_crumb(cb, crumb, n);
         return 0;
     }
     A_EndCb *a = put(R_EndCb, sizeof *a);
     *a = (A_EndCb){crumb, n};
-    pub();
-    rec_drain();
-    __atomic_store_n(&rec_live, 0, __ATOMIC_RELAXED);
+    pub_now();
+    rec_live = 0;
+    sub_pending = 1;
     return 1;
 }
 
-// TOTK_REC_SUBMIT=1 (default 0): the recorder also submits a part it ended when more of the submission follows
-// (vk_sync.c split_impl), and the replay goes on with the next part meanwhile. vkQueueSubmit2 was 37 us of the 77 us a
-// split cost the replaying thread on an RTX 3060 Ti (Bananza, 7 to 8 parts a frame), and that thread is what the guest's
-// fence wait is waiting for. Queue order is as before: the packet follows the part's last call, the end of every later
-// part and of the submission drains the ring first (rec_end_cb, rec_end), and an upload batch waits for a submit in
-// flight (rec_submit_wait). 0, the default: the replaying thread submits every part; ab: switches with the A/B blocks.
-// The recorder calls fn(arg) after every call queued before it (1); 0 without a recorder thread or during a capture,
-// when the caller calls it. vk_sync.c vk_sync_split_finish ends a held part with it, on the thread that recorded it.
-typedef struct { void (*fn)(void *); void *arg; } A_Call;
-int rec_call(void (*fn)(void *), void *arg) {
-    if (!rec_thread) return 0;
-    // A captured packet runs when the capture is replayed, after the caller has gone on; vk_sync_split_finish, the
-    // one caller, runs between captures, so a call here while capturing is a bug, not something to make in place.
-    if (capturing) rt_fatal("vk_rec: rec_call inside a capture");
-    A_Call *a = put(R_Call, sizeof *a);
-    *a = (A_Call){fn, arg};
-    unpub = 0;
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
-    wake();
-    return 1;
-}
-
-typedef struct { VkCommandBuffer pro, cb; uint64_t fence; } A_Submit;
-static volatile uint64_t sub_put, sub_done;   // part submits queued by the producer, made by the recorder
-
-int rec_submit(VkCommandBuffer pro, VkCommandBuffer cb, uint64_t fence) {
-    static int mode = -1;
-    if (mode < 0) {
-        mode = rt_knob("REC_SUBMIT", "0");
-        rt_log("vk_rec: a part the recorder ended is submitted by %s (TOTK_REC_SUBMIT=%s)",
-               mode ? "the recorder" : "the replaying thread", mode == 2 ? "ab" : mode ? "1" : "0");
+// At most two command buffers and one signal: the shape vk_sync.c submits.
+typedef struct { uint32_t ncb, nsig; VkCommandBufferSubmitInfo cbi[2]; VkSemaphoreSubmitInfo sig; } A_Submit;
+VkResult rec_submit(const VkSubmitInfo2 *si) {
+    if (!sub_pending) {
+        vk_queue_lock();
+        VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, si, VK_NULL_HANDLE);
+        vk_queue_unlock();
+        return r;
     }
-    if (!rec_thread || !RT_KNOB_ON(mode)) return 0;
+    sub_pending = 0;
+    if (si->commandBufferInfoCount > 2 || si->signalSemaphoreInfoCount > 1 || si->waitSemaphoreInfoCount || si->pNext)
+        rt_fatal("vk_rec: a submission of %u command buffers, %u waits and %u signals the recorder cannot carry",
+                 si->commandBufferInfoCount, si->waitSemaphoreInfoCount, si->signalSemaphoreInfoCount);
     A_Submit *a = put(R_Submit, sizeof *a);
-    *a = (A_Submit){pro, cb, fence};
-    __atomic_store_n(&sub_put, sub_put + 1, __ATOMIC_RELEASE);
-    unpub = 0;   // at once, whatever TOTK_REC_BATCH says: the GPU waits for this packet
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
-    wake();
-    return 1;
-}
-
-void rec_submit_wait(void) {
-    uint64_t want = __atomic_load_n(&sub_put, __ATOMIC_ACQUIRE);
-    for (int i = 0; __atomic_load_n(&sub_done, __ATOMIC_ACQUIRE) < want; i++)
-        if (i < 20000) plat_pause();
-        else plat_yield();
-}
-
-// TOTK_REC_BEGIN (default 0): the thread that records a part also begins it: vkBeginCommandBuffer, the submission crumb
-// and the start timestamp pair go into the ring ahead of the part's commands, so on the AMD proprietary driver on
-// Windows no call into the buffer is made by the submitting thread (the same class as TOTK_REC_END, issue #5).
-// The timestamp pair (ts_pair, -1 none) is picked by the submitting thread, which owns that state.
-typedef struct { uint64_t fence; VkQueryPool pool; int pair; } A_BeginCb;
-static void begin_cb(VkCommandBuffer cb, const A_BeginCb *a) {
-    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    vkBeginCommandBuffer(cb, &bi);
-    vk_crumb(cb, VK_CRUMB_SUBMIT, a->fence);
-    if (a->pair < 0) return;
-    vkCmdResetQueryPool(cb, a->pool, 2 * (uint32_t)a->pair, 2);
-    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, a->pool, 2 * (uint32_t)a->pair);
-}
-
-int rec_begin_part(VkCommandBuffer cb, uint64_t fence, int ts_pair, VkQueryPool ts_pool) {
-    static int mode = -1;
-    if (mode < 0) {
-        mode = rt_knob("REC_BEGIN", "0");
-        rt_log("vk_rec: a part the recorder records is begun by %s (TOTK_REC_BEGIN=%d)",
-               mode ? "the recorder" : "the submitting thread", mode);
-    }
-    if (!mode) return 0;
-    A_BeginCb a = {fence, ts_pool, ts_pair};
-    rec_begin(cb);
-    if (!rec_live) {   // no recorder: begin it here, in the same order
-        begin_cb(cb, &a);
-        return 1;
-    }
-    A_BeginCb *p = put(R_BeginCb, sizeof *p);
-    *p = a;
+    memset(a, 0, sizeof *a);
+    a->ncb = si->commandBufferInfoCount, a->nsig = si->signalSemaphoreInfoCount;
+    for (uint32_t i = 0; i < a->ncb; i++) a->cbi[i] = si->pCommandBufferInfos[i];
+    if (a->nsig) a->sig = si->pSignalSemaphoreInfos[0];
     pub();
-    return 1;
+    // Waited for here, so the queue holds every earlier submission when the caller goes on, as with the recorder off:
+    // the present, uploads, readbacks and device waits on other threads rely on that order.
+    rec_drain();
+    RS_.submits++;
+    return r_sub_res;
+}
+
+static void submit_run(const A_Submit *a) {
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = a->ncb,
+                        .pCommandBufferInfos = a->cbi, .signalSemaphoreInfoCount = a->nsig,
+                        .pSignalSemaphoreInfos = a->nsig ? &a->sig : NULL};
+    vk_queue_lock();
+    r_sub_res = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock();
 }
 
 void rec_stats_log(void) {
     if (!(rt_trace & RT_TRACE_PERF) || !RS_.parts) return;
     rt_log("vk_rec: %llu of %llu parts recorded by the recorder: %llu packets (%.1f MiB), %llu drains (%llu for a call "
-           "without a packet) waited %.2f ms in all, ring full %llu times",
+           "without a packet) waited %.2f ms in all, ring full %llu times, %llu submissions made by the recorder",
            (unsigned long long)RS_.parts_on, (unsigned long long)RS_.parts, (unsigned long long)RS_.packets,
            RS_.words * 8 / 1048576.0, (unsigned long long)RS_.drains, (unsigned long long)RS_.fallbacks,
-           RS_.drain_ns / 1e6, (unsigned long long)RS_.full_waits);
+           RS_.drain_ns / 1e6, (unsigned long long)RS_.full_waits, (unsigned long long)RS_.submits);
+    static uint64_t last;
+    uint64_t now = now_ns(), span = last ? now - last : 0;
+    last = now;
+    if (span)
+        rt_log("vk_rec: over %.2f s the recorder spun %.1f%% of a core (%llu spins found work), slept %llu times, "
+               "recorded %.1f%%", span / 1e9, 100.0 * RC_.spin_ns / span, (unsigned long long)RC_.spin_hits,
+               (unsigned long long)RC_.sleeps, 100.0 * RC_.work_ns / span);
     memset(&RS_, 0, sizeof RS_);
+    memset(&RC_, 0, sizeof RC_);
 }
 
-// A helper translator asks this too, for its own command buffer, which is never rec_cb: the loads are atomic so that
-// reading them while the producer moves to another part is not a data race.
-#define OWNED(cb) (__atomic_load_n(&rec_live, __ATOMIC_RELAXED) && (cb) == __atomic_load_n(&rec_cb, __ATOMIC_RELAXED))
+// MTF_REC_CHECK=1 (debug, recorder on): the packets of the part being recorded are searched word by word for an object
+// vk_memory.c lets go of. put() zeroes each packet's room, so only words a packer wrote can match. A hit is a hazard
+// - at a deferral (destroy 0) when the stamp tl is below the part's value: vk_memory.c collect_locked may destroy the
+//   object once the GPU reaches tl, before the part ran and, with the recorder behind, before it made the call;
+// - at a destruction (destroy 1) always: a packet not made yet hands the driver a dead handle, a made one leaves it
+//   in a command buffer not yet submitted.
+// "Made" means before the tail the recorder published, which trails it by up to 64 packets. Hazards are logged (the
+// first 64) and counted by kind, packet and case for rec_check_log; named deferrals that wait long enough are only
+// counted. Reads race the producer only in words below head, which stay put until the ring
+// wraps (16 MiB later).
+static const char *const kind_name[REC_KINDS] = {"image", "view", "buffer"};
+static volatile int32_t chk_seen[2], chk_named, chk_logged, chk_hz[2][2][REC_KINDS][64];   // [destroy][made][kind][op]
+void rec_check_handle(int kind, uint64_t handle, int destroy, uint64_t tl, uint64_t gpu) {
+    if (!rec_chk || !handle || kind < 0 || kind >= REC_KINDS || !__atomic_load_n(&rec_live, __ATOMIC_RELAXED)) return;
+    uint64_t h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE), p = __atomic_load_n(&part_h0, __ATOMIC_ACQUIRE);
+    uint64_t fence = __atomic_load_n(&part_fence, __ATOMIC_ACQUIRE);
+    if (p > h || h - p > RING_WORDS / 2) return;   // a part this large is not searched
+    plat_inc32(&chk_seen[destroy != 0]);
+    while (p < h) {
+        uint64_t w = ring[p % RING_WORDS];
+        uint32_t op = (uint32_t)(w & 0xffff), n = (uint32_t)(w >> 32);
+        if (!n) return;   // overwritten meanwhile
+        if (op != R_PAD)
+            for (uint32_t i = 1; i < n; i++) {
+                if (ring[(p + i) % RING_WORDS] != handle) continue;
+                int made = p < __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
+                if (!destroy && tl >= fence) { plat_inc32(&chk_named); return; }
+                plat_inc32(&chk_hz[destroy][made][kind][op & 63]);
+                if (plat_inc32(&chk_logged) <= 64)
+                    rt_log("vk_rec: check: HAZARD: %s %#llx %s while packet op %u (byte %u of its arguments) of the "
+                           "part being recorded names it, %s; deferral stamp %llu, part value %llu, GPU at %llu",
+                           kind_name[kind], (unsigned long long)handle, destroy ? "destroyed" : "deferred", op,
+                           8 * (i - 1), made ? "made" : "not known made", (unsigned long long)tl,
+                           (unsigned long long)fence, (unsigned long long)gpu);
+                return;
+            }
+        p += n;
+    }
+}
+
+#define OWNED(cb) (rec_live && (cb) == rec_cb)
 // A call the ring takes no packet for: everything queued first, then the call here.
-#define FALLBACK() (capturing ? spill() : (void)0, rec_drain(), RS_.fallbacks++)
+#define FALLBACK() (rec_drain(), RS_.fallbacks++)
 
 // Copies n elements of arr after the fixed part at *at and returns where they went (NULL for none).
 static void *tail_copy(uint8_t **at, const void *arr, size_t bytes) {
@@ -400,37 +407,13 @@ FIXED(BeginQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q, VkQueryControl
 #define PACK_BindIndexBuffer *a = (A_BindIndexBuffer){b, o, t}
 FIXED(BindIndexBuffer, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t), (cb, b, o, t), VkBuffer b;
       VkDeviceSize o; VkIndexType t)
-// DKB_GPU_CHECKPOINTS=1: a checkpoint in front of a dispatch, copy, blit or clear (vk_crumbs.c vk_checkpoint_tag), so a
-// lost device names that command and not only the pipeline bound before it. The dispatch checkpoints carry the compute
-// pipeline last bound here, which is why the binds are written by hand. Nothing happens with the checkpoints off.
-static void mark(VkCommandBuffer cb, const char *kind) {
-    if (vk_checkpoints_on()) rec_checkpoint(cb, vk_checkpoint_tag(kind));
-}
-
-typedef struct { VkPipelineBindPoint bp; VkPipeline p; } A_BindPipeline;
-void rc_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
-    if (bp == VK_PIPELINE_BIND_POINT_COMPUTE && vk_checkpoints_on()) vk_checkpoint_compute(p);
-    if (!OWNED(cb)) { vkCmdBindPipeline(cb, bp, p); return; }
-    A_BindPipeline *a = put(R_BindPipeline, sizeof *a);
-    *a = (A_BindPipeline){bp, p};
-    pub();
-}
-typedef struct { uint32_t x, y, z; } A_Dispatch;
-void rc_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
-    mark(cb, "dispatch");
-    if (!OWNED(cb)) { vkCmdDispatch(cb, x, y, z); return; }
-    A_Dispatch *a = put(R_Dispatch, sizeof *a);
-    *a = (A_Dispatch){x, y, z};
-    pub();
-}
-typedef struct { VkBuffer b; VkDeviceSize o; } A_DispatchIndirect;
-void rc_vkCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o) {
-    mark(cb, "dispatch indirect");
-    if (!OWNED(cb)) { vkCmdDispatchIndirect(cb, b, o); return; }
-    A_DispatchIndirect *a = put(R_DispatchIndirect, sizeof *a);
-    *a = (A_DispatchIndirect){b, o};
-    pub();
-}
+#define PACK_BindPipeline *a = (A_BindPipeline){bp, p}
+FIXED(BindPipeline, (VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p), (cb, bp, p), VkPipelineBindPoint bp;
+      VkPipeline p)
+#define PACK_Dispatch *a = (A_Dispatch){x, y, z}
+FIXED(Dispatch, (VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z), (cb, x, y, z), uint32_t x, y, z)
+#define PACK_DispatchIndirect *a = (A_DispatchIndirect){b, o}
+FIXED(DispatchIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o), (cb, b, o), VkBuffer b; VkDeviceSize o)
 #define PACK_Draw *a = (A_Draw){n, i, f, fi}
 FIXED(Draw, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, uint32_t fi), (cb, n, i, f, fi), uint32_t n, i, f, fi)
 #define PACK_DrawIndexed *a = (A_DrawIndexed){n, i, f, v, fi}
@@ -545,7 +528,6 @@ void rc_vkCmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t first, uint32_t n, 
 typedef struct { VkImage s; VkImageLayout sl; VkImage d; VkImageLayout dl; uint32_t n; const void *r; VkFilter f; } A_Img;
 #define IMG_CMD(name, rtype, params, call, ...)                                                                         \
     void rc_vkCmd##name params {                                                                                       \
-        mark(cb, #name);                                                                                                \
         if (!OWNED(cb)) { vkCmd##name call; return; }                                                                  \
         A_Img *a = put(R_##name, sizeof *a + sizeof(rtype) * n);                                                       \
         uint8_t *at = (uint8_t *)(a + 1);                                                                              \
@@ -563,7 +545,6 @@ IMG_CMD(ResolveImage, VkImageResolve, (VkCommandBuffer cb, VkImage s, VkImageLay
 typedef struct { uint64_t s, d; VkImageLayout l; uint32_t n; const void *r; } A_Xfer;   // buffer or image handles
 #define XFER_CMD(name, rtype, params, call, S, D, L)                                                                    \
     void rc_vkCmd##name params {                                                                                       \
-        mark(cb, #name);                                                                                                \
         if (!OWNED(cb)) { vkCmd##name call; return; }                                                                  \
         A_Xfer *a = put(R_##name, sizeof *a + sizeof(rtype) * n);                                                      \
         uint8_t *at = (uint8_t *)(a + 1);                                                                              \
@@ -592,7 +573,6 @@ typedef struct { VkImage i; VkImageLayout l; union { VkClearColorValue c; VkClea
                  const VkImageSubresourceRange *r; } A_ClearImage;
 void rc_vkCmdClearColorImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearColorValue *c, uint32_t n,
                              const VkImageSubresourceRange *r) {
-    mark(cb, "ClearColorImage");
     if (!OWNED(cb)) { vkCmdClearColorImage(cb, i, l, c, n, r); return; }
     A_ClearImage *a = put(R_ClearColorImage, sizeof *a + sizeof *r * n);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -607,6 +587,8 @@ void rc_vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage i, VkImageLayout
     a->i = i, a->l = l, a->v.ds = *c, a->n = n, a->r = tail_copy(&at, r, sizeof *r * n);
     pub();
 }
+
+typedef struct { uint32_t n; const VkCommandBuffer *c; } A_ExecuteCommands;
 
 typedef struct { VkPipelineLayout l; VkShaderStageFlags st; uint32_t o, n; const void *v; } A_PushConstants;
 void rc_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlags st, uint32_t o, uint32_t n,
@@ -655,22 +637,6 @@ void rc_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
 }
 
 // ---- extension commands through function pointers
-
-typedef struct { int kind; uint64_t n; } A_Crumb;
-void rec_crumb(VkCommandBuffer cb, int kind, uint64_t n) {
-    if (!OWNED(cb)) { vk_crumb(cb, kind, n); return; }
-    A_Crumb *a = put(R_Crumb, sizeof *a);
-    *a = (A_Crumb){kind, n};
-    pub();
-}
-
-typedef struct { const void *marker; } A_Checkpoint;
-void rec_checkpoint(VkCommandBuffer cb, const void *marker) {
-    if (!OWNED(cb)) { vk_checkpoint(cb, marker); return; }
-    A_Checkpoint *a = put(R_Checkpoint, sizeof *a);
-    a->marker = marker;
-    pub();
-}
 
 typedef struct { PFN_vkCmdPushDescriptorSetWithTemplateKHR fn; VkDescriptorUpdateTemplate tpl; VkPipelineLayout l;
                  uint32_t set; const void *data; } A_PushTpl;
@@ -741,6 +707,8 @@ void rec_polygon_mode(PFN_vkCmdSetPolygonModeEXT fn, VkCommandBuffer cb, VkPolyg
     pub();
 }
 
+typedef struct { uint32_t id; int end; } A_PassMark;
+
 typedef struct { void *fn; uint32_t first, n; const void *v; } A_Targets;
 #define TARGET_CMD(fname, R, PFN, T)                                                                                    \
     void fname(PFN fn, VkCommandBuffer cb, uint32_t first, uint32_t n, const T *v) {                                    \
@@ -757,7 +725,15 @@ TARGET_CMD(rec_write_mask, R_WriteMask, PFN_vkCmdSetColorWriteMaskEXT, VkColorCo
 
 // ---- the recorder's side
 
-static void exec_cb(VkCommandBuffer cb, uint32_t op, void *p) {
+static void exec_packet(uint32_t op, void *p) {
+    if (op == R_BeginCb) {
+        A_BeginCb *a = p;
+        r_cb = a->cb;
+        if (a->begin) begin_now(r_cb, a->crumb, a->n);
+        return;
+    }
+    if (op == R_Submit) { submit_run(p); return; }
+    VkCommandBuffer cb = r_cb;
     switch (op) {
 #define F(name, ...) case R_##name: { A_##name *a = p; vkCmd##name(cb, __VA_ARGS__); break; }
     F(BeginQuery, a->p, a->q, a->f)
@@ -801,6 +777,7 @@ static void exec_cb(VkCommandBuffer cb, uint32_t op, void *p) {
         break;
     }
     F(PushConstants, a->l, a->st, a->o, a->n, a->v)
+    F(ExecuteCommands, a->n, a->c)
 #undef F
     case R_EndRendering: vkCmdEndRendering(cb); break;
     case R_BlitImage: { A_Img *a = p; vkCmdBlitImage(cb, a->s, a->sl, a->d, a->dl, a->n, a->r, a->f); break; }
@@ -827,30 +804,11 @@ static void exec_cb(VkCommandBuffer cb, uint32_t op, void *p) {
     case R_BlendEnable: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEnableEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_BlendEquation: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEquationEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_WriteMask: { A_Targets *a = p; ((PFN_vkCmdSetColorWriteMaskEXT)a->fn)(cb, a->first, a->n, a->v); break; }
-    case R_Checkpoint: { A_Checkpoint *a = p; vk_checkpoint(cb, a->marker); break; }
-    case R_Crumb: { A_Crumb *a = p; vk_crumb(cb, a->kind, a->n); break; }
-    case R_BeginCb: begin_cb(cb, p); break;
-    case R_Call: { A_Call *a = p; a->fn(a->arg); break; }
+    case R_PassMark: { A_PassMark *a = p; vk_pass_mark_cmd(cb, a->id, a->end); break; }
     case R_EndCb: {
         A_EndCb *a = p;
         if (a->kind) vk_crumb(cb, a->kind, a->n);
         vkEndCommandBuffer(cb);
-        break;
-    }
-    case R_Submit: {   // the mirror prologue, when the part has one, then the part: vk_sync.c split_impl
-        A_Submit *a = p;
-        VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = a->pro},
-                                            {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = a->cb}};
-        VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = a->pro ? 2 : 1,
-                            .pCommandBufferInfos = a->pro ? cbi : cbi + 1};
-        vk_queue_lock();
-        VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, VK_NULL_HANDLE);
-        vk_queue_unlock();
-        if (r != VK_SUCCESS) {
-            vk_device_fault_report(r);
-            rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)a->fence, (int)r);
-        }
-        __atomic_store_n(&sub_done, sub_done + 1, __ATOMIC_RELEASE);
         break;
     }
     default: rt_fatal("vk_rec: unknown packet %u", op);

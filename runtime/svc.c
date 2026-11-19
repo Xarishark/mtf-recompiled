@@ -1,23 +1,23 @@
-// Adapted from MacNativeGames games/totk/runtime/services.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
-// contributors), lines 304-382.
 // The SVC entry of the lifted code: preemption checkpoint, trace, then the thread and
-// synchronization SVCs (kernel.c), IPC (ipc.c), memory (memory.c), Break, OutputDebugString, GetInfo and ExitProcess. The 21 SVCs
-// TotK has but never reaches on MNG's boot path stop with a named fatal, the caller and the guest backtrace.
+// synchronization SVCs (kernel.c), IPC (ipc.c), memory (memory.c), Break, OutputDebugString, GetInfo and ExitProcess. The SVCs
+// the game never reaches stop with a named fatal, the caller and the guest backtrace.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdio.h>
 #include <string.h>
 
-#include "cfg.h"
 #include "fs.h"
-#include "gfx.h"
+#include "cfg.h"
 #include "host.h"
 #include "kernel.h"
+
 #include "platform/platform.h"
 
+#undef R_OK   // io.h defines it as an access() mode
 #define R_OK 0u
 #define ST_FREE 0u
 #define ST_STACK 0xBu
 #define PERM_RW 3u
-#define PROGRAM_ID RT_APPLICATION_ID
+#define PROGRAM_ID 0x0400d4201c6ea000ull   // MTF
 
 static uint64_t g_svcs;
 void (*volatile svc_test_exit_hook)(unsigned code);
@@ -112,7 +112,7 @@ static void get_info(Cpu *c, uint64_t pc) {
         return;
     }
     switch (id) {
-    case 0: v = 0x3f; break;                    // core mask: cores 0-5 on Switch 2 (kernel.c NCORE)
+    case 0: v = 0x3f; break;                    // core mask: the six application cores (kernel.c NCORE)
     case 1: v = 0x0ffffffff0000000ull; break;   // priority mask
     case 8: v = 0; break;                       // debugger attached
     case 10: v = 0; break;                      // idle tick count
@@ -121,11 +121,20 @@ static void get_info(Cpu *c, uint64_t pc) {
         break;
     case 18: v = PROGRAM_ID; break;
     case 20: v = user_exception_context(); break;   // the SDK keeps e.g. the dying message at +0x1C0
-    case 23: v = 1; break;
-    // Switch 2 (Switchbrew "SVC", GetInfo [S2]): RemoteRegionAddress/Size, RemoteMemoryUsage/Peak, ProcessPageSize.
-    // No remote region is given to the process, so its address, size and usage are all 0.
+    case 23: v = 1; break;                      // is application
+    // FreeThreadCount: pm gives an application 96 threads (Atmosphere pm_spec.cpp BaseApplicationThreads); the
+    // kernel answers the limit less the threads alive. Counted here by threads created, which only errs low.
+    case 24: {
+        uint64_t used = kern_threads_created();
+        v = used < 96 ? 96 - used : 0;
+        break;
+    }
+    case 25: case 26: case 27: v = 0; break;   // thread tick count, SVC permitted, I/O region hint
+    // The Switch 2 remote region: nnosInitialize builds its RemoteRegionManager over [29, 29 + 30) and
+    // GetRemoteMemoryUsage returns 31 and 32. Only the GPU driver's boot uses it, which the host replaces, so there is
+    // none.
     case 29: case 30: case 31: case 32: v = 0; break;
-    case 33: v = 0x1000; break;
+    case 33: v = 0x1000; break;                 // page size (Switch 2): nn::ro::ProtectRelro aligns RELRO with it
     default: {
         char why[64];
         snprintf(why, sizeof why, "GetInfo id %u (handle %#x, sub id %#llx)", id, (uint32_t)c->x[2],
@@ -137,34 +146,12 @@ static void get_info(Cpu *c, uint64_t pc) {
     c->x[1] = v;
 }
 
-// TOTK_SVC_SLOW=1 (the environment or totk.ini): time every guest service call and report the ones that block for 100 ms or more, with the guest address
-// that asked for it. A call this slow stalls the whole guest (and leaves the GPU idle while it runs), which is what the
-// once-per-run hitch looks like; the sampler cannot name it because the wait happens across a kernel transition.
-static int svc_slow_on(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = cfg_get("TOTK_SVC_SLOW");
-        on = e && *e && strcmp(e, "0");
-    }
-    return on;
-}
-
-static void svc_slow_note(uint32_t imm, uint64_t pc, uint64_t t0) {
-    uint64_t dt = kern_now_ns() - t0;
-    if (dt < 100000000ull) return;
-    char at[160];
-    rt_log("svc: %#x blocked for %.1f ms at %.1f s tid %u, called from %s", imm, dt / 1e6, (kern_now_ns() - rt_guest_start_ns) / 1e9, (unsigned)plat_thread_id(), ldr_describe(pc, at, sizeof at));
-}
-
 static void svc_body(Cpu *c, uint32_t imm, uint64_t pc);
 
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     kern_checkpoint();
-    int tm = svc_slow_on();
-    uint64_t t0 = tm ? kern_now_ns() : 0;
     if (__builtin_expect(!kern_host_track || !c->thread, 1)) {
         svc_body(c, imm, pc);
-        if (tm) svc_slow_note(imm, pc, t0);
         return;
     }
     void *t = c->thread;   // kern_host_track: the SVC counted in the thread's host depth (hostfn.c hostfn_tracked)
@@ -174,7 +161,6 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     int n = *d - 1;
     __atomic_store_n(d, n, __ATOMIC_RELAXED);
     if (!n && kern_preempt_pending(t)) kern_host_left(t);
-    if (tm) svc_slow_note(imm, pc, t0);
 }
 
 static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
@@ -194,6 +180,12 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x01: {   // SetHeapSize(x1 size -> x1 address)
         uint64_t a = 0;
         uint32_t r = mem_set_heap_size(x[1], &a);
+        {   // every heap size the game asks for, and the answer
+            static volatile int32_t n;
+            if (plat_inc32(&n) <= 32)
+                rt_log("svc: SetHeapSize %#llx (%llu MiB) -> result %#x at %#llx", (unsigned long long)x[1],
+                       (unsigned long long)(x[1] >> 20), r, (unsigned long long)a);
+        }
         x[0] = r;
         if (!r) x[1] = a;
         return;
@@ -201,8 +193,14 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x02: x[0] = mem_set_permission(x[0], x[1], (uint32_t)x[2]); return;
     case 0x03: x[0] = mem_set_attribute(x[0], x[1], (uint32_t)x[2], (uint32_t)x[3]); return;
     case 0x04:   // MapMemory(x0 dst, x1 src, x2 size)
-        x[0] = on_main_stack(x[0], x[2]) ? KERN_R_INVALID_STATE_MEM : mem_map(x[0], x[1], x[2]);
+    {
+        uint64_t dst = x[0], src = x[1], n = x[2];
+        x[0] = on_main_stack(dst, n) ? KERN_R_INVALID_STATE_MEM : mem_map(dst, src, n);
+        if (cfg_bool("MTF_TRACE_MAPMEM"))
+            rt_log("svc MapMemory %#llx <- %#llx size %#llx: %#x", (unsigned long long)dst, (unsigned long long)src,
+                   (unsigned long long)n, (uint32_t)x[0]);
         return;
+    }
     case 0x05: x[0] = mem_unmap(x[0], x[1], x[2]); return;
     case 0x06: {   // QueryMemory(x0 MemoryInfo*, x2 address -> w1 page info)
         RtMemoryInfo mi;
@@ -213,7 +211,17 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
         x[1] = 0;
         return;
     }
-    case 0x2C: x[0] = mem_map_physical(x[0], x[1]); return;
+    case 0x2C: {   // MapPhysicalMemory(x0 address, x1 size)
+        uint64_t a = x[0], n = x[1];
+        x[0] = mem_map_physical(a, n);
+        static volatile int64_t mapped;
+        static volatile int32_t fails;
+        if (x[0] && plat_inc32(&fails) <= 16)   // a failed mapping: the game's allocation behind it fails too
+            rt_log("[RED] svc: MapPhysicalMemory %#llx+%#llx failed (%#llx), %lld MiB mapped so far", (unsigned long long)a,
+                   (unsigned long long)n, (unsigned long long)x[0], (long long)(mapped >> 20));
+        else if (!x[0]) __atomic_add_fetch(&mapped, (int64_t)n, __ATOMIC_RELAXED);
+        return;
+    }
     case 0x2D: x[0] = mem_unmap_physical(x[0], x[1]); return;
     case 0x26: {   // Break(x0 reason, x1 info, x2 info size); bit 31 of the reason: notification only
         uint32_t result = 0;
@@ -238,16 +246,12 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
         return;
     }
     case 0x29: get_info(c, pc); return;
-    case 0x07: {   // ExitProcess, as closing the window (gfx_window_closed): pipeline cache, shader records and
-                   // profile saved, logs flushed, exit code 0
+    case 0x07: {   // ExitProcess, as closing the window (gfx_window_closed): saves, logs flushed, exit code 0
         char at[160];
         rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
-        fs_save_flush();
-        gfx_backend()->save();
-        prof_write();
+        rt_exit_saves();
         fflush(NULL);
         if (svc_test_exit_hook) return svc_test_exit_hook(0);
-        gfx_exit_release();
         plat_exit(0);
     }
     }

@@ -1,6 +1,6 @@
 // Colour adjustment on the present (vk_color.h): brightness, contrast, saturation and gamma of the game's picture, after
-// the game and before the FSR 1 pass or the blit scale it to the window. Settings TOTK_COLOR_BRIGHTNESS (-30..30, %
-// added), TOTK_COLOR_CONTRAST and TOTK_COLOR_SATURATION (%, 100 = unchanged) and TOTK_COLOR_GAMMA (exponent, 1 =
+// the game and before the FSR 1 pass or the blit scale it to the window. Settings MTF_COLOR_BRIGHTNESS (-30..30, %
+// added), MTF_COLOR_CONTRAST and MTF_COLOR_SATURATION (%, 100 = unchanged) and MTF_COLOR_GAMMA (exponent, 1 =
 // unchanged), read when the settings change; the menu's colour profiles only write these four. At the default values
 // nothing is recorded and the present is what it was. Design and preset values: STS78721's colour profiles (issue #136).
 //
@@ -116,10 +116,10 @@ static int adjusting(void) {
     unsigned v = cfg_version();
     if (v != C.seen) {
         C.seen = v;
-        C.adj[0] = (float)cfg_double("TOTK_COLOR_BRIGHTNESS") / 100.0f;
-        C.adj[1] = (float)cfg_double("TOTK_COLOR_CONTRAST") / 100.0f;
-        C.adj[2] = (float)cfg_double("TOTK_COLOR_SATURATION") / 100.0f;
-        C.adj[3] = (float)cfg_double("TOTK_COLOR_GAMMA");
+        C.adj[0] = (float)cfg_double("MTF_COLOR_BRIGHTNESS") / 100.0f;
+        C.adj[1] = (float)cfg_double("MTF_COLOR_CONTRAST") / 100.0f;
+        C.adj[2] = (float)cfg_double("MTF_COLOR_SATURATION") / 100.0f;
+        C.adj[3] = (float)cfg_double("MTF_COLOR_GAMMA");
     }
     return C.adj[0] != 0.0f || C.adj[1] != 1.0f || C.adj[2] != 1.0f || C.adj[3] != 1.0f;
 }
@@ -136,8 +136,8 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkPipel
     vkCmdPipelineBarrier2(cb, &d);
 }
 
-VkImage vk_color_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4], int force) {
-    if (!adjusting() && !force) return VK_NULL_HANDLE;
+VkImage vk_color_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]) {
+    if (!adjusting()) return VK_NULL_HANDLE;
     VkCtx *c = vk_ctx();
     if (!C.tried) init(c);
     if (!C.ok || !ensure_image(c, (uint32_t)crop[2], (uint32_t)crop[3])) return VK_NULL_HANDLE;

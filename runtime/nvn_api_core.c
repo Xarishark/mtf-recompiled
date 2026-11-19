@@ -1,16 +1,16 @@
 // NVN front end, first slice: device, queue, memory pool, buffer, sync and
-// event objects. Ported from MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c @ b75be8cf (MIT,
-// Copyright (c) 2026 jhaizhou; origin d2r-mobile), lines 137-253, 534-645 and 1975-2001; Metal, mach, the translation
-// thread and Apple diagnostics dropped. Calls that reached Metal go to gfx_backend() (gfx.h). nvnQueuePresentTexture
+// event objects. Calls that reach the GPU go to gfx_backend() (gfx.h). nvnQueuePresentTexture
 // belongs to the window slice; nvnDeviceGetProcAddress lives in nvn_procs.c.
 //
 // Objects are stored in place in the NVN object memory the game provides (nvn_obj.h); every argument is read from the
 // AAPCS64 registers (host.h arg_x / arg_p) and every result returned with ret_x.
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
+#include "diag_watch.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -53,7 +53,7 @@ void nvn_guest_written(uint64_t addr, uint64_t size) {
     if (size) gfx_backend()->guest_written(addr, size);
 }
 
-// memcpy of pool storage the GPU rendered into must copy what the GPU wrote: TotK moves its generated grass maps
+// memcpy of pool storage the GPU rendered into must copy what the GPU wrote: a game may move generated maps
 // between pools with memcpy. Copies below 1 KiB skip the check; the copy itself is memmove, as overlapping
 // arguments are undefined for memcpy anyway.
 static void ov_memcpy(Cpu *c) {
@@ -130,8 +130,8 @@ const pool_t *nvn_pool_find(uint64_t addr, uint64_t len) {
     return p;
 }
 
-// Physical and virtual pools (MacNativeGames totk_vpool.c checks). A CPU-invisible one gets a GPU window range.
-// A CPU-visible physical pool (1.4.3: flags 0x18c, GPU_NO_ACCESS) keeps the game's storage for the CPU; the back end
+// Physical and virtual pools. A CPU-invisible one gets a GPU window range.
+// A CPU-visible physical pool (flags 0x18c, GPU_NO_ACCESS) keeps the game's storage for the CPU; the back end
 // gives it device memory as any physical pool (vk_memory.c vk_pool_init), which the GPU reaches through virtual pools.
 static int pool_place(pool_t *o) {
     int phys = (o->flags & NVN_MEMORY_POOL_FLAGS_PHYSICAL) != 0, virt = (o->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) != 0;
@@ -166,9 +166,8 @@ static int pool_place(pool_t *o) {
 static int pool_gpu_visible(const pool_t *o) { return !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS); }
 
 // ---------- Device
-static const int devinfo[] = {   // Tegra X1 values (nnheaders nvn_DeviceConstantsNX.h, measured on SMO)
-    // Base Bananza requires 231.16 (main+0x5b29a4); the update's gate is handled below. The other limits remain Tegra X1 values.
-    [0x00] = 231, [0x01] = 16,
+static const int devinfo[] = {   // Tegra X1 values (measured)
+    [0x00] = 55, [0x01] = 15,    // ABI: the game's main requires major 55, minor >= 15
     [0x02] = 14, [0x03] = 65536, [0x04] = 256, [0x05] = 8, [0x06] = 16, [0x07] = 4, [0x08] = 16, [0x09] = 32,
     [0x0A] = 16, [0x0B] = 4, [0x0C] = 4, [0x0D] = 4, [0x0E] = 16, [0x0F] = 32, [0x10] = 32, [0x11] = 256, [0x12] = 256,
     [0x13] = 4, [0x14] = 8, [0x15] = 512, [0x16] = 256, [0x17] = 2, [0x18] = 256, [0x19] = 4096, [0x1A] = 131072,
@@ -204,12 +203,12 @@ NVN_API(nvnDeviceGetInteger) {
     unsigned w = (unsigned)arg_x(c, 1);
     int *out = arg_p(c, 2);
     if (w >= sizeof devinfo / sizeof *devinfo) rt_fatal("nvn: unsupported NVN device property %#x", w);
-    // Update 458752's graphics initializer (main+0x5c61ac) rejects the base ABI before creating its device singleton.
-    *out = w == NVN_DEVICE_INFO_API_MINOR_VERSION && !strcmp(rt_game_target, "dkb458752") ? 30 : devinfo[w];
-    // Entries the table leaves at 0 are defaults, not measured values; list each asked enum once.
-    static volatile uint32_t zero_seen[4];
-    if (!devinfo[w] && !(__atomic_fetch_or(&zero_seen[w / 32], 1u << (w % 32), __ATOMIC_RELAXED) & (1u << (w % 32))))
-        rt_log("nvn2: DeviceGetInteger %#x answered with the default 0", w);
+    *out = devinfo[w];
+    {   // each property the game asks for, once (MTF: 0x04 0x0a 0x0f-0x16 0x24 0x25 0x2a 0x38 0x5a,
+        // all the same on the Switch 2 as here)
+        static uint8_t seen[0x100];
+        if (w < 0x100 && !seen[w]) seen[w] = 1, rt_log("nvn: DeviceGetInteger %#x -> %d", w, *out);
+    }
     NVN_LOG("DeviceGetInteger %#x -> %d", w, *out);
 }
 // NVNboolean nvnDeviceRegisterFastClearColor{,i,ui}(NVNdevice *d, const T *color, NVNformat format), ...Depth(d, float):
@@ -270,11 +269,16 @@ NVN_API(nvnMemoryPoolBuilderSetStorage) {
     b->mem = arg_p(c, 1);
     b->size = arg_x(c, 2);
 }
+// NVNdevice *nvnMemoryPoolBuilderGetDevice(b), void *GetMemory(b), size_t GetSize(b), int GetFlags(b)
+NVN_API(nvnMemoryPoolBuilderGetDevice) { ret_x(c, (uintptr_t)((const pool_builder_t *)arg_p(c, 0))->dev); }
+NVN_API(nvnMemoryPoolBuilderGetMemory) { ret_x(c, (uintptr_t)((const pool_builder_t *)arg_p(c, 0))->mem); }
+NVN_API(nvnMemoryPoolBuilderGetSize) { ret_x(c, ((const pool_builder_t *)arg_p(c, 0))->size); }
+NVN_API(nvnMemoryPoolBuilderGetFlags) { ret_x(c, ((const pool_builder_t *)arg_p(c, 0))->flags); }
 // void nvnMemoryPoolBuilderSetFlags(NVNmemoryPoolBuilder *b, int flags)
 NVN_API(nvnMemoryPoolBuilderSetFlags) { ((pool_builder_t *)arg_p(c, 0))->flags = (uint32_t)arg_x(c, 1); }
 // NVNboolean nvnMemoryPoolInitialize(NVNmemoryPool *p, const NVNmemoryPoolBuilder *b)
 // Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
-// loader threads, which held a virtual core through it while job workers waited (TOTK_CORE_DIAG). The thread gives
+// loader threads, which held a virtual core through it while job workers waited (MTF_CORE_DIAG). The thread gives
 // the core up, as for any blocking host call.
 NVN_API(nvnMemoryPoolInitialize) {
     NVN_BLOCKING();
@@ -350,7 +354,7 @@ NVN_API(nvnMemoryPoolMap) {
     if (o->magic != NVN_POOL_MAGIC || (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) { ret_x(c, 0); return; }
     ret_x(c, (uintptr_t)o->mem);
 }
-// MacNativeGames totk_vpool.c: every request is checked before any mapping changes.
+// Every request is checked before any mapping changes.
 static int check_request(const pool_t *v, const nvn_mapping_t *r, int i) {
     uint64_t end = (uint64_t)r->virtual_offset + r->size;
     if (r->virtual_offset < 0 || r->physical_offset < 0 || !r->size) {
@@ -429,12 +433,13 @@ NVN_API(nvnBufferInitialize) {
         ret_x(c, 0);
         return;
     }
-    *o = (buf_t){BUF_MAGIC, s->pool, s->off, s->size};
+    uint64_t a = s->pool->mem ? (uintptr_t)s->pool->mem + (uint64_t)s->off : 0;
+    *o = (buf_t){BUF_MAGIC, s->pool, s->size, a, s->off};
     ret_x(c, 1);
 }
 // void nvnBufferFinalize(NVNbuffer *b)
 NVN_API(nvnBufferFinalize) { memset(arg_p(c, 0), 0, sizeof(buf_t)); }
-static uint64_t buf_address(const buf_t *o) { return o->pool && o->pool->mem ? (uintptr_t)o->pool->mem + (uint64_t)o->off : 0; }
+static uint64_t buf_address(const buf_t *o) { return o->addr; }   // +0x18: the game may have moved it (buf_t)
 // void *nvnBufferMap(const NVNbuffer *b): NULL in a GPU-window pool, which has no CPU view
 NVN_API(nvnBufferMap) {
     uint64_t a = buf_address(arg_p(c, 0));
@@ -477,19 +482,6 @@ NVN_API(nvnQueueFenceSync) {
     s->fenced = 1;
     s->fence = nvn_fence_last();
 }
-// void nvnQueueWaitSync(NVNqueue *q, const NVNsync *s): wait on the sync's fence if fenced
-NVN_API(nvnQueueWaitSync) {
-    const sync_t *s = arg_p(c, 1);
-    if (!s || !s->fenced) return;
-    const GfxBackend *b = gfx_backend();
-    if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); return; }
-    int ok;
-    {
-        NVN_BLOCKING();
-        ok = b->fence_wait(s->fence, UINT64_MAX);
-    }
-    if (ok) b->cpu_synced(s->fence);
-}
 // NVNsyncWaitResult nvnSyncWait(const NVNsync *s, uint64_t timeout_ns): a sync never fenced reports a timeout at once;
 // a fenced one is released only after the back end completed that fence value
 NVN_API(nvnSyncWait) {
@@ -497,6 +489,9 @@ NVN_API(nvnSyncWait) {
     uint64_t timeout = arg_x(c, 1);
     if (!s->fenced) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
     const GfxBackend *b = gfx_backend();
+    if (diag_watch_on)
+        diag_watch_note("wait sync %p fence %llu (done %llu)", (const void *)s, (unsigned long long)s->fence,
+                        (unsigned long long)b->fence_done());
     if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     int ok;
     {
@@ -591,31 +586,17 @@ NVN_API(nvnQueueFinish) {
     }
     gfx_backend()->cpu_synced(gfx_backend()->fence_done());
 }
-// ---------- Submit latency guard for TotK 1.2.1's per-object uniform double buffer
-// NVN starts the GPU when QueueSubmitCommands returns, within microseconds; here the replay into Vulkan takes 15-30 ms
-// first, and the GPU reads uniform memory only after it. The game's producer f_70008c6460 (thread 0x103e, p56)
-// rewrites the half of its per-object uniform blocks that was front until the last flip, 14-23 ms after the submit
-// that still reads it, with no fence: on hardware the GPU has read that half by then. Here the rewrite lands inside
-// the replay, and that frame draws other objects' matrices (phantom rocks, flat far field).
-// The guard makes the producer wait, at its commit point, until the newest submit has been replayed and completed.
-// lod_entered / lod_issued count submits that entered QueueSubmitCommands / reached the back end; lod_fence holds
-// the fence of the last LOD_RING. TOTK_LOD_GUARD=0 turns the wait off.
-#define LOD_RING 64
-static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
-
 // void nvnQueueSubmitCommands(NVNqueue *q, int n, const NVNcommandHandle *handles): replayed on this thread with its
-// core given up (section 2.2), or queued for the replay thread (TOTK_REPLAY_ASYNC, vk_backend.c); the newest fence
-// value is what QueueFenceSync records. With the queue the fence covers replay and GPU, so the LOD guard below waits
-// for both.
+// core given up (section 2.2), or queued for the replay thread (MTF_REPLAY_ASYNC, vk_backend.c); the newest fence
+// value is what QueueFenceSync records. With the queue the fence covers replay and GPU.
 NVN_API(nvnQueueSubmitCommands) {
     queue_t *q = arg_p(c, 0);
-    uint64_t submitted = rt_ticks();
     int n = (int)arg_x(c, 1);
     const uint64_t *h = arg_p(c, 2);
     if (n < 0 || (n && !h)) rt_fatal("nvn: QueueSubmitCommands with %d handles at %p", n, (const void *)h);
     NVN_BLOCKING();
-    uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
     q->submits++;
+    if (diag_watch_on) diag_watch_submit(h, n);
     uint64_t f;
     if (gfx_replay_async()) {
         // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
@@ -624,35 +605,14 @@ NVN_API(nvnQueueSubmitCommands) {
         if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
         plat_mutex_lock(&submit_lock);
         nvn_submit_prepare_async(h, hs, n);
-        f = gfx_backend()->submit(hs, n, submitted);
+        f = gfx_backend()->submit(hs, n);
         plat_mutex_unlock(&submit_lock);
         if (hs != local) free(hs);
     } else {
         nvn_submit_prepare(h, n);
-        f = gfx_backend()->submit(h, n, submitted);
+        f = gfx_backend()->submit(h, n);
     }
     uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
-    __atomic_store_n(&lod_fence[no % LOD_RING], f, __ATOMIC_RELAXED);
-    __atomic_store_n(&lod_issued, no, __ATOMIC_SEQ_CST);
 }
 
-// The producer (1.2.1 main f_70008c6460) releases the read lock on obj+0x538 at lr 0x70008c70c8; when
-// [obj+0x529] == [obj+0x528] (x19 = obj) it goes on to rewrite the back half. Waits off the core, at most ~400 ms.
-static void obs_release_read(Cpu *c) {
-    uint64_t lr = c->x[30], obj = c->x[19];
-    rt_original(c);
-    if (lr != 0x70008c70c8ull) return;
-    static int on = -1;
-    if (on < 0) {
-        on = cfg_bool("TOTK_LOD_GUARD");
-    }
-    if (!on || *(volatile uint8_t *)(uintptr_t)(obj + 0x528) != *(volatile uint8_t *)(uintptr_t)(obj + 0x529)) return;
-    uint64_t e = __atomic_load_n(&lod_entered, __ATOMIC_SEQ_CST);
-    if (!e) return;
-    NVN_BLOCKING();
-    for (int i = 0; i < 200 && __atomic_load_n(&lod_issued, __ATOMIC_SEQ_CST) < e; i++) plat_sleep_ms(1);
-    uint64_t f = __atomic_load_n(&lod_fence[e % LOD_RING], __ATOMIC_RELAXED);
-    if (gfx_backend()->fence_done() < f) gfx_backend()->fence_wait(f, 200000000ull);
-}
-HOST_OBSERVER("_ZN2nn2os15ReleaseReadLockEPNS0_20ReaderWriterLockTypeE", obs_release_read);

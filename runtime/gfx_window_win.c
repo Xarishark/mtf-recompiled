@@ -1,9 +1,9 @@
 // The Win32 back end of the window (gfx_wsys.h): the window and its message loop on a thread of their own, F11
-// fullscreen, the settings TOTK_WINDOW_SIZE and TOTK_FULLSCREEN, the monitor's refresh rate, focus, the Vulkan surface.
-// The swapchain and the present are vk_present.c's. The in-game menu's keyboard and mouse come from the window
+// fullscreen, the settings MTF_WINDOW_SIZE and MTF_FULLSCREEN, the monitor's refresh rate, focus, the Vulkan surface.
+// The swapchain and the present are gfx_present.c's. The in-game menu's keyboard and mouse come from the window
 // procedure (ui/menu_win.cpp), and so do the game's (input_win.c).
 //
-// The process is per-monitor DPI aware (totk.manifest): every size here is physical pixels, TOTK_WINDOW_SIZE included,
+// The process is per-monitor DPI aware (mtf.manifest): every size here is physical pixels, MTF_WINDOW_SIZE included,
 // and the swapchain matches the screen pixel for pixel. A window moved to a monitor at another display scale keeps its
 // client size (WM_GETDPISCALEDSIZE); the menu takes its text size floor from the window's DPI (gfx_window_dpi).
 #include <stdio.h>
@@ -13,6 +13,7 @@
 #include <imm.h>
 
 #include "cfg.h"
+#include "diag_watch.h"
 #include "flight.h"
 #include "fs.h"
 #include "gfx.h"
@@ -22,6 +23,7 @@
 #include "nvn_api.h"
 #include "ui/menu.h"
 #include "vk.h"
+#include "vk_exec.h"
 #include "platform/platform.h"
 #include <vulkan/vulkan_win32.h>
 
@@ -29,11 +31,9 @@
 static HWND g_hwnd;
 static PlatEvent g_wnd_ready;   // manual-reset: the window thread made the window or gave up
 static int g_wnd_failed;
-static int g_background;                   // TOTK_BACKGROUND_WINDOW: the window stays behind the user's windows
-static int g_fs_pending;                   // window thread: TOTK_FULLSCREEN waits for the first activation
+static int g_background;                   // MTF_BACKGROUND_WINDOW: the window stays behind the user's windows
+static int g_fs_pending;                   // window thread: MTF_FULLSCREEN waits for the first activation
 static volatile int32_t g_dpi = USER_DEFAULT_SCREEN_DPI;   // the window's DPI, set by the window thread
-
-HWND gfx_window_handle(void) { return g_hwnd; }
 
 int gfx_window_vk_extensions(const char **out, int max) {
     if (max < 2) return 0;
@@ -49,8 +49,18 @@ int gfx_window_vk_presentable(VkInstance inst, VkPhysicalDevice pd, uint32_t fam
 
 // ---- window thread
 #define WND_STYLE WS_OVERLAPPEDWINDOW
-#define WM_APP_TOGGLE_FULLSCREEN (WM_APP + 3)
 #define WM_APP_SETTINGS (WM_APP + 1)
+#define WM_APP_TITLE (WM_APP + 20)   // the frame rate in the title (gfx_window_fps); the window thread sets the text
+
+static volatile LONG g_fps_x10, g_frame_ms_x10;
+
+// Called once a second from the present path: the window title shows the game's presents per second and the mean
+// frame time. Posted, so the present thread never waits on the window thread.
+void gfx_window_fps(double fps, double frame_ms) {
+    InterlockedExchange(&g_fps_x10, (LONG)(fps * 10 + 0.5));
+    InterlockedExchange(&g_frame_ms_x10, (LONG)(frame_ms * 10 + 0.5));
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_TITLE, 0, 0);
+}
 #define WM_APP_FULLSCREEN (WM_APP + 2)   // the fullscreen setting, held back until the window is first activated
 
 static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window behind fullscreen (window thread)
@@ -65,11 +75,25 @@ unsigned gfx_window_dpi(void) { return (unsigned)plat_cas32(&g_dpi, 0, 0); }
 // The outer size of a framed window whose client area is cw x ch. The frame is measured at the window's DPI, or the
 // system DPI before the window exists: plain AdjustWindowRect always takes the system DPI, which is wrong on a monitor
 // at another display scale.
+// A size that does not fit the monitor's work area (MTF_WINDOW_SIZE=3840x2160 on a smaller screen opened a window larger
+// than the monitor) shrinks to fit it, frame and taskbar included, keeping the client's aspect ratio.
 static void outer_size(HWND h, int cw, int ch, int *ow, int *oh) {
+    UINT dpi = h ? GetDpiForWindow(h) : GetDpiForSystem();
     RECT r = {0, 0, cw, ch};
-    AdjustWindowRectExForDpi(&r, WND_STYLE, FALSE, 0, h ? GetDpiForWindow(h) : GetDpiForSystem());
+    AdjustWindowRectExForDpi(&r, WND_STYLE, FALSE, 0, dpi);
     *ow = r.right - r.left;
     *oh = r.bottom - r.top;
+    MONITORINFO mi = {sizeof mi};
+    HMONITOR mon = h ? MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY) : MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (!cw || !ch || !GetMonitorInfoW(mon, &mi)) return;
+    int fw = *ow - cw, fh = *oh - ch;   // the frame around the client
+    int aw = mi.rcWork.right - mi.rcWork.left - fw, ah = mi.rcWork.bottom - mi.rcWork.top - fh;
+    if (aw <= 0 || ah <= 0 || (cw <= aw && ch <= ah)) return;
+    double k = (double)aw / cw < (double)ah / ch ? (double)aw / cw : (double)ah / ch;
+    int nw = (int)(cw * k), nh = (int)(ch * k);
+    rt_log("gfx: window %dx%d does not fit the monitor's work area: %dx%d", cw, ch, nw, nh);
+    *ow = nw + fw;
+    *oh = nh + fh;
 }
 
 // Windows turns the display off and sleeps after the idle timeout, and gamepad input does not count as activity. While
@@ -105,35 +129,20 @@ static void toggle_fullscreen(HWND h) {
     }
 }
 
-// Window mode 0 windowed, 1 borderless (the popup over the monitor), 2 fullscreen. Windows has no mode switch worth
-// making under a Vulkan swapchain (the flip-model present already bypasses the compositor), so fullscreen is the popup
-// kept above every other window, taskbar included.
-static int last_fs = 1;   // the full-screen mode F11 returns to: the last one chosen anywhere
-
-static void set_mode(HWND h, int mode) {
-    if (mode) last_fs = mode;
-    input_cursor_suspend(1);
-    if ((mode != 0) != is_fullscreen(h)) toggle_fullscreen(h);
-    if (!g_background)
-        SetWindowPos(h, mode == 2 ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    input_cursor_suspend(0);
-}
-
-// The window size and mode last taken from the settings (window thread). apply_settings acts on a change of either
-// value only, so a window resized by hand keeps its size when another setting changes.
+// The window size and fullscreen state last taken from the settings (window thread). apply_settings acts on a change of
+// either value only, so a window resized by hand keeps its size when another setting changes.
 static char g_applied_size[32];
-static int g_applied_mode;
+static int g_applied_fs;
 
 static void note_applied(void) {
-    snprintf(g_applied_size, sizeof g_applied_size, "%s", cfg_value("TOTK_WINDOW_SIZE"));
-    g_applied_mode = gfx_cfg_window_mode();
+    snprintf(g_applied_size, sizeof g_applied_size, "%s", cfg_value("MTF_WINDOW_SIZE"));
+    g_applied_fs = cfg_fullscreen();
 }
 
 // Window thread: the window takes the size and fullscreen state of the settings when they changed. In fullscreen the
 // size goes into the placement restored when fullscreen ends.
 static void apply_settings(HWND h) {
-    int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, mode = gfx_cfg_window_mode(),
-        mode_changed = mode != g_applied_mode;
+    int size_changed = strcmp(cfg_value("MTF_WINDOW_SIZE"), g_applied_size) != 0, fs = cfg_fullscreen(), fs_changed = fs != g_applied_fs;
     note_applied();
     if (size_changed) {
         int cw, ch, ow, oh;
@@ -151,24 +160,31 @@ static void apply_settings(HWND h) {
             }
         }
     }
-    if (mode_changed) set_mode(h, mode);
+    if (fs_changed && fs != is_fullscreen(h)) {
+        input_cursor_suspend(1);
+        toggle_fullscreen(h);
+        input_cursor_suspend(0);
+    }
+}
+
+// Pixels of the monitor the window is on; 0 when unknown (before the window exists).
+int gfx_window_monitor_size(int *w, int *h) {
+    MONITORINFO mi = {.cbSize = sizeof mi};
+    if (!g_hwnd || !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) return 0;
+    *w = mi.rcMonitor.right - mi.rcMonitor.left;
+    *h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    return 1;
 }
 
 void gfx_window_apply_settings(void) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_SETTINGS, 0, 0);
 }
 
-
-// Never resize from the input/present thread: F11 and this request share the window-thread handler.
-void gfx_window_toggle_fullscreen(void) {
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_TOGGLE_FULLSCREEN, 0, 0);
-}
-
 void gfx_window_request_close(void) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
 }
 
-// ---- refresh rate of the window's monitor (TOTK_FPS_LIMIT=display), measured when the window opens, lands on another
+// ---- refresh rate of the window's monitor (MTF_FPS_LIMIT=display), measured when the window opens, lands on another
 // monitor or the display mode changes (gfx_window_set_refresh keeps it). QueryDisplayConfig gives the exact rational
 // rate (59.94, 143.998); EnumDisplaySettings' whole hertz is the fallback.
 static HMONITOR g_rate_mon;
@@ -209,46 +225,40 @@ static void refresh_rate_update(HWND h, int force) {
     gfx_window_set_refresh(monitor_rate_hz(mon));
 }
 
-int gfx_window_monitor_size(int *w, int *h) {
-    MONITORINFO mi = {sizeof mi};
-    if (!g_hwnd || !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) return 0;
-    *w = mi.rcMonitor.right - mi.rcMonitor.left;
-    *h = mi.rcMonitor.bottom - mi.rcMonitor.top;
-    return 1;
-}
-
-
-static void toggle_window_mode(HWND h) {
-    // the real window decides, so a mode forced by the environment cannot stick F11
-    int cur = is_fullscreen(h) ? (g_applied_mode ? g_applied_mode : 1) : 0, mode = cur ? 0 : last_fs;
-    set_mode(h, mode);
-    // the menu shows these; the next start keeps them
-    cfg_set("TOTK_WINDOW_MODE", mode == 2 ? "fullscreen" : mode == 1 ? "borderless" : "windowed");
-    cfg_set("TOTK_FULLSCREEN", mode ? "1" : "0");
-    cfg_save();
-    note_applied();   // what cfg_get reads now (the environment may still override it)
-}
-
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT input_res;
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
     case WM_KEYDOWN:
-        if (w == VK_F7 && !(l & (1 << 30))) gfx_backend()->capture_log_toggle();
-        if (w == VK_F9 && !(l & (1 << 30))) gfx_backend()->dump_request();   // TOTK_DUMP=key; F10 is the system menu key
+        if (w == VK_F12 && !(l & (1 << 30))) vk_dump_request(), diag_watch_key();   // MTF_DUMP=key / MTF_WATCH_KEY
         if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
-            toggle_window_mode(h);
+            input_cursor_suspend(1);
+            toggle_fullscreen(h);
+            input_cursor_suspend(0);
+            cfg_set("MTF_FULLSCREEN", is_fullscreen(h) ? "1" : "0");   // the menu shows it; the next start keeps it
+            cfg_save();
+            note_applied();   // what cfg_get reads now (the environment may still override it)
         }
         break;
-    case WM_APP_TOGGLE_FULLSCREEN:
-        toggle_window_mode(h);
-        return 0;
     case WM_APP_SETTINGS:
         apply_settings(h);
         return 0;
+    case WM_APP_TITLE: {
+        wchar_t t[128];
+        LONG f = g_fps_x10, ms = g_frame_ms_x10;
+        _snwprintf(t, sizeof t / sizeof *t, L"MTF Recomp - %ld.%ld fps (%ld.%ld ms)", f / 10, f % 10,
+                   ms / 10, ms % 10);
+        t[sizeof t / sizeof *t - 1] = 0;
+        SetWindowTextW(h, t);
+        return 0;
+    }
     case WM_APP_FULLSCREEN:
-        if (cfg_fullscreen() && !is_fullscreen(h)) set_mode(h, gfx_cfg_window_mode());
+        if (cfg_fullscreen() && !is_fullscreen(h)) {
+            input_cursor_suspend(1);
+            toggle_fullscreen(h);
+            input_cursor_suspend(0);
+        }
         return 0;
     case WM_SIZE:
         keep_awake(w != SIZE_MINIMIZED);
@@ -290,8 +300,6 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_ACTIVATEAPP: {
         int in = w != 0;
         gfx_window_focus_changed(in);
-        if (g_applied_mode == 2 && is_fullscreen(h))   // fullscreen is topmost only while the game has focus
-            SetWindowPos(h, in ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (in && g_fs_pending) {
             g_fs_pending = 0;
             PostMessageW(h, WM_APP_FULLSCREEN, 0, 0);
@@ -300,34 +308,51 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CLOSE:
         gfx_window_closed();
-        return 0;
     case WM_ERASEBKGND:
         return 1;
     }
     return DefWindowProcW(h, m, w, l);
 }
 
+// Brings the game window to the front. Windows refuses SetForegroundWindow to a process that was not the last to get
+// input, which is the case for a game started by a frontend; attaching this thread's input queue to the foreground
+// window's thread for the call is the documented way around it. The window is not left topmost.
+static void raise_window(HWND h) {
+    HWND fg = GetForegroundWindow();
+    DWORD me = GetCurrentThreadId(), other = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    int attached = other && other != me && AttachThreadInput(me, other, TRUE);
+    ShowWindow(h, IsIconic(h) ? SW_RESTORE : SW_SHOW);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    SetActiveWindow(h);
+    if (attached) AttachThreadInput(me, other, FALSE);
+    if (GetForegroundWindow() != h) {   // still refused: a topmost toggle puts it above the others without keeping it there
+        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    }
+}
+
 static void window_main(void *arg) {
     (void)arg;
     HINSTANCE inst = GetModuleHandleW(NULL);
-    // Icon resource 1 of totk.rc (runtime/dkb.ico): the title bar, the taskbar button and Alt+Tab.
+    // Icon resource 1 of mtf.rc (runtime/mtf.ico): the title bar, the taskbar button and Alt+Tab.
     WNDCLASSEXW wc = {.cbSize = sizeof wc, .lpfnWndProc = wnd_proc, .hInstance = inst,
                       .hIcon = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
                                           GetSystemMetrics(SM_CYICON), LR_SHARED),
                       .hIconSm = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                             GetSystemMetrics(SM_CYSMICON), LR_SHARED),
-                      .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"TotKRecompWindow"};
+                      .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"MTFRecompWindow"};
     RegisterClassExW(&wc);
     int cw, ch, ow, oh;
     cfg_window_size(&cw, &ch);
     outer_size(NULL, cw, ch, &ow, &oh);
-    // The window opens behind the user's windows without taking focus: it shows the game's blank loading frames for a
-    // while, and must not cover what the player works on meanwhile. The game still counts itself in focus until the
-    // first WM_ACTIVATEAPP, so loading goes on, and keyboard input waits for the foreground (input_win.c). Its taskbar
-    // button flashes until it is brought up, and TOTK_FULLSCREEN waits for that first activation.
-    // TOTK_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
-    int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Mario Tennis Fever \u2014 MTF Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
+    // The window opens behind the user's windows first and is then raised (raise_window): a game started by a frontend
+    // has no other way to reach it. The game counts itself in focus until the first WM_ACTIVATEAPP, so loading goes on,
+    // and keyboard input waits for the foreground (input_win.c). If Windows still refuses the foreground, the taskbar
+    // button flashes, and MTF_FULLSCREEN waits for the first activation.
+    // MTF_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
+    int background = g_background = cfg_get("MTF_BACKGROUND_WINDOW") && atoi(cfg_get("MTF_BACKGROUND_WINDOW"));
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"MTF Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
                              NULL, inst, NULL);
     if (!g_hwnd) {
         rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
@@ -343,9 +368,12 @@ static void window_main(void *arg) {
         outer_size(g_hwnd, cw, ch, &ow, &oh);
         SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         if (!background) {
+            // Pending before the raise: the activation it gets is the first WM_ACTIVATEAPP, which takes the fullscreen
+            // setting; set after it, fullscreen waited for the next activation and the game started in a window
+            g_fs_pending = cfg_fullscreen();
+            raise_window(g_hwnd);   // a frontend's player may have no way to reach a window left behind
             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
             FlashWindowEx(&fw);
-            g_fs_pending = cfg_fullscreen();
         }
         note_applied();
         refresh_rate_update(g_hwnd, 1);
@@ -388,18 +416,3 @@ void wsys_client_size(int *w, int *h) {
 
 int wsys_minimized(void) { return IsIconic(g_hwnd) != 0; }
 
-void wsys_resize(int cw, int ch) {
-    int ow, oh;
-    outer_size(g_hwnd, cw, ch, &ow, &oh);
-    SetWindowPos(g_hwnd, NULL, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-void wsys_probe_focus(int in) { SendMessageW(g_hwnd, WM_ACTIVATEAPP, in ? TRUE : FALSE, 0); }
-
-void wsys_probe_escape(void) { SendMessageW(g_hwnd, WM_KEYDOWN, VK_ESCAPE, 0); }
-
-int wsys_probe_click(int where) {
-    if (where == 0) SendMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, 0);
-    else SendMessageW(g_hwnd, WM_MOUSEACTIVATE, (WPARAM)g_hwnd, MAKELPARAM(where == 1 ? HTCLIENT : HTCAPTION, WM_LBUTTONDOWN));
-    return 1;
-}

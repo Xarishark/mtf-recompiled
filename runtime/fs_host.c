@@ -1,5 +1,3 @@
-// Adapted from MacNativeGames games/totk/runtime/fs_host.c @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames
-// contributors); the probe follows MacNativeGames' romfs.c runtime_fs_probe and fs_host.c runtime_save_probe.
 // nn::fs host implementation of the functions main imports. RomFS paths and
 // handles go to the read-only backend (romfs.c); save, temporary and cache storage are host directories under the
 // profile directory (rt_config()->profile, default build/profile):
@@ -16,17 +14,17 @@
 // Commit; a crash or an Unmount before Commit leaves the previous committed save. Commit returns at once and the copy
 // runs on a background thread (section "save transactions"); fs_save_flush lets the exit paths wait for it. Paths are
 // UTF-8 (platform.h plat_fs_*).
+// Contains adapted code under the MIT licence: authors and licence texts in THIRD_PARTY_NOTICES.md.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "aoc_romfs.h"
 #include "fs.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "romfs_path.h"
 
-#define TOTK_APPLICATION_ID RT_APPLICATION_ID   // name kept from TotK Recomp
+#define MTF_APPLICATION_ID 0x0100f2c0115b6000ull
 #define FILE_BASE 0x200000000ull
 #define DIR_BASE 0x300000000ull
 #define NFILES 1024
@@ -91,7 +89,7 @@ static char *join(const char *dir, const char *name) {
 }
 
 // Save in progress: a save-data file open for writing, or save data changed in the last 3 s and not committed yet
-// (TotK writes a slot's files back to back and then commits; between the files nothing is open for a moment).
+// (a game writes a slot's files back to back and then commits; between the files nothing is open for a moment).
 static volatile int32_t save_writers, save_dirty;
 static volatile int64_t save_changed_ns;
 static void save_wait_commit(void);
@@ -99,11 +97,6 @@ static void save_touched(void) {
     save_wait_commit();   // every change to save data comes here first: none lands in a commit's snapshot
     plat_xchg64(&save_changed_ns, (int64_t)plat_now_ns());
     plat_xchg32(&save_dirty, 1);
-}
-int fs_save_busy(void) {
-    if (plat_cas32(&save_writers, 0, 0) > 0) return 1;
-    return plat_cas32(&save_dirty, 0, 0) &&
-           plat_now_ns() - (uint64_t)plat_cas64(&save_changed_ns, 0, 0) < 3000000000ull;
 }
 
 // ---- host directories
@@ -126,12 +119,30 @@ static void make_dirs(const char *p) {
     if (!make_dir(buf)) rt_fatal("fs: cannot create directory %s", buf);
 }
 
-// Remove a directory tree; a link (reparse point, symbolic link) is removed as a link, never followed. 0 also when
+// The first path remove_tree could not delete and the OS error code, for the message of a fatal.
+static char remove_failed[1100];
+static int remove_error;
+static void remove_note(const char *path) {
+    if (*remove_failed) return;
+    snprintf(remove_failed, sizeof remove_failed, "%s", path);
+    remove_error = plat_fs_os_error();
+}
+
+// Remove a directory tree; a link (symbolic link, junction) is removed as a link, never followed. 0 also when
 // nothing is there.
 static int remove_tree(const char *path) {
     int kind = plat_fs_kind(path);
     if (kind == PLAT_FS_MISSING) return 0;
-    if (kind == PLAT_FS_FILE) return plat_fs_unlink(path) ? -1 : 0;
+    if (kind == PLAT_FS_FILE) {
+        if (!plat_fs_unlink(path)) return 0;
+        remove_note(path);
+        return -1;
+    }
+    if (kind == PLAT_FS_LINK) {   // a link to a file goes by unlink, a link to a directory by rmdir
+        if (!plat_fs_unlink(path) || !plat_fs_rmdir(path)) return 0;
+        remove_note(path);
+        return -1;
+    }
     int bad = 0;
     if (kind == PLAT_FS_DIR) {
         Listing l;
@@ -143,7 +154,23 @@ static int remove_tree(const char *path) {
         }
         listing_free(l.e, l.n);
     }
-    return bad | (plat_fs_rmdir(path) ? -1 : 0);
+    if (plat_fs_rmdir(path)) {
+        remove_note(path);
+        bad |= -1;
+    }
+    return bad;
+}
+
+// remove_tree, tried again every 50 ms for up to 2 s while another process (the previous run still exiting, a virus
+// scanner, a sync client) holds a file in the tree. The failing path and its OS error stay in remove_failed.
+#define MOVE_TRIES 40   // 2 s, also move_dir's
+static int remove_tree_retry(const char *path) {
+    for (int i = 0;; i++) {
+        *remove_failed = 0;
+        if (!remove_tree(path)) return 0;
+        if (i == MOVE_TRIES) return -1;
+        plat_sleep_ms(50);
+    }
 }
 
 // ---- save transactions
@@ -163,7 +190,7 @@ static int remove_tree(const char *path) {
 // open, in this or another process (a virus scanner, Explorer's preview, a sync tool), and a folder an elevated run
 // made can refuse it too. ready-<n> then stays the newest save: later working copies are made from it, and the next
 // Commit and the next start try (3) to (5) again. The game's Commit returns 0 once the steps are queued; a thread runs
-// them (95-135 ms on the game thread before, in the 1.4.3 fight save) while every change to the working copy waits in
+// them (95-135 ms on the game thread before, in one test) while every change to the working copy waits in
 // save_touched, and Unmount and the next Commit wait too. A crash in that time loses this Commit only, and a failed
 // one is logged instead of returned. The recovery rule at start (save_recover):
 //   new present          an unfinished copy: deleted (rollback). An older build renamed save/<uid> away before its
@@ -191,7 +218,6 @@ static int exists(const char *p) { return plat_fs_kind(p) != PLAT_FS_MISSING; }
 
 // Rename a directory, durably; retried every 50 ms, tries times in all, while another process (a virus scanner, the
 // indexer) holds a file in it. 0 on success.
-#define MOVE_TRIES 40   // 2 s
 static int move_dir(const char *from, const char *to, int tries) {
     for (int i = 0; i < tries; i++) {
         int e = plat_fs_rename(from, to, 1);
@@ -447,7 +473,8 @@ static void save_recover(void) {
         did = swap_in() ? "a finished commit still waits in save-tx; the game loads it from there"
                         : "completed a finished commit";
     if (exists(work_root)) {
-        if (remove_tree(work_root)) rt_fatal("fs: cannot delete the old save working copy");
+        if (remove_tree_retry(work_root))
+            rt_fatal("fs: cannot delete the old save working copy: %s (OS error %d)", remove_failed, remove_error);
         if (!strcmp(did, "nothing to recover"))
             did = "deleted the last run's working copy (changes after its last Commit)";
     }
@@ -596,17 +623,12 @@ static void ready(void) {
     plat_once(&once, storage_init, NULL);
 }
 
-void fs_host_set_profile(const char *dir) {
-    if (plat_cas32(&storage_ready, 0, 0)) rt_fatal("fs_host_set_profile after the first storage use");
-    need(dir && snprintf(profile, sizeof profile, "%s", dir) < (int)sizeof profile, "profile path");
-}
-
 // ---- mounts and paths
 static uint32_t mount_add(const char *name, int kind, const char *root) {
     if (!name || !*name || strlen(name) >= 32 || strchr(name, ':') || strchr(name, '/')) return FS_R_INVALID_ARGUMENT;
     char as_path[40];
     snprintf(as_path, sizeof as_path, "%s:", name);
-    if (romfs_owns(as_path) || aoc_owns(as_path)) return FS_R_ALREADY_EXISTS;   // the RomFS and add-on content mounts
+    if (romfs_owns(as_path)) return FS_R_ALREADY_EXISTS;   // the RomFS mount's name
     plat_mutex_lock(&lock);
     int slot = -1;
     for (int i = 0; i < NMOUNTS; i++) {
@@ -623,20 +645,6 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     plat_mutex_unlock(&lock);
     rt_log("fs mount %s: -> %s", name, root);
     return 0;
-}
-
-static int is_mounted(const char *name) {
-    if (!name || !*name || strlen(name) >= 32 || strchr(name, ':') || strchr(name, '/')) return 0;
-    char path[40];
-    snprintf(path, sizeof path, "%s:", name);
-    if (romfs_owns(path)) return 1;
-    if (aoc_owns(path)) return 1;
-    int found = 0;
-    plat_mutex_lock_shared(&lock);
-    for (int i = 0; i < NMOUNTS; i++)
-        if (mounts[i].kind && !strcmp(mounts[i].name, name)) found = 1;
-    plat_mutex_unlock_shared(&lock);
-    return found;
 }
 
 // A path component every host stores under exactly this name: not empty, ".", "..", no reserved character, no trailing
@@ -722,7 +730,7 @@ static uint32_t mount_save(const char *name, const uint64_t *uid) {
 
 static uint8_t save_exists(uint64_t application, const uint64_t *uid) {
     ready();
-    return application == TOTK_APPLICATION_ID && my_uid(uid);
+    return application == MTF_APPLICATION_ID && my_uid(uid);
 }
 
 // Other titles' save data (data-link bonuses) is not present on this host.
@@ -818,9 +826,8 @@ static void unmount(const char *name) {
     plat_mutex_unlock(&tx_lock);
     size_t n = name ? strlen(name) : 0;
     char probe[40];
-    if (!n || n >= 32 || (snprintf(probe, sizeof probe, "%s:", name), !romfs_owns(probe) && !aoc_owns(probe)))
+    if (!n || n >= 32 || (snprintf(probe, sizeof probe, "%s:", name), !romfs_owns(probe)))
         rt_fatal("fs: unmount of unknown mount %s", name ? name : "(null)");
-    if (aoc_owns(probe)) aoc_unmount(name);   // the generic Unmount also ends an add-on content mount
 }
 
 static uint32_t commit(const char *name) {
@@ -852,7 +859,6 @@ static File *file_of(uint64_t h, PlatFile **fh, int *mode) {
 
 // Positional reads: bytes read at off, 0 at the end, -1 on an error.
 static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
-    mem_touch((uintptr_t)buf, n);  // a lazily committed page fails the kernel's write too
     mem_thaw((uintptr_t)buf, n);   // the kernel's write would fail on a frozen page instead of faulting
     int64_t got = plat_file_pread(f, buf, n, off);
     if (got == -2)   // a read-only page in the buffer: a frozen region missed its thaw
@@ -862,7 +868,6 @@ static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
 
 static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     if (romfs_owns(path)) return romfs_open(out, path, mode);
-    if (aoc_owns(path)) return aoc_open(out, path, mode);
     fs_trace(mode & FS_OPEN_WRITE ? "write" : "read", path);
     if (!out || !(mode & (FS_OPEN_READ | FS_OPEN_WRITE)) || (mode & ~7)) return FS_R_INVALID_ARGUMENT;
     char p[PATH_CAP];
@@ -893,7 +898,6 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
 
 static uint32_t read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
     if (romfs_handle(h)) return romfs_read(out, h, offset, buffer, size);
-    if (aoc_handle(h)) return aoc_read(out, h, offset, buffer, size);
     PlatFile *f;
     int mode;
     if (!out || offset < 0 || (!buffer && size) || !file_of(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
@@ -928,7 +932,6 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     if (file->save) save_touched();
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
-        mem_touch((uintptr_t)buffer + done, chunk);   // WriteFile from a lazily uncommitted page fails with ERROR_NOACCESS
         int64_t put = plat_file_pwrite(f, (const uint8_t *)buffer + done, chunk, (uint64_t)offset + done);
         if (put <= 0) rt_fatal("fs: host save write failure");
         done += (uint64_t)put;
@@ -939,7 +942,6 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
 
 static uint32_t file_size(int64_t *out, uint64_t h) {
     if (romfs_handle(h)) return romfs_size(out, h);
-    if (aoc_handle(h)) return aoc_size(out, h);
     PlatFile *f;
     PlatFileId id;
     if (!out || !file_of(h, &f, NULL) || !plat_file_id(f, &id)) return FS_R_INVALID_ARGUMENT;
@@ -968,10 +970,6 @@ static uint32_t flush_file(uint64_t h) {
 static void close_file(uint64_t h) {
     if (romfs_handle(h)) {
         romfs_close(h);
-        return;
-    }
-    if (aoc_handle(h)) {
-        aoc_close(h);
         return;
     }
     if (!file_of(h, NULL, NULL)) rt_fatal("fs: close of invalid file handle %#llx", (unsigned long long)h);
@@ -1021,7 +1019,6 @@ static uint32_t rename_file(const char *from, const char *to) {
 
 static uint32_t entry_type(int *out, const char *path) {
     if (romfs_owns(path)) return romfs_entry_type(out, path);
-    if (aoc_owns(path)) return aoc_entry_type(out, path);
     char p[PATH_CAP];
     uint32_t r = host_path(path, p, sizeof p);
     if (r) return r;
@@ -1053,7 +1050,6 @@ static uint32_t delete_recursive(const char *path) {
 
 static uint32_t open_directory(uint64_t *out, const char *path, int mode) {
     if (romfs_owns(path)) rt_fatal("fs: OpenDirectory on the RomFS (%s) is not implemented", path);
-    if (aoc_owns(path)) rt_fatal("fs: OpenDirectory on add-on content (%s) is not implemented", path);
     char p[PATH_CAP];
     uint32_t r = host_path(path, p, sizeof p);
     if (r) return r;
@@ -1095,6 +1091,20 @@ static uint32_t read_directory(int64_t *count, DirectoryEntry *out, uint64_t h, 
     return 0;
 }
 
+// Result GetDirectoryEntryCount(int64_t *count, DirectoryHandle): the entries the open mode lists, read or not
+static uint32_t directory_entry_count(int64_t *count, uint64_t h) {
+    if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !count) return FS_R_INVALID_ARGUMENT;
+    Dir *d = &dirs[h - DIR_BASE];
+    if (!d->used) return FS_R_INVALID_ARGUMENT;
+    int64_t n = 0;
+    for (int i = 0; i < d->n; i++) {
+        int is_dir = d->e[i].kind == PLAT_FS_DIR;
+        if (strlen(d->e[i].name) < 769 && (d->mode & (is_dir ? 1 : 2))) n++;
+    }
+    *count = n;
+    return 0;
+}
+
 static void close_directory(uint64_t h) {
     if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !dirs[h - DIR_BASE].used)
         rt_fatal("fs: close of invalid directory handle %#llx", (unsigned long long)h);
@@ -1130,16 +1140,10 @@ static void ov_close_directory(Cpu *c) { close_directory(arg_x(c, 0)); }
 static void ov_mount_save(Cpu *c) { ret_x(c, mount_save(arg_p(c, 0), arg_p(c, 1))); }
 static void ov_mount_save_ro(Cpu *c) { ret_x(c, mount_save_ro(arg_p(c, 0), arg_x(c, 1), arg_p(c, 2))); }
 static void ov_save_exists(Cpu *c) { ret_x(c, save_exists(arg_x(c, 0), arg_p(c, 1))); }
-// Result nn::fs::EnsureSaveData(const account::Uid &): the host save folder needs no creating ahead of the mount
-// (mount_save makes its working copy), so the local user's save "exists" already. Bananza calls it before mounting.
-static void ov_ensure_save(Cpu *c) {
-    ready();
-    ret_x(c, my_uid(arg_p(c, 0)) ? 0 : FS_R_TARGET_NOT_FOUND);
-}
 static void ov_mount_temp(Cpu *c) { ret_x(c, mount_temp(arg_p(c, 0))); }
 static void ov_unmount(Cpu *c) { unmount(arg_p(c, 0)); }
-static void ov_is_mounted(Cpu *c) { ret_x(c, is_mounted(arg_p(c, 0))); }
 static void ov_commit(Cpu *c) { ret_x(c, commit(arg_p(c, 0))); }
+static void ov_dir_count(Cpu *c) { ret_x(c, directory_entry_count(arg_p(c, 0), arg_x(c, 1))); }
 static void ov_create_cache(Cpu *c) { ret_x(c, create_cache(I32(0), I64(1), I64(2))); }
 static void ov_delete_cache(Cpu *c) { ret_x(c, delete_cache(I32(0))); }
 static void ov_mount_cache(Cpu *c) { ret_x(c, mount_cache(arg_p(c, 0), I32(1))); }
@@ -1182,7 +1186,6 @@ static void ov_set_priority(Cpu *c) { (void)c; }
 #define S_READ_CACHE_LIST "_ZN2nn2fs20ReadCacheStorageListEPiPNS0_16CacheStorageInfoENS0_22CacheStorageListHandleEi"
 #define S_CLOSE_CACHE_LIST "_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE"
 #define S_SET_PRIORITY "_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE"
-#define S_IS_MOUNTED "_ZN2nn2fs9IsMountedEPKc"
 // romfs.c
 #define S_MOUNT_ROM "_ZN2nn2fs8MountRomEPKcPvm"
 #define S_QUERY_CACHE "_ZN2nn2fs22QueryMountRomCacheSizeEPm"
@@ -1209,26 +1212,13 @@ HOST_OVERRIDE(S_CLOSE_DIRECTORY, ov_close_directory);
 HOST_OVERRIDE(S_MOUNT_SAVE, ov_mount_save);
 HOST_OVERRIDE(S_MOUNT_SAVE_RO, ov_mount_save_ro);
 HOST_OVERRIDE(S_SAVE_EXISTS, ov_save_exists);
-HOST_OVERRIDE("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", ov_ensure_save);
 HOST_OVERRIDE(S_MOUNT_TEMP, ov_mount_temp);
-// nn::Result MountAddOnContent(const char *mount, int addon_index): the packed add-on content next to the
-// executable, read-only, one at a time
-static void ov_mount_aoc(Cpu *c) { ret_x(c, aoc_mount(arg_p(c, 0), (uint32_t)(int32_t)arg_x(c, 1))); }
-// nn::Result UnmountAddOnContent(const char *mount)
-static void ov_unmount_aoc(Cpu *c) { ret_x(c, aoc_unmount(arg_p(c, 0))); }
-// nn::Result QueryMountAddOnContentCacheSize(u64 *out, s32 addon_index): no cache, the host reads the image. Both
-// the name and this argument list are what the run reported (sdk+0x3e8124, called from main+0x195c0dc); the earlier
-// guess that took a mount name was wrong, and it left the guest SDK asking fsp-srv for a service the host has none of.
-static void ov_query_aoc_cache(Cpu *c) {
-    uint64_t *out = arg_p(c, 0);
-    if (out) *out = 0;
-    ret_x(c, out ? 0 : FS_R_INVALID);
-}
-HOST_OVERRIDE("_ZN2nn2fs17MountAddOnContentEPKciPvm", ov_mount_aoc);
-HOST_OVERRIDE("_ZN2nn2fs19UnmountAddOnContentEPKc", ov_unmount_aoc);
-HOST_OVERRIDE("_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", ov_query_aoc_cache);
 HOST_OVERRIDE(S_UNMOUNT, ov_unmount);
 HOST_OVERRIDE(S_COMMIT, ov_commit);
+// CommitSaveData(name) is Commit(name) by another name; the SDK's calls its own Commit directly, past the GOT, and
+// that Commit does not know the host's save mount (2-6905, an abort leaving the practice for the menu)
+HOST_OVERRIDE("_ZN2nn2fs14CommitSaveDataEPKc", ov_commit);
+HOST_OVERRIDE("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", ov_dir_count);
 HOST_OVERRIDE(S_CREATE_CACHE, ov_create_cache);
 HOST_OVERRIDE(S_DELETE_CACHE, ov_delete_cache);
 HOST_OVERRIDE(S_MOUNT_CACHE, ov_mount_cache);
@@ -1236,575 +1226,5 @@ HOST_OVERRIDE(S_OPEN_CACHE_LIST, ov_open_cache_list);
 HOST_OVERRIDE(S_READ_CACHE_LIST, ov_read_cache_list);
 HOST_OVERRIDE(S_CLOSE_CACHE_LIST, ov_close_cache_list);
 HOST_OVERRIDE(S_SET_PRIORITY, ov_set_priority);
-HOST_OVERRIDE(S_IS_MOUNTED, ov_is_mounted);
-static void ov_fs_set_allocator(Cpu *c) { (void)c; }
-static void ov_fs_is_enabled_access_log(Cpu *c) { ret_x(c, 0); }
-HOST_OVERRIDE("_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE", ov_fs_set_allocator);
-HOST_OVERRIDE("_ZN2nn2fs6detail18IsEnabledAccessLogEj", ov_fs_is_enabled_access_log);
 
-// ---- --probe-fs
-// Every check calls the overrides the way guest code does: by synthetic address through rt_call, with AAPCS64
-// arguments in a Cpu, on this (probe) thread. Prints counts only, never RomFS paths.
-static const char *const probe_symbols[] = {
-    S_OPEN_FILE, S_FILE_SIZE, S_CLOSE_FILE, S_ENTRY_TYPE, S_READ_FILE, S_READ_OPTIONS, S_READ_EXACT, S_WRITE_FILE,
-    S_SET_FILE_SIZE, S_FLUSH_FILE, S_CREATE_FILE, S_DELETE_FILE, S_RENAME_FILE, S_CREATE_DIRECTORY, S_DELETE_RECURSIVE,
-    S_OPEN_DIRECTORY, S_READ_DIRECTORY, S_CLOSE_DIRECTORY, S_MOUNT_SAVE, S_MOUNT_SAVE_RO, S_SAVE_EXISTS, S_MOUNT_TEMP,
-    S_UNMOUNT, S_COMMIT, S_CREATE_CACHE, S_DELETE_CACHE, S_MOUNT_CACHE, S_OPEN_CACHE_LIST, S_READ_CACHE_LIST,
-    S_CLOSE_CACHE_LIST, S_SET_PRIORITY, S_MOUNT_ROM, S_QUERY_CACHE, S_INITIALIZE, S_IS_MOUNTED};
-#define NPROBE ((int)(sizeof probe_symbols / sizeof *probe_symbols))
-#define SAMPLES 64
-#define HEAD_BYTES (8u << 20)      // a sampled file is compared whole up to this size, else head and tail
-#define TAIL_BYTES (64u << 10)
 
-static uint64_t probe_addr[NPROBE];
-static Cpu *pcpu;
-static int failures, checks;
-#define CHECK(cond, ...) \
-    do { checks++; if (!(cond)) { failures++; printf("  FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
-
-static uint64_t U(const void *p) { return (uint64_t)(uintptr_t)p; }
-
-// The override registered for sym, called through its synthetic address with up to 6 arguments. Returns x0.
-static uint64_t fs_call(const char *sym, const uint64_t a[6]) {
-    for (int i = 0; i < NPROBE; i++)
-        if (!strcmp(probe_symbols[i], sym)) {
-            for (int r = 0; r < 19; r++) pcpu->x[r] = 0xdead0000 + r;   // caller-saved garbage
-            return rt_call(pcpu, probe_addr[i], 6, a[0], a[1], a[2], a[3], a[4], a[5]);
-        }
-    rt_fatal("probe-fs: %s is not a probed symbol", sym);
-}
-#define CALL(sym, ...) fs_call(sym, (const uint64_t[6]){__VA_ARGS__})
-#define RES(sym, ...) ((uint32_t)CALL(sym, __VA_ARGS__))
-
-static int64_t independent_read(PlatFile *f, uint8_t *buf, uint64_t n, uint64_t off) {
-    uint64_t done = 0;
-    while (done < n) {
-        int64_t r = host_read_at(f, buf + done, (uint32_t)(n - done), off + done);
-        if (r <= 0) return -1;
-        done += (uint64_t)r;
-    }
-    return (int64_t)done;
-}
-
-// Read [pos, pos+n) of the open RomFS handle h through one of the three ReadFile overloads, and compare it with an
-// independent read of romfs.bin at the index offset.
-static int compare_range(PlatFile *image, uint64_t h, uint64_t offset, uint64_t pos, uint64_t n, int variant,
-                         uint8_t *a, uint8_t *b) {
-    uint64_t got = ~0ull;
-    uint32_t r;
-    int32_t option = 0;
-    if (variant == 0) r = RES(S_READ_FILE, U(&got), h, pos, U(a), n);
-    else if (variant == 1) r = RES(S_READ_OPTIONS, U(&got), h, pos, U(a), n, U(&option));
-    else r = RES(S_READ_EXACT, h, pos, U(a), n), got = r ? ~0ull : n;
-    if (r || got != n) return 0;
-    if (independent_read(image, b, n, offset + pos) != (int64_t)n) return 0;
-    return !memcmp(a, b, n);
-}
-
-static void probe_paths(void) {
-    static const struct { const char *path, *want; } cases[] = {
-        {"rom:/a/b.bin", "a/b.bin"}, {"rom://a/b.bin", "a/b.bin"}, {"rom:///a/b.bin", "a/b.bin"},
-        {"rom:/a", "a"},             {"rom:/../main", NULL},       {"rom://../a", NULL},
-        {"rom:/a/../b", NULL},       {"rom:/a/./b", NULL},         {"rom:/a//b", NULL},
-        {"rom:/a\\b", NULL},         {"rom:/", NULL},              {"rom://", NULL},
-        {"rom:a", NULL},             {"ro:/a", NULL},              {"romx:/a", NULL},
-        {"rom:/.", NULL},            {"rom:/..", NULL},            {"ROM:/a", NULL},
-    };
-    int bad = 0;
-    for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
-        const char *got = romfs_path_relative("rom", cases[i].path);
-        if (cases[i].want ? !got || strcmp(got, cases[i].want) : got != NULL) {
-            bad++;
-            printf("  FAIL: romfs_path_relative(\"rom\", \"%s\") = %s%s%s\n", cases[i].path, got ? "\"" : "",
-                   got ? got : "NULL", got ? "\"" : "");
-        }
-    }
-    checks++;
-    failures += bad > 0;
-    CHECK(!romfs_path_relative(NULL, "rom:/a") && !romfs_path_relative("", ":/a") && !romfs_path_relative("rom", NULL),
-          "romfs_path_relative accepts an empty mount or path");
-    printf("paths: %u romfs_path.h normalisation cases: %s\n", (unsigned)(sizeof cases / sizeof *cases),
-           bad ? "FAIL" : "ok");
-}
-
-static uint64_t probe_romfs(void) {
-    uint64_t count = romfs_file_count(), cache = ~0ull;
-    CHECK(!CALL(S_IS_MOUNTED, U("rom")) && !CALL(S_IS_MOUNTED, 0) &&
-          !CALL(S_IS_MOUNTED, U("rom:")), "IsMounted rejects absent/invalid names");
-    CHECK(RES(S_QUERY_CACHE, U(&cache)) == 0 && cache == 0, "QueryMountRomCacheSize");
-    CHECK(RES(S_MOUNT_ROM, U("rom"), 0, 0) == 0, "MountRom(\"rom\")");
-    CHECK(CALL(S_IS_MOUNTED, U("rom")) == 1 && !CALL(S_IS_MOUNTED, U("romx")), "IsMounted RomFS exact name");
-    CHECK(RES(S_MOUNT_ROM, U("rom"), 0, 0) == 0, "MountRom(\"rom\") again");
-    CHECK(RES(S_MOUNT_ROM, U("../x"), 0, 0) == FS_R_INVALID, "MountRom with a bad name");
-    probe_paths();
-
-    PlatFile *image = plat_file_open(romfs_image_path());
-    if (!image) rt_fatal("probe-fs: cannot open the RomFS image");
-    uint8_t *a = malloc(HEAD_BYTES), *b = malloc(HEAD_BYTES);
-    need(a && b, "probe buffers");
-    uint64_t step = count / SAMPLES, bytes = 0, sampled = 0, deep = 0, high = 0, largest = 0, lsize = 0;
-    char path[4200], sample[4200] = "";
-    for (uint64_t i = 0, size; i < count; i++)
-        if (romfs_entry(i, NULL, &size) && size > lsize) largest = i, lsize = size;
-    for (uint64_t k = 0; k <= SAMPLES && step; k++) {   // k == SAMPLES: the largest file, beyond the 64
-        uint64_t i = k < SAMPLES ? k * step : largest, off, size, h = 0;
-        int64_t fsize = -1;
-        int type = -1;
-        const char *name = romfs_entry(i, &off, &size);
-        snprintf(path, sizeof path, "rom:/%s", name);
-        if (!*sample && strchr(name, '/') && size >= 256) snprintf(sample, sizeof sample, "%s", name);
-        int ok = RES(S_ENTRY_TYPE, U(&type), U(path)) == 0 && type == FS_ENTRY_FILE;
-        ok = ok && RES(S_OPEN_FILE, U(&h), U(path), FS_OPEN_READ) == 0 && romfs_handle(h);
-        ok = ok && RES(S_FILE_SIZE, U(&fsize), h) == 0 && (uint64_t)fsize == size;
-        uint64_t head = size < HEAD_BYTES ? size : HEAD_BYTES;
-        ok = ok && compare_range(image, h, off, 0, head, (int)(k % 3), a, b);
-        bytes += head;
-        if (size > HEAD_BYTES) {
-            uint64_t tail = size - TAIL_BYTES;
-            ok = ok && compare_range(image, h, off, tail, TAIL_BYTES, (int)((k + 1) % 3), a, b);
-            bytes += TAIL_BYTES;
-            deep += k < SAMPLES;
-        }
-        high += k < SAMPLES && off >= (1ull << 32);
-        uint64_t got = ~0ull;
-        ok = ok && RES(S_READ_FILE, U(&got), h, size, U(a), 1) == 0 && got == 0;          // at EOF: 0 bytes
-        ok = ok && RES(S_READ_FILE, U(&got), h, size + 1, U(a), 1) == FS_R_INVALID;      // past EOF
-        if (h) CALL(S_CLOSE_FILE, h);
-        CHECK(ok, "sampled RomFS file %llu (index row %llu)", (unsigned long long)k, (unsigned long long)i);
-        sampled += ok && k < SAMPLES;
-    }
-    printf("romfs: %llu of %d sampled files equal romfs.bin at their index offset (%llu at offsets past 4 GiB, %llu "
-           "over 8 MiB compared by head and tail, %.1f MiB compared), EOF reads ok\n", (unsigned long long)sampled,
-           SAMPLES, (unsigned long long)high, (unsigned long long)deep, bytes / 1048576.0);
-    printf("romfs: largest file (%.1f MiB): head and tail equal romfs.bin\n", lsize / 1048576.0);
-
-    // The same file under "rom:/", "rom://" and "rom:///"; its folder is a directory; traversal and writes refused.
-    uint64_t h = 0, off, size, got = 0;
-    int type = -1;
-    need(*sample, "no sampled file in a folder");
-    uint64_t si = 0;
-    while (strcmp(romfs_entry(si, &off, &size), sample)) si++;
-    int same = 1;
-    for (int slashes = 1; slashes <= 3; slashes++) {
-        snprintf(path, sizeof path, "rom:%.*s%s", slashes, "///", sample);
-        same &= RES(S_ENTRY_TYPE, U(&type), U(path)) == 0 && type == FS_ENTRY_FILE;
-        if (RES(S_OPEN_FILE, U(&h), U(path), FS_OPEN_READ)) {
-            same = 0;
-            continue;
-        }
-        same &= RES(S_READ_FILE, U(&got), h, 0, U(a), 256) == 0 && got == 256;
-        same &= independent_read(image, b, 256, off) == 256 && !memcmp(a, b, 256);
-        CALL(S_CLOSE_FILE, h);
-    }
-    CHECK(same, "rom:/, rom:// and rom:/// do not open the same file");
-    snprintf(path, sizeof path, "rom:/%.*s", (int)(strrchr(sample, '/') - sample), sample);
-    CHECK(RES(S_ENTRY_TYPE, U(&type), U(path)) == 0 && type == FS_ENTRY_DIRECTORY, "a sampled file's folder");
-    snprintf(path, sizeof path, "rom://../%s", sample);
-    CHECK(RES(S_OPEN_FILE, U(&h), U(path), FS_OPEN_READ) == FS_R_PATH_NOT_FOUND, "rom://../<file> opens");
-    snprintf(path, sizeof path, "rom:/%s.absent", sample);
-    CHECK(RES(S_OPEN_FILE, U(&h), U(path), FS_OPEN_READ) == FS_R_PATH_NOT_FOUND, "an absent file opens");
-    uint32_t traversal = RES(S_OPEN_FILE, U(&h), U("rom:/../main"), FS_OPEN_READ);
-    uint32_t write_open = RES(S_OPEN_FILE, U(&h), U("rom:/absent"), FS_OPEN_WRITE);
-    snprintf(path, sizeof path, "rom:/%s", sample);
-    uint32_t write_existing = RES(S_OPEN_FILE, U(&h), U(path), FS_OPEN_READ | FS_OPEN_WRITE);
-    printf("romfs: rom:/, rom://, rom:/// same file: %s; rom:/../main -> %#x; write open -> %#x, %#x\n",
-           same ? "ok" : "FAIL", traversal, write_open, write_existing);
-    CHECK(traversal == FS_R_PATH_NOT_FOUND, "rom:/../main -> %#x, expected 0x202", traversal);
-    CHECK(write_open == FS_R_UNSUPPORTED_OPEN && write_existing == FS_R_UNSUPPORTED_OPEN,
-          "write open -> %#x/%#x, expected 0x6402", write_open, write_existing);
-
-    // Overlays (TOTK_ROMFS_PATCHES, TOTK_ROMFS_MODS): served in place of the original, added files and their folders
-    // exist, bytes equal the overlay file.
-    size_t nov = romfs_overlay_count(), ovok = 0;
-    for (size_t k = 0; k < nov; k++) {
-        const char *file;
-        uint64_t osize;
-        int is_added;
-        const char *name = romfs_overlay(k, &file, &osize, &is_added);
-        snprintf(path, sizeof path, "rom:/%s", name);
-        int ok = RES(S_ENTRY_TYPE, U(&type), U(path)) == 0 && type == FS_ENTRY_FILE;
-        char *slash = strrchr(path, '/');
-        if (is_added && slash > path + 5) {
-            *slash = 0;
-            ok = ok && RES(S_ENTRY_TYPE, U(&type), U(path)) == 0 && type == FS_ENTRY_DIRECTORY;
-            *slash = '/';
-        }
-        int64_t fsize = -1;
-        uint64_t n = osize < HEAD_BYTES ? osize : HEAD_BYTES;
-        ok = ok && RES(S_OPEN_FILE, U(&h), U(path), FS_OPEN_READ) == 0;
-        if (ok) {
-            ok = RES(S_FILE_SIZE, U(&fsize), h) == 0 && (uint64_t)fsize == osize &&
-                 RES(S_READ_FILE, U(&got), h, 0, U(a), n) == 0 && got == n;
-            CALL(S_CLOSE_FILE, h);
-        }
-        PlatFile *of = plat_file_open(file);
-        ok = ok && of && independent_read(of, b, n, 0) == (int64_t)n && !memcmp(a, b, n);
-        if (of) plat_file_close(of);
-        CHECK(ok, "overlay %zu (%s)", k, is_added ? "added" : "replacement");
-        ovok += ok;
-    }
-    if (nov) printf("romfs: %zu of %zu overlay files served from their overlay\n", ovok, nov);
-    plat_file_close(image);
-    free(a);
-    free(b);
-    return count;
-}
-
-// ---- save transactions: restarts, uncommitted and committed changes, a crash at every step of a Commit
-// The process dies here: the save mount goes without Unmount, and the next start runs save_recover and mounts again.
-static void probe_restart(const uint64_t *uid) {
-    plat_mutex_lock(&lock);
-    for (int i = 0; i < NMOUNTS; i++)
-        if (mounts[i].kind == M_SAVE) mounts[i].kind = M_FREE;
-    plat_mutex_unlock(&lock);
-    save_mounts = tx_crash_at = tx_dead = 0;
-    plat_xchg32(&save_dirty, 0);
-    save_recover();
-    CHECK(RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0, "MountSaveData after a restart");
-}
-
-// Commit through the override, then wait for its background thread, as the checks read the disk next.
-static uint32_t tx_commit(void) {
-    uint32_t r = RES(S_COMMIT, U("save"));
-    fs_save_flush();
-    return r;
-}
-
-#define TX_SIZE 4096
-static uint8_t tx_buf[TX_SIZE];
-
-// Fill a save file, created when absent, with byte g through the overrides.
-static int tx_write(const char *path, int g) {
-    uint64_t h = 0;
-    int32_t no_flush = 0;
-    memset(tx_buf, g, sizeof tx_buf);
-    uint32_t r = RES(S_CREATE_FILE, U(path), TX_SIZE);
-    if ((r && r != FS_R_ALREADY_EXISTS) || RES(S_OPEN_FILE, U(&h), U(path), FS_OPEN_WRITE)) return 0;
-    int ok = RES(S_WRITE_FILE, h, 0, U(tx_buf), TX_SIZE, U(&no_flush)) == 0;
-    CALL(S_CLOSE_FILE, h);
-    return ok;
-}
-
-static int tx_byte(int ok) {
-    for (int i = 1; ok && i < TX_SIZE; i++) ok = tx_buf[i] == tx_buf[0];
-    return ok ? tx_buf[0] : -2;
-}
-
-// The byte a save file is filled with, read through the overrides; -1 absent, -2 short or mixed.
-static int tx_read(const char *path) {
-    uint64_t h = 0, got = 0;
-    if (RES(S_OPEN_FILE, U(&h), U(path), FS_OPEN_READ)) return -1;
-    int ok = RES(S_READ_FILE, U(&got), h, 0, U(tx_buf), TX_SIZE) == 0 && got == TX_SIZE;
-    CALL(S_CLOSE_FILE, h);
-    return tx_byte(ok);
-}
-
-// The same, read from the committed save on disk.
-static int tx_read_committed(const char *name) {
-    char *p = join(save_root, name);
-    PlatFile *f = plat_file_open(p);
-    free(p);
-    if (!f) return -1;
-    int ok = independent_read(f, tx_buf, TX_SIZE, 0) == TX_SIZE;
-    plat_file_close(f);
-    return tx_byte(ok);
-}
-
-// Hard links of a file of the committed save on disk; 0 when absent.
-static int tx_links_committed(const char *name) {
-    char *p = join(save_root, name);
-    int links = plat_fs_links(p);
-    free(p);
-    return links;
-}
-
-static int count_dirs(const char *dir) {
-    Listing l;
-    list_dir(dir, &l);
-    int n = 0;
-    for (int i = 0; i < l.n; i++) n += l.e[i].kind == PLAT_FS_DIR && l.e[i].name[0] != '.';
-    listing_free(l.e, l.n);
-    return n;
-}
-
-static void probe_save_tx(const uint64_t *uid) {
-    const char *a = "save:/tx_a.sav", *b = "save:/tx_b.sav";
-    uint64_t h = 0;
-    CHECK(tx_write(a, 1) && tx_write(b, 1) && tx_commit() == 0 && tx_read_committed("tx_a.sav") == 1,
-          "Commit of generation 1");
-
-    // uncommitted changes: the game reads them; the committed save and the next start do not see them
-    CHECK(tx_write(a, 2) && tx_write("save:/tx_c.sav", 2), "uncommitted writes");
-    CHECK(tx_read(a) == 2 && tx_read("save:/tx_c.sav") == 2, "reads do not see the game's uncommitted writes");
-    CHECK(tx_read_committed("tx_a.sav") == 1 && tx_read_committed("tx_c.sav") == -1,
-          "an uncommitted write reached the committed save");
-    probe_restart(uid);
-    CHECK(tx_read(a) == 1 && tx_read("save:/tx_c.sav") == -1, "an uncommitted write survived a restart");
-
-    // committed changes survive a restart; an Unmount without Commit drops changes
-    CHECK(tx_write(a, 3) && tx_write(b, 3) && tx_commit() == 0, "Commit of generation 3");
-    probe_restart(uid);
-    CHECK(tx_read(a) == 3 && tx_read(b) == 3, "a commit lost in a restart");
-    CHECK(tx_write(a, 4), "write before Unmount");
-    CALL(S_UNMOUNT, U("save"));
-    CHECK(RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0 && tx_read(a) == 3, "Unmount without Commit kept the change");
-
-    // a crash at step k of a Commit, k = 1, 2, ... until a Commit completes: the next start sees all of the old
-    // generation or all of the new one
-    int committed = 3, gen = 4, steps = 0, olds = 0, news = 0, mixed = 0;
-    for (int k = 1; k < 64; k++) {
-        int next = ++gen, ok = tx_write(a, next) && tx_write(b, next);
-        tx_crash_at = k;
-        uint32_t r = tx_commit();
-        int died = tx_dead;
-        tx_crash_at = 0;
-        if (!died) {
-            steps = k - 1;
-            CHECK(ok && r == 0 && tx_read_committed("tx_a.sav") == next && tx_read_committed("tx_b.sav") == next,
-                  "Commit after the crash points");
-            committed = next;
-            break;
-        }
-        probe_restart(uid);
-        int va = tx_read(a), vb = tx_read(b);
-        if (va == committed && vb == committed) olds++;
-        else if (va == next && vb == next) news++, committed = next;
-        else mixed++;
-        CHECK(ok && (va == vb) && (va == committed), "crash at commit step %d: tx_a %d, tx_b %d (old %d, new %d)", k,
-              va, vb, committed, next);
-        CHECK(!exists(new_root) && !exists(old_root) && !*ready_root, "crash at commit step %d: staging left after "
-              "recovery", k);
-    }
-    CHECK(steps >= 4 && olds && news && !mixed, "crash points: %d (%d old, %d new, %d mixed)", steps, olds, news,
-          mixed);
-    int backups = count_dirs(backup_root);
-    CHECK(backups == SAVE_BACKUPS, "save-backup holds %d saves", backups);
-
-    // a Commit writes the changed file and links the unchanged one to the committed save it replaces
-    int kept = committed;
-    CHECK(tx_write(a, ++gen) && tx_commit() == 0 && tx_read_committed("tx_a.sav") == gen &&
-          tx_read_committed("tx_b.sav") == kept && tx_links_committed("tx_b.sav") >= 2 &&
-          tx_links_committed("tx_a.sav") == 1, "Commit of one changed file: tx_a %d links, tx_b %d links",
-          tx_links_committed("tx_a.sav"), tx_links_committed("tx_b.sav"));
-    committed = gen;
-
-    // a Commit that changed no byte (the game rewrites its files at start) makes no new save and no backup
-    static char backups_before[64][48], backups_after[64][48];
-    int nbefore = backup_names(backups_before);
-    CHECK(tx_write(a, committed) && tx_commit() == 0 && tx_read_committed("tx_a.sav") == committed &&
-          backup_names(backups_after) == nbefore && !memcmp(backups_before, backups_after, sizeof backups_before),
-          "a Commit of unchanged bytes made a backup");
-
-    // the background commit: a write right after Commit waits for it and stays out of it; an Unmount right after
-    // Commit waits for it and keeps it
-    int queued = ++gen;
-    CHECK(tx_write(a, queued) && RES(S_COMMIT, U("save")) == 0 && tx_write(a, ++gen) && tx_read(a) == gen &&
-          tx_read_committed("tx_a.sav") == queued, "a write right after Commit: committed tx_a %d, expected %d",
-          tx_read_committed("tx_a.sav"), queued);
-    CHECK(RES(S_COMMIT, U("save")) == 0, "Commit before Unmount");
-    CALL(S_UNMOUNT, U("save"));
-    CHECK(tx_read_committed("tx_a.sav") == gen && RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0 && tx_read(a) == gen,
-          "an Unmount right after Commit lost it");
-    committed = gen;
-
-    // a file of the committed save held open by another program (a virus scanner, Explorer's preview, a sync tool):
-    // Windows refuses to rename a directory with an open file under it, so the committed save cannot be swapped out.
-    // The game and a restart still see every Commit, and the first start after the file is closed swaps them in.
-    char *held_path = join(save_root, "tx_b.sav");
-    PlatFile *held = plat_fs_open(held_path, 0, NULL);
-    free(held_path);
-    int pending = ++gen;
-    CHECK(held && tx_write(a, pending) && tx_commit() == 0, "Commit with a committed file held open");
-    probe_restart(uid);
-    CHECK(tx_read(a) == pending, "a Commit made while a committed file was held open, after a restart: tx_a %d, "
-          "expected %d", tx_read(a), pending);
-    pending = ++gen;
-    CHECK(tx_write(a, pending) && tx_commit() == 0 && tx_read(a) == pending, "a second Commit while held open");
-    if (held) plat_file_close(held);
-    probe_restart(uid);
-    CHECK(tx_read(a) == pending && tx_read_committed("tx_a.sav") == pending && tx_read_committed("tx_b.sav") == kept,
-          "the held-open Commits after the file was closed and a restart: tx_a %d, on disk %d, expected %d",
-          tx_read(a), tx_read_committed("tx_a.sav"), pending);
-    committed = pending;
-
-    // the read-only mount shows the committed save and refuses changes
-    CHECK(tx_write(a, 99) && RES(S_MOUNT_SAVE_RO, U("ro"), TOTK_APPLICATION_ID, U(uid)) == 0 &&
-          tx_read("ro:/tx_a.sav") == committed && RES(S_OPEN_FILE, U(&h), U("ro:/tx_a.sav"), FS_OPEN_WRITE) ==
-          FS_R_UNSUPPORTED_OPEN && RES(S_CREATE_FILE, U("ro:/x"), 0) == FS_R_UNSUPPORTED_OPEN &&
-          RES(S_RENAME_FILE, U("save:/tx_a.sav"), U("ro:/y")) == FS_R_INVALID_PATH, "MountSaveDataReadOnly");
-    CALL(S_UNMOUNT, U("ro"));
-    CHECK(RES(S_DELETE_FILE, U(a)) == 0 && RES(S_DELETE_FILE, U(b)) == 0 && tx_commit() == 0 &&
-          tx_read_committed("tx_a.sav") == -1, "Commit of deletions");
-    printf("save tx: uncommitted writes visible to the game and dropped by a restart and by Unmount, commits kept; a "
-           "crash at each of %d commit steps recovers to the old save %d times, the new one %d times, mixed %d "
-           "times; %d backups\n", steps, olds, news, mixed, backups);
-}
-
-static void probe_storage(void) {
-    char tmp[PLAT_PATH_MAX * 3], dir[PLAT_PATH_MAX * 3 + 64];
-    need(plat_temp_dir(tmp, sizeof tmp), "temporary directory");
-    snprintf(dir, sizeof dir, "%s/totk-probe-fs-%u", tmp, plat_process_id());
-    remove_tree(dir);
-    fs_host_set_profile(dir);
-    uint64_t uid[2], other[2], h = 0, h2 = 0, d = 0, l = 0;
-    account_uid(uid);
-    other[0] = uid[0] ^ 1, other[1] = uid[1];
-    static uint8_t data[65536], back[65536];
-    for (unsigned i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 7 + (i >> 8));
-    int32_t no_flush = 0, flush = 1;
-    int64_t size = -1, count = -1;
-    uint64_t got = 0;
-    int type = -1;
-
-    CHECK(RES(S_MOUNT_SAVE, U("save"), U(other)) == FS_R_TARGET_NOT_FOUND, "MountSaveData for another user");
-    CHECK(RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0, "MountSaveData");
-    CHECK(RES(S_MOUNT_SAVE, U("save"), U(uid)) == FS_R_ALREADY_EXISTS, "MountSaveData twice");
-    CHECK((CALL(S_SAVE_EXISTS, TOTK_APPLICATION_ID, U(uid)) & 0xff) == 1 &&
-          (CALL(S_SAVE_EXISTS, TOTK_APPLICATION_ID + 0x1000, U(uid)) & 0xff) == 0, "IsSaveDataExisting");
-    CHECK(RES(S_MOUNT_SAVE_RO, U("other"), TOTK_APPLICATION_ID + 0x1000, U(uid)) == FS_R_TARGET_NOT_FOUND,
-          "MountSaveDataReadOnly of another title");
-    CHECK(!fs_save_busy(), "idle at start");
-
-    // create, write, commit
-    CHECK(RES(S_CREATE_FILE, U("save:/probe.sav"), 0) == 0 && fs_save_busy(), "CreateFile");
-    CHECK(RES(S_CREATE_FILE, U("save:/probe.sav"), 0) == FS_R_ALREADY_EXISTS, "CreateFile twice");
-    CHECK(RES(S_OPEN_FILE, U(&h), U("save:/probe.sav"), FS_OPEN_WRITE) == 0, "OpenFile for writing");
-    CHECK(RES(S_WRITE_FILE, h, 0, U(data), 16, U(&no_flush)) == FS_R_APPEND_REQUIRED, "a growing write without append");
-    CALL(S_CLOSE_FILE, h);
-    CHECK(RES(S_OPEN_FILE, U(&h), U("save:/probe.sav"), FS_OPEN_WRITE | FS_OPEN_APPEND) == 0, "OpenFile for append");
-    CHECK(RES(S_WRITE_FILE, h, 0, U(data), sizeof data / 2, U(&no_flush)) == 0 &&
-          RES(S_WRITE_FILE, h, sizeof data / 2, U(data + sizeof data / 2), sizeof data / 2, U(&flush)) == 0,
-          "WriteFile");
-    CHECK(RES(S_FILE_SIZE, U(&size), h) == 0 && size == sizeof data, "GetFileSize after writing");
-    CHECK(RES(S_READ_FILE, U(&got), h, 0, U(back), 16) == FS_R_OPEN_MODE, "ReadFile on a write-only handle");
-    CHECK(RES(S_FLUSH_FILE, h) == 0, "FlushFile");
-    CHECK(fs_save_busy(), "a save file open for writing does not count as a save in progress");
-    CALL(S_CLOSE_FILE, h);
-    CHECK(fs_save_busy(), "closed but uncommitted save data does not count as a save in progress");
-    CHECK(tx_commit() == 0 && !fs_save_busy(), "Commit");
-    CHECK(RES(S_COMMIT, U("nomount")) == FS_R_PATH_NOT_FOUND, "Commit of an unknown mount");
-
-    // paths
-    CHECK(RES(S_CREATE_FILE, U("save:/../x"), 0) == FS_R_INVALID_PATH, "save:/../x");
-    CHECK(RES(S_CREATE_FILE, U("save:/a\\b"), 0) == FS_R_INVALID_PATH, "save:/a\\b");
-    CHECK(RES(S_CREATE_FILE, U("save:/a:b"), 0) == FS_R_INVALID_PATH, "save:/a:b");
-    CHECK(RES(S_CREATE_FILE, U("save:/a."), 0) == FS_R_INVALID_PATH, "save:/a.");
-    CHECK(RES(S_CREATE_FILE, U("nomount:/x"), 0) == FS_R_PATH_NOT_FOUND, "a path on no mount");
-
-    // directories
-    CHECK(RES(S_CREATE_DIRECTORY, U("save:/dir")) == 0 && RES(S_CREATE_FILE, U("save:/dir/inner.bin"), 8) == 0,
-          "CreateDirectory");
-    CHECK(RES(S_ENTRY_TYPE, U(&type), U("save:/dir")) == 0 && type == FS_ENTRY_DIRECTORY, "GetEntryType (directory)");
-    static DirectoryEntry ents[8];
-    CHECK(RES(S_OPEN_DIRECTORY, U(&d), U("save:/"), 3) == 0, "OpenDirectory");
-    CHECK(RES(S_READ_DIRECTORY, U(&count), U(ents), d, 8) == 0 && count == 2, "ReadDirectory count %lld",
-          (long long)count);
-    int seen = 0;
-    for (int i = 0; i < count && i < 8; i++) {
-        if (!strcmp(ents[i].name, "dir") && ents[i].type == FS_ENTRY_DIRECTORY) seen |= 1;
-        if (!strcmp(ents[i].name, "probe.sav") && ents[i].type == FS_ENTRY_FILE && ents[i].size == sizeof data)
-            seen |= 2;
-    }
-    CHECK(seen == 3, "ReadDirectory entries");
-    CHECK(RES(S_READ_DIRECTORY, U(&count), U(ents), d, 8) == 0 && count == 0, "ReadDirectory at the end");
-    CALL(S_CLOSE_DIRECTORY, d);
-    CHECK(RES(S_OPEN_DIRECTORY, U(&d), U("save:/"), 2) == 0 && RES(S_READ_DIRECTORY, U(&count), U(ents), d, 8) == 0 &&
-          count == 1 && ents[0].type == FS_ENTRY_FILE, "ReadDirectory, files only");
-    CALL(S_CLOSE_DIRECTORY, d);
-
-    CHECK(tx_commit() == 0, "Commit of the directories");
-
-    // reopen after unmount: the bytes come back through the overrides and are on disk
-    CALL(S_UNMOUNT, U("save"));
-    CHECK(RES(S_OPEN_FILE, U(&h), U("save:/probe.sav"), FS_OPEN_READ) == FS_R_PATH_NOT_FOUND, "open after Unmount");
-    CHECK(RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0, "MountSaveData again");
-    CHECK(RES(S_OPEN_FILE, U(&h), U("save:/probe.sav"), FS_OPEN_READ) == 0, "reopen");
-    memset(back, 0, sizeof back);
-    CHECK(RES(S_FILE_SIZE, U(&size), h) == 0 && size == sizeof data &&
-          RES(S_READ_EXACT, h, 0, U(back), sizeof back) == 0 && !memcmp(back, data, sizeof data), "reopened bytes");
-    CHECK(RES(S_READ_FILE, U(&got), h, sizeof data - 10, U(back), 100) == 0 && got == 10, "short read at the end");
-    CHECK(RES(S_WRITE_FILE, h, 0, U(data), 1, U(&no_flush)) == FS_R_OPEN_MODE, "WriteFile on a read-only handle");
-    CALL(S_CLOSE_FILE, h);
-    char host[1200];
-    snprintf(host, sizeof host, "%s/save/%016llx%016llx/probe.sav", dir, (unsigned long long)uid[1],
-             (unsigned long long)uid[0]);
-    PlatFile *f = plat_file_open(host);
-    memset(back, 0, sizeof back);
-    CHECK(f && independent_read(f, back, sizeof back, 0) == sizeof back && !memcmp(back, data, sizeof data),
-          "the save file on disk");
-    if (f) plat_file_close(f);
-
-    // resize, rename, delete
-    CHECK(RES(S_OPEN_FILE, U(&h), U("save:/probe.sav"), FS_OPEN_READ | FS_OPEN_WRITE) == 0 &&
-          RES(S_SET_FILE_SIZE, h, 100) == 0 && RES(S_FILE_SIZE, U(&size), h) == 0 && size == 100, "SetFileSize");
-    CHECK(RES(S_OPEN_FILE, U(&h2), U("save:/probe.sav"), FS_OPEN_READ) == 0, "a second handle on one file");
-    CALL(S_CLOSE_FILE, h2);
-    CALL(S_CLOSE_FILE, h);
-    CHECK(RES(S_RENAME_FILE, U("save:/probe.sav"), U("save:/dir/inner.bin")) == FS_R_ALREADY_EXISTS,
-          "RenameFile over an existing file");
-    CHECK(RES(S_RENAME_FILE, U("save:/probe.sav"), U("save:/renamed.sav")) == 0 &&
-          RES(S_ENTRY_TYPE, U(&type), U("save:/renamed.sav")) == 0 && type == FS_ENTRY_FILE &&
-          RES(S_ENTRY_TYPE, U(&type), U("save:/probe.sav")) == FS_R_PATH_NOT_FOUND, "RenameFile");
-    CHECK(RES(S_DELETE_FILE, U("save:/renamed.sav")) == 0 &&
-          RES(S_DELETE_FILE, U("save:/renamed.sav")) == FS_R_PATH_NOT_FOUND, "DeleteFile");
-    CHECK(RES(S_DELETE_RECURSIVE, U("save:/dir")) == 0 &&
-          RES(S_ENTRY_TYPE, U(&type), U("save:/dir")) == FS_R_PATH_NOT_FOUND, "DeleteDirectoryRecursively");
-    CHECK(tx_commit() == 0 && !fs_save_busy(), "Commit after the changes");
-    probe_save_tx(uid);
-
-    // temporary and cache storage
-    CHECK(RES(S_MOUNT_TEMP, U("temp")) == 0 && RES(S_CREATE_FILE, U("temp:/t.bin"), 4) == 0 && !fs_save_busy(),
-          "temporary storage");
-    CHECK(RES(S_CREATE_CACHE, 3, 1 << 20, 1 << 20) == 0 && RES(S_CREATE_CACHE, 3, 1 << 20, 1 << 20) ==
-          FS_R_ALREADY_EXISTS, "CreateCacheStorage");
-    CHECK(RES(S_MOUNT_CACHE, U("cache"), 3) == 0 && RES(S_MOUNT_CACHE, U("cache9"), 9) == FS_R_TARGET_NOT_FOUND,
-          "MountCacheStorage");
-    CacheStorageInfo infos[4];
-    int ncache = -1;
-    CHECK(RES(S_OPEN_CACHE_LIST, U(&l)) == 0 && RES(S_READ_CACHE_LIST, U(&ncache), U(infos), l, 4) == 0 &&
-          ncache == 1 && infos[0].index == 3, "cache storage list");
-    CALL(S_CLOSE_CACHE_LIST, l);
-    CALL(S_SET_PRIORITY, 1);
-    CALL(S_UNMOUNT, U("cache"));
-    CHECK(CALL(S_IS_MOUNTED, U("temp")) == 1 && !CALL(S_IS_MOUNTED, U("cache")), "IsMounted host mounts");
-    CALL(S_UNMOUNT, U("temp"));
-    CHECK(!CALL(S_IS_MOUNTED, U("temp")), "IsMounted after unmount");
-    CHECK(RES(S_DELETE_CACHE, 3) == 0, "DeleteCacheStorage");
-    CALL(S_UNMOUNT, U("save"));
-
-    int removed = !remove_tree(dir) && !exists(dir);
-    CHECK(removed, "the temporary profile was not deleted");
-    printf("storage: save create/write/commit/reopen, directories, rename/delete, temporary and cache storage in a "
-           "temporary profile: %s; profile deleted: %s\n", failures ? "see FAIL lines" : "ok", removed ? "yes" : "no");
-}
-
-int probe_fs(void) {
-    fs_init();
-    for (int i = 0; i < NPROBE; i++) {
-        GuestFn fn = hostfn_override(probe_symbols[i]);
-        if (!fn) rt_fatal("probe-fs: no HOST_OVERRIDE for %s", probe_symbols[i]);
-        probe_addr[i] = hostfn_register(probe_symbols[i], fn);
-    }
-    printf("overrides: %d nn::fs overrides registered\n", NPROBE);
-    pcpu = plat_aligned_alloc(sizeof(Cpu), 64);
-    need(pcpu != NULL, "probe Cpu");
-    memset(pcpu, 0, sizeof *pcpu);
-    uint8_t *stack = mem_kernel_alloc(0x10000, 16);
-    pcpu->sp = (uint64_t)(uintptr_t)stack + 0x10000;
-    pcpu->excl_addr = ~0ull;
-    for (int r = 19; r < 30; r++) pcpu->x[r] = 0x1900 + r;
-    CALL(S_INITIALIZE, 0);   // nn::fs::InitializeForApplication: fs_init again, idempotent
-    uint64_t files = probe_romfs();
-    probe_storage();
-    int kept = 1;
-    for (int r = 19; r < 30; r++) kept &= pcpu->x[r] == 0x1900u + r;
-    CHECK(kept && pcpu->sp == (uint64_t)(uintptr_t)stack + 0x10000, "an override lost a callee-saved register");
-    mem_kernel_free(stack, 0x10000);
-    plat_aligned_free(pcpu);
-    if (failures) {
-        printf("probe-fs: FAILED (%d of %d checks)\n", failures, checks);
-        return 1;
-    }
-    printf("probe-fs: passed (%llu files, %d sampled)\n", (unsigned long long)files, SAMPLES);
-    return 0;
-}
