@@ -485,10 +485,10 @@ static void tab_screen(float scale) {
     if (mon_hz > 0) snprintf(mon_label, sizeof mon_label, "%s (%d Hz)", menu_text(UI_MENU_FPS_DISPLAY), mon_hz);
     else snprintf(mon_label, sizeof mon_label, "%s", menu_text(UI_MENU_FPS_DISPLAY));
 
-    static const char *const fps_vals[] = {"30", "40", "45", "60", "90", "120", "144", "240", "display", "unlimited"};
-    const char *fps_names[] = {"30", "40", "45", "60", "90", "120", "144", "240",
+    static const char *const fps_vals[] = {"30", "45", "60", "90", "120", "display", "unlimited"};
+    const char *fps_names[] = {"30", "45", "60", "90", "120",
                                mon_label, menu_text(UI_MENU_FPS_UNLIMITED)};
-    opt_choice_list("MTF_FPS_LIMIT", UI_MENU_FPS_LIMIT, fps_vals, fps_names, 10, UI_MENU_FPS_LIMIT_DESC);
+    opt_choice_list("MTF_FPS_LIMIT", UI_MENU_FPS_LIMIT, fps_vals, fps_names, 7, UI_MENU_FPS_LIMIT_DESC);
 
     const char *fg_cur = cfg_value("MTF_FRAMEGEN");
     bool fg_on = strcmp(fg_cur, "off") != 0;
