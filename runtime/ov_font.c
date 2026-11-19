@@ -127,7 +127,7 @@ static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
 static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int px) {
-    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.78f;
+    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.72f;
     GlyphBox box = {cx, cy, s, s};
     if (kind == PK_DPAD) {
         if (dev == INPUT_DEV_KEYBOARD) glyph_keycap(c, box, NULL, arg);
@@ -145,8 +145,8 @@ static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int px)
         case B_R: lbl = "E"; break;
         case B_ZL: lbl = "Z"; break;
         case B_ZR: lbl = "C"; break;
-        case B_PLUS: lbl = "Ent"; break;
-        case B_MINUS: lbl = "Bk"; break;
+        case B_PLUS: lbl = "ENT"; break;
+        case B_MINUS: lbl = "BK"; break;
         case B_LS: lbl = "WASD"; break;
         case B_RS: lbl = "Arr"; break;
         }
@@ -325,10 +325,10 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
-    h[6] = 2;                        // loX (extra left margin so outline doesn't touch '/')
+    h[6] = 4;                        // loX (symmetric left margin before icon)
     h[7] = (int16_t)(px * 86 / 100); // hiY (aligned with '+' / capital letters)
-    h[8] = (int16_t)(px + 8);        // dx (wider advance so outlines don't overlap '/' or text)
-    h[11] = (int16_t)(px + 8);       // advance
+    h[8] = (int16_t)(px + 10);       // dx (healthy symmetric spacing around '/' and '+')
+    h[11] = (int16_t)(px + 10);      // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
     h[16] = (int16_t)px;             // bpl (bytes per line)
