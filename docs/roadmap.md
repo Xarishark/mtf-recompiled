@@ -58,3 +58,26 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 
 - [x] Implement Tkinter local-build installer & launcher ([installer/mtf_setup.py](installer/mtf_setup.py)) + clean release packager ([tools/make_release.py](tools/make_release.py)).
 - [x] **Gate F8:** `python tools/make_release.py` produces a clean `2.79 MiB` release archive (`build/release/mtf-recomp-0.1.0-dev-src.zip`) with **0 content-guard violations** and zero game files.
+
+## F9 — Fork 1:1 (`0.1.0+6caba99`) Feature & Optimization Roadmap
+
+Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`).
+
+1. **FPS Alto (> 60 FPS) & Frame Generation**
+   - [ ] Implementar `frame_rate.c` (`REALTIME`, `FPS_LIMIT` > 60 / `display` / `unlimited`) substituindo stubs em `runtime/gfx_stubs.c` e localizar o frame step do MTF via `MTF_SCAN_DT`.
+   - [ ] Portar `FRAME_GEN` (`vk_framegen.c`, `fg_pace.h`, `fg_*_spv.h`) do `dkb-pc-recomp`.
+2. **Resoluções Maiores (> 4K / Supersampling), Ultrawide & Câmera/FOV**
+   - [ ] Remover limite de `2160` linhas / `100%` em `runtime/ov_resolution.c` (suportar `125|150|200%` e resoluções livres).
+   - [ ] Implementar `ULTRAWIDE`, `HUD_POSITION` (`edges|centered`) e `ASPECT_PATCH`.
+   - [ ] Implementar `FOV` (`res_fov_live()`), `WINDOW_MODE` (`windowed|borderless|fullscreen`) e `DEVICE_PROFILE`.
+3. **Anti-Aliasing, Upscaling & HDR Nativo**
+   - [ ] Portar `SMAA` (`vk_smaa.c` + `smaa_*_spv.h`).
+   - [ ] Portar `HDR_NATIVE` + `spirv_hdr_shoulder.c`.
+   - [ ] Expor `SHADOW_RES` e `SHADOW_SCALE` no menu in-game (`metas[]` em `runtime/cfg.c`).
+4. **Otimizações de CPU, GPU & Memória (Vulkan Backend)**
+   - [ ] Replay paralelo multi-thread (`REPLAY_THREADS`, `vk_spec.c`, `vk_exec_draw_helper.c`, `REC_BATCH`, `PREWARM_XLATE`).
+   - [ ] Gerenciamento de memória/VRAM (`vk_headroom.c`, `HEAP_LAZY`, `WB_ASYNC`, `WB_UNLOCKED`, `SPARSE_MIRROR_COPY`).
+   - [ ] Passes de robustez/otimização SPIR-V (`spirv_rewrite.c`, `spirv_lq_fold.cpp`, `spirv_nan_guard.c`, `spirv_screen_uv.c`).
+5. **Diagnóstico, Mods & Pipeline de Build**
+   - [ ] Portar `flight.c` (`FLIGHT`), `vk_crumbs.c`, `prof_win.c`/`perf.c`, `rdoc.c`, `mods_scan.h` (`ROMFS_MODS`/`ROMFS_PATCHES`), `MOUSE_CAMERA` e `RUMBLE_TRIGGERS`.
+   - [ ] Manter `tools/build_fork.py` + `tools/mtf_launcher.py` alinhados à build limpa do fork.
