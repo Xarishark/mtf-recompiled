@@ -245,7 +245,7 @@ static void render_button_bytes(int dev, int kind, int arg, int px, uint8_t *out
                 continue;
             }
             int idx = y * px + x;
-            float v = canvas.body[idx] * (1.0f - canvas.mark[idx] * 0.85f);
+            float v = canvas.body[idx] * (1.0f - canvas.mark[idx]);
             int iv = (int)(v * 255.0f + 0.5f);
             out[idx] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
         }
@@ -314,7 +314,7 @@ static void obs_acquire_glyph(Cpu *c) {
     uint64_t bits_addr = hdr + 0x28;
     int raw_px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
     if (raw_px < 16) raw_px = 24;
-    int px = (raw_px * 80 + 50) / 100;
+    int px = (raw_px * 82 + 50) / 100;
     if (px < 16) px = 16;
     if (px > GLYPH_CELL_MAX) px = GLYPH_CELL_MAX;
     int dev = active_icon_device();
@@ -325,10 +325,10 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
-    h[6] = 0;                        // loX (4px internal padding gives clean outline clearance)
+    h[6] = 2;                        // loX (extra left margin so outline doesn't touch '/')
     h[7] = (int16_t)(px * 86 / 100); // hiY (aligned with '+' / capital letters)
-    h[8] = (int16_t)(px + 4);        // dx (extra advance so outlines don't touch '/' or text)
-    h[11] = (int16_t)(px + 4);       // advance
+    h[8] = (int16_t)(px + 8);        // dx (wider advance so outlines don't overlap '/' or text)
+    h[11] = (int16_t)(px + 8);       // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
     h[16] = (int16_t)px;             // bpl (bytes per line)
