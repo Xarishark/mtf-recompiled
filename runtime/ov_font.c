@@ -127,7 +127,7 @@ static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
 static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int w, int h) {
-    float cx = w * 0.5f, cy = h * 0.5f, s = h * 0.66f;
+    float cx = w * 0.5f, cy = h * 0.5f, s = h * 0.56f;
     GlyphBox box = {cx, cy, s, s};
     if (kind == PK_DPAD) {
         if (dev == INPUT_DEV_KEYBOARD) glyph_keycap(c, box, NULL, arg);
@@ -314,7 +314,7 @@ static void obs_acquire_glyph(Cpu *c) {
     uint64_t bits_addr = hdr + 0x28;
     int raw_px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
     if (raw_px < 16) raw_px = 24;
-    int h_px = (raw_px * 82 + 50) / 100;
+    int h_px = raw_px;
     if (h_px < 16) h_px = 16;
     if (h_px > GLYPH_CELL_MAX - 10) h_px = GLYPH_CELL_MAX - 10;
     int w_px = h_px + 10;
@@ -326,8 +326,8 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + w_px * h_px);
-    h[6] = -6;                         // loX = -6 (exact 25px == 25px symmetry around '+' and '/')
-    h[7] = (int16_t)(h_px * 86 / 100); // hiY (aligned with '+' / capital letters)
+    h[6] = -10;                        // loX = -10 (keeps exact 25px==25px center at 1:1 raw_px)
+    h[7] = (int16_t)(h_px * 79 / 100); // hiY (keeps exact vertical center at 1:1 raw_px)
     h[8] = (int16_t)w_px;              // dx == width
     h[11] = (int16_t)w_px;             // advance == width
     h[14] = (int16_t)w_px;             // width
