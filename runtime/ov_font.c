@@ -273,6 +273,7 @@ void ov_font_tick(void) {
     int dev = active_icon_device();
     plat_mutex_lock(&g_glyph_lock);
     int dev_changed = (dev != g_last_tick_dev);
+    if (dev_changed) rt_log("font: icon device %d -> %d (tracked=%d)", g_last_tick_dev, dev, g_n_synth);
     g_last_tick_dev = dev;
     for (int i = 0; i < g_n_synth; i++) {
         SynthGlyph *g = &g_synth[i];

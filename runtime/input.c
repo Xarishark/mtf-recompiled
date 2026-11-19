@@ -439,8 +439,12 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
     prev_kb = kb;
     int kb_moved = new_kb != 0;
     for (int i = 0; i < 4; i++) kb_moved |= ka[i] > STICK_ACTIVE || ka[i] < -STICK_ACTIVE;
-    if (kb_moved) __atomic_store_n(&last_dev, INPUT_DEV_KEYBOARD, __ATOMIC_RELAXED);
-    else if (pad_moved) __atomic_store_n(&last_dev, dt, __ATOMIC_RELAXED);
+    int old_dev = __atomic_load_n(&last_dev, __ATOMIC_RELAXED);
+    int new_dev = kb_moved ? INPUT_DEV_KEYBOARD : (pad_moved ? dt : old_dev);
+    if (new_dev != old_dev) {
+        __atomic_store_n(&last_dev, new_dev, __ATOMIC_RELAXED);
+        rt_log("input: device %d -> %d (kb=%d pad=%d)", old_dev, new_dev, kb_moved, pad_moved);
+    }
     extern void ov_font_tick(void);
     ov_font_tick();
     b |= kb;
