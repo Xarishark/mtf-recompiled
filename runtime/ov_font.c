@@ -120,6 +120,10 @@ static int active_icon_device(void) {
     return input_last_device();
 }
 
+#define POOL_SLOTS 64
+#define SLOT_BYTES (64u + (size_t)GLYPH_CELL_MAX * GLYPH_CELL_MAX)
+static uint64_t g_pool_base;
+static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
 static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int px) {
@@ -218,50 +222,57 @@ static void obs_acquire_glyph(Cpu *c) {
         rt_original(c);
         return;
     }
-    // Let the engine allocate a genuine GlyphMap at the active scale using '@' (a wide square-ish glyph),
-    // then overwrite its pixel buffer with our button icon.
-    c->x[1] = '@';
-    rt_original(c);
-    uint64_t hdr = c->x[0];
-    if (!hdr || !mem_guest_readable(hdr, 48)) return;
-    int16_t *h = (int16_t *)(uintptr_t)hdr;
-    uint64_t bits_addr = *(const uint64_t *)(uintptr_t)hdr;
-    int w = h[14], ht = h[15], bpl = h[16];
-    if (!bits_addr || w <= 0 || ht <= 0 || bpl < w || w > GLYPH_CELL_MAX || ht > GLYPH_CELL_MAX ||
-        !mem_guest_readable(bits_addr, (size_t)bpl * (size_t)ht))
-        return;
-
     plat_mutex_lock(&g_glyph_lock);
     static int font_init;
     if (!font_init) {
         font_init = 1;
         glyph_font_set(menu_roboto_ttf());
     }
-    int px = w < ht ? w : ht;
+    if (!g_pool_base) {
+        g_pool_base = mem_host_alloc((uint64_t)POOL_SLOTS * SLOT_BYTES, 0x1000);
+        if (!g_pool_base) rt_fatal("font: out of memory for button glyph pool");
+    }
+    uint32_t slot = g_pool_next++ % POOL_SLOTS;
+    uint64_t hdr = g_pool_base + (uint64_t)slot * SLOT_BYTES;
+    uint64_t bits_addr = hdr + 64;
+    int px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
+    if (px < 16) px = 24;
+    if (px > GLYPH_CELL_MAX) px = GLYPH_CELL_MAX;
     static GlyphCanvas canvas;
     memset(&canvas, 0, sizeof canvas);
     canvas.size = px;
     draw_button_icon(&canvas, active_icon_device(), kind, arg, px);
     uint8_t *dst = (uint8_t *)(uintptr_t)bits_addr;
-    memset(dst, 0, (size_t)bpl * (size_t)ht);
-    int ox = (w - px) / 2, oy = (ht - px) / 2;
     for (int y = 0; y < px; y++) {
         for (int x = 0; x < px; x++) {
             int idx = y * GLYPH_CELL_MAX + x;
             float v = canvas.body[idx] * (1.0f - canvas.mark[idx] * 0.85f);
             int iv = (int)(v * 255.0f + 0.5f);
-            dst[(oy + y) * bpl + (ox + x)] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
+            dst[y * px + x] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
         }
     }
-    static int dbg_once;
-    if (!dbg_once++) {
-        rt_log("font: synthesized U+%04X into '@' GlyphMap (%dx%d bpl=%d mode=%d dev=%d)",
-               cp, w, ht, bpl, (int)h[19], active_icon_device());
-    }
+    memset((void *)(uintptr_t)hdr, 0, 64);
+    uint64_t *pbits = (uint64_t *)(uintptr_t)hdr;
+    uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
+    int16_t *h = (int16_t *)(uintptr_t)hdr;
+    *pbits = bits_addr;
+    *psize = (uint32_t)(px * px + 72);
+    h[6] = 0;                        // loX
+    h[7] = (int16_t)(px * 85 / 100); // hiY
+    h[8] = (int16_t)(px + 2);        // dx
+    h[11] = (int16_t)(px + 2);       // advance
+    h[14] = (int16_t)px;             // width
+    h[15] = (int16_t)px;             // height
+    h[16] = (int16_t)px;             // bpl (bytes per line)
+    h[18] = 8;                       // bitsPerPixel
+    h[19] = (int16_t)c->x[2];        // mode
     plat_mutex_unlock(&g_glyph_lock);
+    ret_x(c, hdr);
 }
 
 static void obs_release_glyph(Cpu *c) {
+    uint64_t ptr = c->x[1];
+    if (g_pool_base && ptr >= g_pool_base && ptr < g_pool_base + (uint64_t)POOL_SLOTS * SLOT_BYTES) return;
     rt_original(c);
 }
 
