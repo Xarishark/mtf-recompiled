@@ -208,6 +208,27 @@ void glyph_keycap(GlyphCanvas *c, GlyphBox b, const char *s, int dirs) {
     }
 }
 
+void glyph_keycap_sym(GlyphCanvas *c, GlyphBox b, int sym) {
+    float hh = b.s * 0.44f, hw = minf(b.w / 2, b.s * 0.54f);
+    fill(c, c->body, box(b.cx, b.cy, hw, hh, b.s * 0.12f));
+    float t = b.s * 0.055f;
+    if (sym == GLYPH_KEY_ENTER) {
+        // Crisp return arrow (↵): vertical stem on right, horizontal bar left, arrowhead pointing left
+        float x1 = b.cx + hw * 0.42f, x0 = b.cx - hw * 0.20f;
+        float y0 = b.cy - hh * 0.36f, y1 = b.cy + hh * 0.16f;
+        fill(c, c->mark, seg(x1, y0, x1, y1, t));
+        fill(c, c->mark, seg(x1, y1, x0, y1, t));
+        float ah = b.s * 0.16f;
+        fill(c, c->mark, tri(x0 - ah * 0.95f, y1, x0 + ah * 0.25f, y1 - ah * 0.85f, x0 + ah * 0.25f, y1 + ah * 0.85f));
+    } else if (sym == GLYPH_KEY_BACKSPACE) {
+        // Crisp left backspace arrow (←): horizontal shaft + bold left arrowhead
+        float x1 = b.cx + hw * 0.44f, x0 = b.cx - hw * 0.14f, y = b.cy;
+        fill(c, c->mark, seg(x1, y, x0, y, t));
+        float ah = b.s * 0.18f;
+        fill(c, c->mark, tri(x0 - ah * 0.95f, y, x0 + ah * 0.25f, y - ah * 0.85f, x0 + ah * 0.25f, y + ah * 0.85f));
+    }
+}
+
 void glyph_mouse(GlyphCanvas *c, GlyphBox b, int button) {
     float x = b.cx, y = b.cy, hw = b.s * 0.29f, hh = b.s * 0.45f, t = b.s * 0.05f, split = y - hh * 0.15f;
     Shape body = box(x, y, hw, hh, hw);

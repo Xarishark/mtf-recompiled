@@ -135,6 +135,12 @@ static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int w, 
         return;
     }
     if (dev == INPUT_DEV_KEYBOARD) {
+        if (arg == B_PLUS) { glyph_keycap_sym(c, box, GLYPH_KEY_ENTER); return; }
+        if (arg == B_MINUS) { glyph_keycap_sym(c, box, GLYPH_KEY_BACKSPACE); return; }
+        if (arg == B_LS || arg == B_RS) {
+            glyph_keycap(c, box, NULL, GLYPH_UP | GLYPH_DOWN | GLYPH_LEFT | GLYPH_RIGHT);
+            return;
+        }
         const char *lbl = "?";
         switch (arg) {
         case B_A: lbl = "K"; break;
@@ -145,10 +151,6 @@ static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int w, 
         case B_R: lbl = "E"; break;
         case B_ZL: lbl = "Z"; break;
         case B_ZR: lbl = "C"; break;
-        case B_PLUS: lbl = "ENT"; break;
-        case B_MINUS: lbl = "BK"; break;
-        case B_LS: lbl = "WASD"; break;
-        case B_RS: lbl = "Arr"; break;
         }
         glyph_keycap(c, box, lbl, 0);
         return;
@@ -215,7 +217,9 @@ static void obs_check_glyph(Cpu *c) {
     rt_original(c);
 }
 
-int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h, uint64_t *cached_atlas_off);
+#include <math.h>
+
+int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, const uint8_t *new_sdf, int w, int h, uint64_t *cached_atlas_off);
 
 #define MAX_SYNTH_GLYPHS 64
 typedef struct {
@@ -224,11 +228,12 @@ typedef struct {
     uint8_t *cur_bytes;
     uint64_t atlas_off;
     int miss_count;
+    int gpu_synced;
 } SynthGlyph;
 static SynthGlyph g_synth[MAX_SYNTH_GLYPHS];
 static int g_n_synth, g_last_tick_dev = -1;
 
-static void render_button_bytes(int dev, int kind, int arg, int w, int h, uint8_t *out) {
+static void render_button_bytes(int dev, int kind, int arg, int w, int h, uint8_t *out_alpha, uint8_t *out_sdf) {
     static int font_init;
     if (!font_init) {
         font_init = 1;
@@ -240,14 +245,53 @@ static void render_button_bytes(int dev, int kind, int arg, int w, int h, uint8_
     draw_button_icon(&canvas, dev, kind, arg, w, h);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
+            int idx = y * w + x;
             if (x < 2 || x >= w - 2 || y < 2 || y >= h - 2) {
-                out[y * w + x] = 0;
+                if (out_alpha) out_alpha[idx] = 0;
                 continue;
             }
+            if (out_alpha) {
+                float v = canvas.body[idx] * (1.0f - canvas.mark[idx]);
+                int iv = (int)(v * 255.0f + 0.5f);
+                out_alpha[idx] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
+            }
+        }
+    }
+    if (!out_sdf) return;
+    // Build a clean 8-bit SDF directly from separate body & mark layers:
+    // - Steep outer falloff (52/px) -> thin ~1.5px outer outline that never overlaps '/'
+    // - Inner mark blended to ~145 -> solid crisp dark symbol with zero inner SDF bloat
+    const int R = 6;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
             int idx = y * w + x;
-            float v = canvas.body[idx] * (1.0f - canvas.mark[idx]);
-            int iv = (int)(v * 255.0f + 0.5f);
-            out[idx] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
+            float ba = (x < 2 || x >= w - 2 || y < 2 || y >= h - 2) ? 0.0f : canvas.body[idx];
+            int inside = ba >= 0.5f;
+            int best_d2 = (R + 1) * (R + 1);
+            int y0 = y - R < 0 ? 0 : y - R, y1 = y + R >= h ? h - 1 : y + R;
+            int x0 = x - R < 0 ? 0 : x - R, x1 = x + R >= w ? w - 1 : x + R;
+            for (int ny = y0; ny <= y1; ny++) {
+                int dy = ny - y, dy2 = dy * dy;
+                if (dy2 >= best_d2) continue;
+                for (int nx = x0; nx <= x1; nx++) {
+                    float nba = (nx < 2 || nx >= w - 2 || ny < 2 || ny >= h - 2) ? 0.0f : canvas.body[ny * w + nx];
+                    if ((nba >= 0.5f) == inside) continue;
+                    int dx = nx - x, d2 = dx * dx + dy2;
+                    if (d2 < best_d2) best_d2 = d2;
+                }
+            }
+            float dist = sqrtf((float)best_d2) - 0.5f;
+            if (dist < 0.0f) dist = 0.0f;
+            float sdist = inside ? dist : -dist;
+            if (dist < 1.0f) sdist = (ba - 0.5f);
+            float body_sdf = 196.0f + sdist * (sdist >= 0.0f ? 30.0f : 52.0f);
+            if (body_sdf < 0.0f) body_sdf = 0.0f;
+            if (body_sdf > 255.0f) body_sdf = 255.0f;
+            float m = (x < 2 || x >= w - 2 || y < 2 || y >= h - 2) ? 0.0f : canvas.mark[idx];
+            float sdf = body_sdf;
+            if (m > 0.0f && body_sdf > 145.0f) sdf = body_sdf * (1.0f - m) + 145.0f * m;
+            int iv = (int)(sdf + 0.5f);
+            out_sdf[idx] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
         }
     }
 }
@@ -262,6 +306,7 @@ static void record_synth_glyph(uint32_t cp, int w, int h, int kind, int arg, int
             g_synth[i].dev = dev;
             g_synth[i].atlas_off = UINT64_MAX;
             g_synth[i].miss_count = 0;
+            g_synth[i].gpu_synced = 0;
             return;
         }
     }
@@ -269,7 +314,7 @@ static void record_synth_glyph(uint32_t cp, int w, int h, int kind, int arg, int
     uint8_t *buf = malloc(sz);
     if (!buf) return;
     memcpy(buf, bytes, sz);
-    g_synth[g_n_synth++] = (SynthGlyph){cp, w, h, kind, arg, dev, buf, UINT64_MAX, 0};
+    g_synth[g_n_synth++] = (SynthGlyph){cp, w, h, kind, arg, dev, buf, UINT64_MAX, 0, 0};
 }
 
 void ov_font_tick(void) {
@@ -281,15 +326,17 @@ void ov_font_tick(void) {
     g_last_tick_dev = dev;
     for (int i = 0; i < g_n_synth; i++) {
         SynthGlyph *g = &g_synth[i];
-        if (g->dev == dev) continue;
+        if (g->dev == dev && g->gpu_synced) continue;
         if (dev_changed) g->miss_count = 0;
-        if (g->miss_count >= 4) continue;
-        uint8_t new_bytes[GLYPH_CELL_MAX * GLYPH_CELL_MAX];
-        render_button_bytes(dev, g->kind, g->arg, g->w, g->h, new_bytes);
-        if (vk_patch_r8_atlas(g->cur_bytes, new_bytes, g->w, g->h, &g->atlas_off)) {
-            memcpy(g->cur_bytes, new_bytes, (size_t)g->w * (size_t)g->h);
+        if (g->miss_count >= 6) continue;
+        uint8_t new_alpha[GLYPH_CELL_MAX * GLYPH_CELL_MAX];
+        uint8_t new_sdf[GLYPH_CELL_MAX * GLYPH_CELL_MAX];
+        render_button_bytes(dev, g->kind, g->arg, g->w, g->h, new_alpha, new_sdf);
+        if (vk_patch_r8_atlas(g->cur_bytes, new_alpha, new_sdf, g->w, g->h, &g->atlas_off)) {
+            memcpy(g->cur_bytes, new_alpha, (size_t)g->w * (size_t)g->h);
             g->dev = dev;
             g->miss_count = 0;
+            g->gpu_synced = 1;
         } else {
             g->miss_count++;
         }
@@ -320,7 +367,7 @@ static void obs_acquire_glyph(Cpu *c) {
     int w_px = h_px + 10;
     int dev = active_icon_device();
     uint8_t *dst = (uint8_t *)(uintptr_t)bits_addr;
-    render_button_bytes(dev, kind, arg, w_px, h_px, dst);
+    render_button_bytes(dev, kind, arg, w_px, h_px, dst, NULL);
     record_synth_glyph(cp, w_px, h_px, kind, arg, dev, dst);
     memset((void *)(uintptr_t)hdr, 0, 0x28);
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);

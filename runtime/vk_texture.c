@@ -910,8 +910,9 @@ static void atlas_write(uint8_t *dst, uint32_t stride, const uint8_t *new_px, in
 
 // Patches a synthesized glyph in-place inside a mirrored linear R8 font atlas.
 // Guest memory writes trigger WriteWatch so make_fresh_snap re-uploads on the next draw.
-int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h, uint64_t *cached_atlas_off) {
+int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, const uint8_t *new_sdf, int w, int h, uint64_t *cached_atlas_off) {
     if (!old_px || !new_px || w <= 0 || h <= 0) return 0;
+    const uint8_t *gpu_px = new_sdf ? new_sdf : new_px;
     plat_mutex_lock(&r8_atlas_lock);
     if (cached_atlas_off && *cached_atlas_off != UINT64_MAX) {
         int ai = (int)(*cached_atlas_off >> 48);
@@ -927,7 +928,7 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h
                     for (int gi = 0; gi < n_r8_gpu_atlases; gi++) {
                         Tex *gt = r8_gpu_atlases[gi];
                         if (gt && gt->t.d.width == a->w && gt->t.d.height == a->h)
-                            queue_r8_patch(gt, px_x, px_y, w, h, new_px);
+                            queue_r8_patch(gt, px_x, px_y, w, h, gpu_px);
                     }
                     uint8_t *dirty_mem = a->mem;
                     uint64_t dirty_sz = (uint64_t)a->h * a->stride;
@@ -938,7 +939,7 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h
             } else {
                 uint32_t x = (uint32_t)(off % a->stride), y = (uint32_t)(off / a->stride);
                 if (x + (uint32_t)w <= a->w && y + (uint32_t)h <= a->h) {
-                    queue_r8_patch(a->tex, x, y, w, h, new_px);
+                    queue_r8_patch(a->tex, x, y, w, h, gpu_px);
                     plat_mutex_unlock(&r8_atlas_lock);
                     return 1;
                 }
@@ -982,10 +983,10 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h
                             for (int gi = 0; gi < n_r8_gpu_atlases; gi++) {
                                 Tex *gt = r8_gpu_atlases[gi];
                                 if (gt && gt->t.d.width == a->w && gt->t.d.height == a->h)
-                                    queue_r8_patch(gt, x, y, w, h, new_px);
+                                    queue_r8_patch(gt, x, y, w, h, gpu_px);
                             }
                         } else {
-                            queue_r8_patch(a->tex, x, y, w, h, new_px);
+                            queue_r8_patch(a->tex, x, y, w, h, gpu_px);
                         }
                     }
                 }
@@ -1839,36 +1840,6 @@ void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uin
 
 // WriteTexels: a mirrored texture gets the texels in its pool bytes (and in its image once the GPU owns it); every
 // other texture in its image.
-// Convert an 8-bit alpha glyph (0..255) into the 8-bit SDF expected by nn::font's GPU atlas (~196 at edge, +-20/px).
-static void alpha_to_sdf(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h) {
-    const int R = 10;
-    for (int y = 0; y < (int)h; y++) {
-        for (int x = 0; x < (int)w; x++) {
-            int inside = src[y * (int)w + x] >= 128;
-            int best_d2 = (R + 1) * (R + 1);
-            int y0 = y - R < 0 ? 0 : y - R, y1 = y + R >= (int)h ? (int)h - 1 : y + R;
-            int x0 = x - R < 0 ? 0 : x - R, x1 = x + R >= (int)w ? (int)w - 1 : x + R;
-            for (int ny = y0; ny <= y1; ny++) {
-                int dy = ny - y, dy2 = dy * dy;
-                if (dy2 >= best_d2) continue;
-                for (int nx = x0; nx <= x1; nx++) {
-                    if ((src[ny * (int)w + nx] >= 128) == inside) continue;
-                    int dx = nx - x, d2 = dx * dx + dy2;
-                    if (d2 < best_d2) best_d2 = d2;
-                }
-            }
-            float dist = sqrtf((float)best_d2) - 0.5f;
-            if (dist < 0.0f) dist = 0.0f;
-            float sdist = inside ? dist : -dist;
-            // Subpixel refinement right on the contour from AA alpha
-            float a = src[y * (int)w + x] / 255.0f;
-            if (dist < 1.0f) sdist = (a - 0.5f);
-            int v = (int)(196.0f + sdist * 20.0f + 0.5f);
-            dst[y * (int)w + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
-        }
-    }
-}
-
 static void apply_r8_patches(void) {
     plat_mutex_lock(&r8_atlas_lock);
     for (int i = 0; i < n_r8_patches; i++) {
@@ -1877,10 +1848,8 @@ static void apply_r8_patches(void) {
             NVNcopyRegion r = {(int)p.x, (int)p.y, 0, (int)p.w, (int)p.h, 1};
             Region g;
             if (region_of(&p.tex->t, NULL, &r, p.w, (uint64_t)p.w * p.h, &g)) {
-                uint8_t sdf[128 * 128];
-                alpha_to_sdf(p.px, sdf, p.w, p.h);
                 plat_mutex_unlock(&r8_atlas_lock);
-                image_texels(p.tex, &g, &r, sdf, 1);
+                image_texels(p.tex, &g, &r, p.px, 1);
                 plat_mutex_lock(&r8_atlas_lock);
             }
         }
