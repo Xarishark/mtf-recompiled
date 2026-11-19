@@ -64,6 +64,7 @@ static struct {
     // pacing (the present thread)
     uint64_t last_at, interval, frames, made_total;
     int logged_mult, auto_m;   // auto_m: MKW_FRAMEGEN=auto's factor now (mult_now)
+    double disp_acc;           // fractional accumulator for exact monitor refresh rate (e.g. 144 Hz = 2.4x)
 } F;
 
 static VkPipeline make_pipeline(VkCtx *c, const uint32_t *code, size_t size, const int *spec, int nspec) {
@@ -354,38 +355,34 @@ static int fits(int m) {
 
 static int vrr(void) { return cfg_bool("MTF_VRR"); }
 
-static int mult_now(void) {
+static int mult_now(int advance_acc) {
     const char *v = cfg_value("MTF_FRAMEGEN");
     if (!strcmp(v, "off") || turbo_speed() > 1 || ov_movie_playing()) return 0;
-    int m;
+    int m = 1;
     if (!strcmp(v, "unlimited")) {
-        m = VK_FG_MAX;
+        return VK_FG_MAX;
     } else if (!strcmp(v, "120")) {
         int iv = game_ticks(), n = frame_logic_hz();
         m = (120 * iv + n - 1) / n;
         double hz = vk_present_refresh_hz();
         int refresh_room = hz > 0 ? (int)(hz * iv / n + 0.03) : m;
         if (m > refresh_room) m = refresh_room;
-    } else if ((!strcmp(v, "monitor") || !strcmp(v, "auto")) && !vrr()) {
+    } else if (!strcmp(v, "monitor") || !strcmp(v, "auto")) {
         double hz = vk_present_refresh_hz();
         if (hz <= 0) m = 2;
         else if (hz <= 62.0) m = 1;
-        else m = (int)ceil(hz * game_ticks() / (double)frame_logic_hz() - 0.05);
-    } else if (!strcmp(v, "monitor") || !strcmp(v, "auto")) {   // a variable refresh screen shows any rate evenly: as many as fit in time
-        // The refreshes of the monitor that fit in one game frame, rounded down: rounded up a quarter early, a game
-        // frame of 46 ms at 60 Hz (2.76 refreshes) asked for 3x, made 2 frames where 1.76 fit, so the GPU made frames
-        // never shown (fg3-auto: 1.1 made per game frame), and it switched between 2x and 3x every few seconds. Kept
-        // within a band: up only 0.1 past the next whole number, down only 0.05 under its own.
-        double hz = vk_present_refresh_hz(), r = hz * (double)F.interval / 1e9;
-        if (hz <= 0) F.auto_m = 2;
-        else if (!F.auto_m || r < F.auto_m - 0.05) F.auto_m = (int)r;
-        else if (r >= F.auto_m + 1.1) F.auto_m = (int)(r - 0.1);
-        m = F.auto_m;
+        else if (advance_acc) {
+            double ratio = hz * game_ticks() / (double)frame_logic_hz();
+            F.disp_acc += ratio;
+            m = (int)floor(F.disp_acc + 1e-6);
+            if (m < 1) m = 1;
+            F.disp_acc -= m;
+        } else {
+            m = (int)round(hz * game_ticks() / (double)frame_logic_hz());
+        }
     } else {
         m = atoi(v);
     }
-    int room = vk_present_ahead_max();
-    if (m > room) m = room;
     if (m > VK_FG_MAX) m = VK_FG_MAX;
     return m < 1 ? 1 : m;
 }
@@ -396,7 +393,7 @@ int vk_fg_wanted(void) { return strcmp(cfg_value("MTF_FRAMEGEN"), "off") != 0; }
 int vk_fg_uneven(void) {
     const char *v = cfg_value("MTF_FRAMEGEN");
     if (!strcmp(v, "off") || !strcmp(v, "monitor") || !strcmp(v, "auto") || vrr() || !F.frames) return 0;
-    int m = mult_now();
+    int m = mult_now(0);
     return m >= 2 && !fits(m);
 }
 
@@ -461,11 +458,12 @@ int vk_fg_frame(VkImage src, int sw, int sh, const int crop[4], uint64_t at, VkI
         F.interval = F.interval ? (F.interval * 7 + d) / 8 : d;
     }
     F.last_at = at;
-    int m = mult_now();
-    if (m < 2) {   // off, or auto with no room between two refreshes: the caller presents the game's picture
+    int m = mult_now(1);
+    if (m < 2) {   // off, or monitor at 60 Hz: the caller presents the game's picture
         if (F.logged_mult >= 2) rt_log("vk: frame generation paused (%s)", ov_movie_playing() ? "a movie plays" : "off");
         F.logged_mult = m;
         F.have_prev = 0;
+        F.disp_acc = 0;
         return 0;
     }
     VkCtx *c = vk_ctx();
@@ -500,9 +498,15 @@ int vk_fg_frame(VkImage src, int sw, int sh, const int crop[4], uint64_t at, VkI
     if (dump) dump_write(F.fence[slot], n, *w, *h);
     // the step from the game's interval in whole vsync ticks (the average lags ~8 frames behind a change of rate;
     // under the turbo frame generation is off)
-    *step = (uint64_t)(game_ticks() * (1e9 / frame_logic_hz())) / (uint64_t)n;
+    const char *v = cfg_value("MTF_FRAMEGEN");
+    double hz = vk_present_refresh_hz();
+    if ((!strcmp(v, "monitor") || !strcmp(v, "auto")) && hz > 62.0)
+        *step = (uint64_t)(1e9 / hz);
+    else
+        *step = (uint64_t)(game_ticks() * (1e9 / frame_logic_hz())) / (uint64_t)n;
     F.frames++, F.made_total += (uint64_t)(n - 1);
-    if (m != F.logged_mult || F.frames % 1800 == 0) {   // ~1 min at 30 fps
+    int log_change = (!strcmp(v, "monitor") || !strcmp(v, "auto")) ? !F.logged_mult : (m != F.logged_mult);
+    if (log_change || F.frames % 1800 == 0) {   // ~1 min at 30 fps
         F.logged_mult = m;
         rt_log("vk: frame generation %dx: game frame every %.1f ms, %llu frames made over %llu game frames", m,
                F.interval / 1e6, (unsigned long long)F.made_total, (unsigned long long)F.frames);

@@ -63,7 +63,9 @@ static void present_main(void *arg) {
         int fw = 0, fh = 0;
         uint64_t step = 0;
         int nf = vk_fg_frame(j.image, j.w, j.h, j.has_crop ? j.crop : NULL, j.at, fo, &fw, &fh, &step);
-        for (int k = 0; k < nf; k++) vk_present_blit_ahead(fo[k], VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM, fw, fh, NULL);
+        int ahead = nf ? vk_present_ahead_max() : 0;
+        int batch = nf <= ahead ? nf : ahead;
+        for (int k = 0; k < batch; k++) vk_present_blit_ahead(fo[k], VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM, fw, fh, NULL);
         if (!nf) vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
@@ -79,6 +81,8 @@ static void present_main(void *arg) {
             wait_until(first + (uint64_t)(k - 1) * step);
             vk_present_flip();
             perf_flip();
+            if (k - 1 + batch < nf)
+                vk_present_blit_ahead(fo[k - 1 + batch], VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM, fw, fh, NULL);
         }
         uint64_t target = nf ? first + (uint64_t)(nf - 1) * step : j.at;
         wait_until(target);

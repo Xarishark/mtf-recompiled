@@ -323,14 +323,30 @@ bool opt_choice_list(const char *key, UiTextId label, const char *const *values,
         if (!strcmp(values[i], m->def)) def = i;
     RowView v = {cur >= 0 ? names[cur] : now, cur == def, true, note};
     int step = row(key, label, desc, v);
-    if (!step || n <= 0) return false;
-    int nv;
-    if (cur < 0) nv = 0;
-    else if (step == 2) nv = (cur + 1) % n;               // A / click: the next value, round to the first
-    else nv = cur + step < 0 ? 0 : cur + step >= n ? n - 1 : cur + step;   // left / right stop at the ends
-    if (nv == cur) return false;
-    apply(key, values[nv]);
-    return true;
+    char pop[96];
+    snprintf(pop, sizeof pop, "##drop_%s", key);
+    bool changed = false;
+    if (step == 2 && n > 1) {
+        ImGui::OpenPopup(pop);
+    } else if (step && step != 2 && n > 0) {
+        int nv = cur < 0 ? 0 : cur + step < 0 ? 0 : cur + step >= n ? n - 1 : cur + step;
+        if (nv != cur) { apply(key, values[nv]); changed = true; }
+    }
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, IM_COL32(28, 22, 14, 246));
+    ImGui::PushStyleColor(ImGuiCol_Border, kGold);
+    ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(160, 118, 42, 200));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(190, 145, 56, 220));
+    if (ImGui::BeginPopup(pop)) {
+        for (int i = 0; i < n; i++) {
+            if (ImGui::Selectable(names[i], i == cur)) {
+                if (i != cur) { apply(key, values[i]); changed = true; }
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleColor(4);
+    return changed;
 }
 
 bool opt_choice(const char *key, UiTextId label, const UiTextId *names, int n, UiTextId desc, const char *note) {
