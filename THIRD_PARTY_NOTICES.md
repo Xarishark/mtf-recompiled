@@ -27,6 +27,7 @@ Files that contain adapted code say so in their first lines.
 | AMD FidelityFX Super Resolution 1.0 (`ffx_a.h`, `ffx_fsr1.h`, unmodified; licence text in `runtime/shaders/ffx/LICENSE.txt`) | https://github.com/GPUOpen-Effects/FidelityFX-FSR @ `a21ffb8f6c13233ba336352bdff293894c706575`, Copyright (c) 2021 Advanced Micro Devices, Inc. | MIT | `runtime/shaders/ffx/`, `runtime/shaders/fsr_easu.comp`, `runtime/shaders/fsr_rcas.comp` (through `runtime/vk_fsr.c`) |
 | Roboto Medium | https://fonts.google.com/specimen/Roboto, Copyright 2011 Google Inc. | Apache-2.0 (`runtime/ui/fonts/LICENSE-Roboto.txt`) | `runtime/ui/fonts/Roboto-Medium.ttf`, embedded in the menu |
 | Optical-flow frame generation (`vk_framegen.c`, `fg_*_spv.h`) | Adapted from [mkw-recomp](https://github.com/adriadam10/mkw-recomp) (`runtime/gfx/vk/device/vk_framegen.c`), after [SkyboundTotk](https://github.com/NotRexed/SkyboundTotk) @ `a4495f9` | MIT | `runtime/vk_framegen.c`, `runtime/fg_{luma,flow,median,synth}_spv.h` |
+| SDF button icon renderer (`glyph_draw.c`, `glyph_draw.h`) | [mkw-recomp](https://github.com/adriadam10/mkw-recomp) (`runtime/ui/glyphs/glyph_draw.{c,h}`), after [SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp) | MIT | `runtime/glyph_draw.c`, `runtime/glyph_draw.h` |
 
 Design ideas taken without code: Savage Wind Recomp (https://github.com/Revivedx/SavageWindRecomp), for the recorder
 thread and the depth twins of `vk_exec_draw.c`.

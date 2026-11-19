@@ -138,7 +138,8 @@ static CfgMeta metas[] = {
     {"OPERATION_MODE", NULL, "docked|handheld", RESTART}, {"ASSUME_FOCUS", NULL, "0|1", LIVE},
     // Sound, Controls, Menu
     {"VOLUME", NULL, "0..100", LIVE}, {"AUDIO_CHANNELS", NULL, "auto|stereo|5.1", RESTART},
-    {"PAD_LAYOUT", NULL, "auto|positional", LIVE}, {"MOTION", NULL, "0|1", LIVE},
+    {"PAD_LAYOUT", NULL, "auto|positional", LIVE}, {"BUTTON_ICONS", "auto", "auto|nintendo|xbox|playstation|keyboard", LIVE},
+    {"MOTION", NULL, "0|1", LIVE},
     {"RUMBLE_STRENGTH", "100", "0..300", LIVE}, {"RUMBLE_CURVE", "1", "0.2..1.5", LIVE},
     {"STICK_DEADZONE", NULL, "0..50", LIVE},
     {"MENU_LANG", "", "en|pt-BR", LIVE},

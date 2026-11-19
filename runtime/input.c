@@ -70,6 +70,10 @@ static void keyboard_read(uint64_t *buttons, int32_t axes[4]) {
 int input_shake_held(void) { return window_in_front() && key(VK_SPACE); }
 
 // ---- gamepad (under lock)
+static int pad_dev_type = INPUT_DEV_XBOX;
+static int last_dev = INPUT_DEV_KEYBOARD;
+int input_last_device(void) { return __atomic_load_n(&last_dev, __ATOMIC_RELAXED); }
+
 static void open_pad(void) {
     if (pad && SDL_GamepadConnected(pad)) return;
     if (pad) {
@@ -83,7 +87,19 @@ static void open_pad(void) {
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
     if (ids && n > 0) {
         pad = SDL_OpenGamepad(ids[0]);
-        if (pad) rt_log("input: gamepad \"%s\"", SDL_GetGamepadName(pad));
+        if (pad) {
+            SDL_GamepadType gt = SDL_GetGamepadType(pad);
+            int dt = gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
+                             gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT ||
+                             gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR
+                         ? INPUT_DEV_NINTENDO
+                     : gt == SDL_GAMEPAD_TYPE_PS3 || gt == SDL_GAMEPAD_TYPE_PS4 || gt == SDL_GAMEPAD_TYPE_PS5
+                         ? INPUT_DEV_PLAYSTATION
+                         : INPUT_DEV_XBOX;
+            pad_dev_type = dt;
+            __atomic_store_n(&last_dev, dt, __ATOMIC_RELAXED);
+            rt_log("input: gamepad \"%s\"", SDL_GetGamepadName(pad));
+        }
     }
     SDL_free(ids);
 }
@@ -400,8 +416,20 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
     uint64_t b = pad_buttons;
     int32_t a[4];
     memcpy(a, pad_axes, sizeof a);
+    int dt = pad_dev_type;
     plat_mutex_unlock(&lock);
-    keyboard_read(&b, a);
+    int pad_moved = b != 0;
+    for (int i = 0; i < 4; i++) pad_moved |= a[i] > STICK_ACTIVE || a[i] < -STICK_ACTIVE;
+    uint64_t kb = 0;
+    int32_t ka[4] = {0};
+    keyboard_read(&kb, ka);
+    int kb_moved = kb != 0;
+    for (int i = 0; i < 4; i++) kb_moved |= ka[i] > STICK_ACTIVE || ka[i] < -STICK_ACTIVE;
+    if (pad_moved) __atomic_store_n(&last_dev, dt, __ATOMIC_RELAXED);
+    else if (kb_moved) __atomic_store_n(&last_dev, INPUT_DEV_KEYBOARD, __ATOMIC_RELAXED);
+    b |= kb;
+    for (int i = 0; i < 4; i++)
+        if (ka[i]) a[i] = ka[i];
     // the menu's combination, held by the player (not the script): an edge toggles the menu
     static int combo_was, held_off, was_open;
     int combo = (b & (BIT(B_PLUS) | BIT(B_MINUS))) == (BIT(B_PLUS) | BIT(B_MINUS));

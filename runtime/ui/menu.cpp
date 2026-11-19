@@ -51,6 +51,7 @@ extern const char rt_port_version[];
 static const unsigned char roboto_ttf[] = {
 #embed "fonts/Roboto-Medium.ttf"
 };
+extern "C" const unsigned char *menu_roboto_ttf(void) { return roboto_ttf; }
 #pragma clang diagnostic pop
 
 // ---- open state, any thread
@@ -563,6 +564,9 @@ static void tab_controls(float scale) {
     opt_begin("##controls", scale);
     static const UiTextId layout[] = {UI_MENU_PAD_LAYOUT_AUTO, UI_MENU_PAD_LAYOUT_POSITIONAL};
     opt_choice("MTF_PAD_LAYOUT", UI_MENU_PAD_LAYOUT, layout, 2, UI_MENU_PAD_LAYOUT_DESC);
+    static const UiTextId icons[] = {UI_MENU_BUTTON_ICONS_AUTO, UI_MENU_BUTTON_ICONS_NINTENDO, UI_MENU_BUTTON_ICONS_XBOX,
+                                     UI_MENU_BUTTON_ICONS_PS, UI_MENU_BUTTON_ICONS_KB};
+    opt_choice("MTF_BUTTON_ICONS", UI_MENU_BUTTON_ICONS, icons, 5, UI_MENU_BUTTON_ICONS_DESC);
     opt_toggle("MTF_MOTION", UI_MENU_MOTION, UI_MENU_MOTION_DESC);
     opt_slider("MTF_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 300, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");
     opt_slider("MTF_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");

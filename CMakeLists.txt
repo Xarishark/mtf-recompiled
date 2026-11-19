@@ -73,6 +73,7 @@ set(MTF_RUNTIME_SOURCES
     runtime/gfx_shader.c
     runtime/gfx_stubs.c
     runtime/gfx_window_win.c
+    runtime/glyph_draw.c
     runtime/hostfn.c
     runtime/input.c
     runtime/ipc.c
