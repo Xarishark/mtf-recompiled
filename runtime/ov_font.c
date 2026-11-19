@@ -263,6 +263,9 @@ static void obs_acquire_glyph(Cpu *c) {
     h[11] = (int16_t)(px + 2);       // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
+    h[16] = (int16_t)px;             // bpl (bytes per line)
+    h[18] = 8;                       // bitsPerPixel
+    h[19] = (int16_t)c->x[2];        // mode (8)
     plat_mutex_unlock(&g_glyph_lock);
     ret_x(c, hdr);
 }
