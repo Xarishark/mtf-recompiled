@@ -78,11 +78,13 @@ static void present_main(void *arg) {
         for (int k = 1; k < nf; k++) {
             wait_until(first + (uint64_t)(k - 1) * step);
             vk_present_flip();
+            perf_flip();
         }
         uint64_t target = nf ? first + (uint64_t)(nf - 1) * step : j.at;
         wait_until(target);
         uint64_t t1 = kern_now_ns();
         vk_present_flip();
+        perf_flip();
         // MTF_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
         if (rt_trace & RT_TRACE_PRESENT)

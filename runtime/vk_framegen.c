@@ -367,13 +367,10 @@ static int mult_now(void) {
         int refresh_room = hz > 0 ? (int)(hz * iv / n + 0.03) : m;
         if (m > refresh_room) m = refresh_room;
     } else if ((!strcmp(v, "monitor") || !strcmp(v, "auto")) && !vrr()) {
-        // the most frames that split the refreshes evenly; none (a 75 Hz screen: no game rate fits) shows the game's
-        // own frames. Within what the swapchain has room for.
-        int room = vk_present_ahead_max();
-        m = 1;
-        for (int k = VK_FG_MAX < room ? VK_FG_MAX : room; k >= 2 && m == 1; k--)
-            if (fits(k)) m = k;
-        return m;
+        double hz = vk_present_refresh_hz();
+        if (hz <= 0) m = 2;
+        else if (hz <= 62.0) m = 1;
+        else m = (int)ceil(hz * game_ticks() / (double)frame_logic_hz() - 0.05);
     } else if (!strcmp(v, "monitor") || !strcmp(v, "auto")) {   // a variable refresh screen shows any rate evenly: as many as fit in time
         // The refreshes of the monitor that fit in one game frame, rounded down: rounded up a quarter early, a game
         // frame of 46 ms at 60 Hz (2.76 refreshes) asked for 3x, made 2 frames where 1.76 fit, so the GPU made frames

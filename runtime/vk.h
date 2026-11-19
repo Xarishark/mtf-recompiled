@@ -172,8 +172,8 @@ int vk_contact_strength(void);   // percent, 0 = off
 void vk_contact_release(void);   // before the device goes away
 void vk_present_flip(void);
 
-// Frame generation (vk_framegen.c, MTF_FRAMEGEN=off|auto|2|3|4|120)
-#define VK_FG_MAX 4
+// Frame generation (vk_framegen.c, MTF_FRAMEGEN=off|120|monitor|unlimited)
+#define VK_FG_MAX 8
 int vk_fg_wanted(void);
 int vk_fg_frame(VkImage src, int sw, int sh, const int crop[4], uint64_t at, VkImage out[VK_FG_MAX], int *w, int *h,
                 uint64_t *step);

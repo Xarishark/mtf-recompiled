@@ -25,7 +25,7 @@
 #include "ui/menu.h"
 #include "vk.h"
 
-#define FRAMES 4
+#define FRAMES 8
 #define MAX_IMAGES 16
 #define VSYNC_NS 1000000000ull
 #define VSYNC_HZ gfx_vsync_hz()

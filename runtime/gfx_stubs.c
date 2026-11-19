@@ -147,16 +147,19 @@ static void scan_dt(uint64_t frame) {
            (unsigned long long)nrange, (unsigned long long)n60, (unsigned long long)n30, name);
 }
 
-// The per-thread time split (MTF_TRACE=sched); its overlay is not ported. Once a second the frame rate
-// goes to the window title and, with MTF_FPS_LOG=1, to the log.
+// The per-thread time split (MTF_TRACE=sched) and per-game-frame reset; display FPS & overlay frame times are updated
+// by perf_flip() on every shown frame (including synthesized Frame Generation frames).
 void perf_present(uint64_t frame) {
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     scan_dt(frame);
-    static uint64_t since, frames, last;
-    uint64_t now = kern_now_ns();
     perf_render_tid = plat_thread_id();
     if (__atomic_load_n(&perf_on, __ATOMIC_RELAXED) != perf_wanted())
         __atomic_store_n(&perf_on, perf_wanted(), __ATOMIC_RELAXED);   // MTF_TRACE=perf: on from the first present
+}
+
+void perf_flip(void) {
+    static uint64_t since, frames, shown, last;
+    uint64_t now = kern_now_ns();
     if (__atomic_load_n(&perf_overlay, __ATOMIC_RELAXED))              // the overlay's only cost while it is off
         perfmon_frame(now, last ? now - last : 0, perf_frame_ns,
                       (uint64_t)__atomic_exchange_n(&perf_frame_replay_ns, 0, __ATOMIC_RELAXED),
@@ -165,12 +168,13 @@ void perf_present(uint64_t frame) {
     last = now;
     if (!since) since = now;
     frames++;
+    shown++;
     if (now - since >= 1000000000ull) {
         double s = (now - since) / 1e9, fps = frames / s;
         gfx_window_fps(fps, 1000.0 / fps);
         static int log = -1;
         if (log < 0) log = cfg_bool("MTF_FPS_LOG");
-        if (log) rt_log("fps: %.1f (frame %llu)", fps, (unsigned long long)frame);
+        if (log) rt_log("fps: %.1f (frame %llu)", fps, (unsigned long long)shown);
         since = now, frames = 0;
     }
 }

@@ -30,6 +30,7 @@
 
 extern "C" {
 #include "cfg.h"
+int gfx_window_refresh_hz(void);
 #include "input.h"
 #include "platform/platform.h"
 #include "ui/menu.h"
@@ -479,14 +480,29 @@ static void tab_screen(float scale) {
     row_window_size();
     static const UiTextId present[] = {UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE};
     opt_choice("MTF_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC);
+    int mon_hz = gfx_window_refresh_hz();
+    char mon_label[48];
+    if (mon_hz > 0) snprintf(mon_label, sizeof mon_label, "%s (%d Hz)", menu_text(UI_MENU_FPS_DISPLAY), mon_hz);
+    else snprintf(mon_label, sizeof mon_label, "%s", menu_text(UI_MENU_FPS_DISPLAY));
+
     static const char *const fps_vals[] = {"30", "40", "45", "60", "90", "120", "144", "240", "display", "unlimited"};
     const char *fps_names[] = {"30", "40", "45", "60", "90", "120", "144", "240",
-                               menu_text(UI_MENU_FPS_DISPLAY), menu_text(UI_MENU_FPS_UNLIMITED)};
+                               mon_label, menu_text(UI_MENU_FPS_UNLIMITED)};
     opt_choice_list("MTF_FPS_LIMIT", UI_MENU_FPS_LIMIT, fps_vals, fps_names, 10, UI_MENU_FPS_LIMIT_DESC);
-    static const char *const fg_vals[] = {"off", "120", "monitor", "unlimited"};
-    const char *fg_names[] = {menu_text(UI_MENU_OFF), "120 FPS", menu_text(UI_MENU_FPS_DISPLAY),
-                              menu_text(UI_MENU_FPS_UNLIMITED)};
-    opt_choice_list("MTF_FRAMEGEN", UI_MENU_FRAMEGEN, fg_vals, fg_names, 4, UI_MENU_FRAMEGEN_DESC);
+
+    const char *fg_cur = cfg_value("MTF_FRAMEGEN");
+    bool fg_on = strcmp(fg_cur, "off") != 0;
+    static char fg_last[16] = "monitor";
+    if (fg_on) snprintf(fg_last, sizeof fg_last, "%s", !strcmp(fg_cur, "auto") ? "monitor" : fg_cur);
+    if (opt_toggle_text("##fg_enable", menu_text(UI_MENU_FRAMEGEN), menu_text(UI_MENU_FRAMEGEN_DESC), fg_on)) {
+        cfg_set("MTF_FRAMEGEN", fg_on ? "off" : fg_last);
+        opt_save_soon();
+    }
+    static const char *const fg_vals[] = {"120", "monitor", "unlimited"};
+    const char *fg_names[] = {"120 FPS", mon_label, menu_text(UI_MENU_FPS_UNLIMITED)};
+    if (!fg_on) opt_disable_next(UI_MENU_FRAMEGEN_FIRST);
+    opt_choice_list("MTF_FRAMEGEN", UI_MENU_FRAMEGEN_TARGET, fg_vals, fg_names, 3, UI_MENU_FRAMEGEN_DESC,
+                    fg_on ? (!strcmp(fg_cur, "auto") ? 1 : -1) : 1);
     row_gpu();
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("MTF_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
