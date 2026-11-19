@@ -319,7 +319,7 @@ static void obs_acquire_glyph(Cpu *c) {
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
     h[6] = 0;                        // loX
-    h[7] = (int16_t)(px * 82 / 100); // hiY (aligned with capital letter cap-height)
+    h[7] = (int16_t)(px * 72 / 100); // hiY (aligned with capital letter cap-height)
     h[8] = (int16_t)px;              // dx
     h[11] = (int16_t)px;             // advance
     h[14] = (int16_t)px;             // width

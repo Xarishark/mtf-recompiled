@@ -850,23 +850,23 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 #define UPLOAD_PART (32ull << 20)   // fits the staging pool (vk_staging takes up to half of its 64 MiB block)
 
 #define MAX_R8_ATLASES 8
-typedef struct { uint8_t *mem; uint32_t w, h, stride; } R8Atlas;
+typedef struct { Tex *tex; uint8_t *mem; uint32_t w, h, stride; } R8Atlas;
 static PlatMutex r8_atlas_lock = PLAT_MUTEX_INIT;
 static R8Atlas r8_atlases[MAX_R8_ATLASES];
 static int n_r8_atlases;
 
-static void register_r8_atlas(uint8_t *mem, uint32_t w, uint32_t h, uint32_t stride) {
-    if (!mem || !w || !h || stride < w) return;
+static void register_r8_atlas(Tex *tex, uint8_t *mem, uint32_t w, uint32_t h, uint32_t stride) {
+    if (!tex || !mem || !w || !h || stride < w) return;
     plat_mutex_lock(&r8_atlas_lock);
     for (int i = 0; i < n_r8_atlases; i++) {
         if (r8_atlases[i].mem == mem) {
-            r8_atlases[i].w = w; r8_atlases[i].h = h; r8_atlases[i].stride = stride;
+            r8_atlases[i].tex = tex; r8_atlases[i].w = w; r8_atlases[i].h = h; r8_atlases[i].stride = stride;
             plat_mutex_unlock(&r8_atlas_lock);
             return;
         }
     }
     int idx = n_r8_atlases < MAX_R8_ATLASES ? n_r8_atlases++ : (MAX_R8_ATLASES - 1);
-    r8_atlases[idx] = (R8Atlas){mem, w, h, stride};
+    r8_atlases[idx] = (R8Atlas){tex, mem, w, h, stride};
     plat_mutex_unlock(&r8_atlas_lock);
 }
 
@@ -896,7 +896,12 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h
             if (off + (uint64_t)(h - 1) * a->stride + (uint64_t)w <= (uint64_t)a->h * a->stride &&
                 atlas_match(a->mem + off, a->stride, old_px, w, h)) {
                 atlas_write(a->mem + off, a->stride, new_px, w, h);
+                Tex *dirty_tex = a->tex;
+                uint8_t *dirty_mem = a->mem;
+                uint64_t dirty_sz = (uint64_t)a->h * a->stride;
                 plat_mutex_unlock(&r8_atlas_lock);
+                vk_guest_written((uintptr_t)dirty_mem, dirty_sz);
+                if (dirty_tex) { lock(); dirty_tex->uploaded = 0; unlock(); }
                 return 1;
             }
         }
@@ -921,7 +926,12 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h
                         atlas_write(cand, a->stride, new_px, w, h);
                         if (cached_atlas_off)
                             *cached_atlas_off = ((uint64_t)ai << 48) | ((uint64_t)y * a->stride + x);
+                        Tex *dirty_tex = a->tex;
+                        uint8_t *dirty_mem = a->mem;
+                        uint64_t dirty_sz = (uint64_t)a->h * a->stride;
                         plat_mutex_unlock(&r8_atlas_lock);
+                        vk_guest_written((uintptr_t)dirty_mem, dirty_sz);
+                        if (dirty_tex) { lock(); dirty_tex->uploaded = 0; unlock(); }
                         return 1;
                     }
                 }
@@ -941,7 +951,7 @@ static void upload(Tex *e) {
     if (!bpb || !t->mem) return;
     uint64_t p0 = perf_begin(), u0 = kern_now_ns();
     if (bpb == 1 && e->pub.mirrored && nvn_tex_is_linear(d) && d->width >= 1024 && d->height >= 512)
-        register_r8_atlas((uint8_t *)t->mem, d->width, d->height, nvn_tex_linear_stride(d));
+        register_r8_atlas(e, (uint8_t *)t->mem, d->width, d->height, nvn_tex_linear_stride(d));
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;

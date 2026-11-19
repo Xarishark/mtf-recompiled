@@ -486,7 +486,9 @@ int input_rumble(float low, float high, uint32_t ms) {
 
 // ---- the game window's mouse: this port reads no mouse, so the window keeps the cursor
 int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
-    (void)h, (void)m, (void)w, (void)l, (void)res;
+    (void)h, (void)w, (void)l, (void)res;
+    if (m == WM_KEYDOWN || m == WM_SYSKEYDOWN || m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN)
+        __atomic_store_n(&last_dev, INPUT_DEV_KEYBOARD, __ATOMIC_RELAXED);
     return 0;
 }
 void input_cursor_suspend(int on) { (void)on; }
