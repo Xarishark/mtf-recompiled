@@ -326,9 +326,9 @@ void ov_font_tick(void) {
     g_last_tick_dev = dev;
     for (int i = 0; i < g_n_synth; i++) {
         SynthGlyph *g = &g_synth[i];
-        if (g->dev == dev && g->gpu_synced) continue;
+        if (g->dev == dev) continue;
         if (dev_changed) g->miss_count = 0;
-        if (g->miss_count >= 6) continue;
+        if (g->miss_count >= 4) continue;
         uint8_t new_alpha[GLYPH_CELL_MAX * GLYPH_CELL_MAX];
         uint8_t new_sdf[GLYPH_CELL_MAX * GLYPH_CELL_MAX];
         render_button_bytes(dev, g->kind, g->arg, g->w, g->h, new_alpha, new_sdf);

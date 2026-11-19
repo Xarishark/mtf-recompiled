@@ -595,7 +595,10 @@ static void dropped_check(const TexKey *k) {
     dropped[i].hash = 0;
 }
 
+static void unregister_r8_tex(Tex *e);
+
 static void destroy_tex(Tex *e) {
+    unregister_r8_tex(e);
     own_remove(e);
     tex_gen_bump(e->key.addr);
     nvn_hm_del(&by_key, &e->key);
@@ -862,6 +865,30 @@ static int n_r8_patches;
 static Tex *r8_gpu_atlases[4];
 static int n_r8_gpu_atlases;
 
+static void unregister_r8_tex(Tex *e) {
+    if (!e) return;
+    plat_mutex_lock(&r8_atlas_lock);
+    for (int i = 0; i < n_r8_atlases; i++) {
+        if (r8_atlases[i].tex == e) {
+            r8_atlases[i] = r8_atlases[--n_r8_atlases];
+            i--;
+        }
+    }
+    for (int i = 0; i < n_r8_gpu_atlases; i++) {
+        if (r8_gpu_atlases[i] == e) {
+            r8_gpu_atlases[i] = r8_gpu_atlases[--n_r8_gpu_atlases];
+            i--;
+        }
+    }
+    for (int i = 0; i < n_r8_patches; i++) {
+        if (r8_patches[i].tex == e) {
+            r8_patches[i] = r8_patches[--n_r8_patches];
+            i--;
+        }
+    }
+    plat_mutex_unlock(&r8_atlas_lock);
+}
+
 static void register_r8_gpu_atlas(Tex *tex) {
     if (!tex) return;
     plat_mutex_lock(&r8_atlas_lock);
@@ -923,17 +950,13 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, const uint8_
                 if (off + (uint64_t)(h - 1) * a->stride + (uint64_t)w <= (uint64_t)a->h * a->stride &&
                     atlas_match(a->mem + off, a->stride, old_px, w, h)) {
                     atlas_write(a->mem + off, a->stride, new_px, w, h);
-                    a->dirty = 1;
                     uint32_t px_x = (uint32_t)(off % a->stride), px_y = (uint32_t)(off / a->stride);
                     for (int gi = 0; gi < n_r8_gpu_atlases; gi++) {
                         Tex *gt = r8_gpu_atlases[gi];
-                        if (gt && gt->t.d.width == a->w && gt->t.d.height == a->h)
+                        if (gt && !gt->released && !gt->pub.gone && gt->t.d.width == a->w && gt->t.d.height == a->h)
                             queue_r8_patch(gt, px_x, px_y, w, h, gpu_px);
                     }
-                    uint8_t *dirty_mem = a->mem;
-                    uint64_t dirty_sz = (uint64_t)a->h * a->stride;
                     plat_mutex_unlock(&r8_atlas_lock);
-                    vk_guest_written((uintptr_t)dirty_mem, dirty_sz);
                     return 1;
                 }
             } else {
@@ -979,10 +1002,9 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, const uint8_
                         hits++;
                         if (a->linear) {
                             atlas_write(a->mem + (size_t)y * stride + x, stride, new_px, w, h);
-                            a->dirty = 1;
                             for (int gi = 0; gi < n_r8_gpu_atlases; gi++) {
                                 Tex *gt = r8_gpu_atlases[gi];
-                                if (gt && gt->t.d.width == a->w && gt->t.d.height == a->h)
+                                if (gt && !gt->released && !gt->pub.gone && gt->t.d.width == a->w && gt->t.d.height == a->h)
                                     queue_r8_patch(gt, x, y, w, h, gpu_px);
                             }
                         } else {
@@ -994,21 +1016,8 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, const uint8_
         }
         free(tmp);
     }
-    if (hits) {
-        for (int ai = 0; ai < n_r8_atlases; ai++) {
-            if (r8_atlases[ai].dirty) {
-                uint8_t *dirty_mem = r8_atlases[ai].mem;
-                uint64_t dirty_sz = (uint64_t)r8_atlases[ai].h * r8_atlases[ai].stride;
-                plat_mutex_unlock(&r8_atlas_lock);
-                vk_guest_written((uintptr_t)dirty_mem, dirty_sz);
-                return 1;
-            }
-        }
-        plat_mutex_unlock(&r8_atlas_lock);
-        return 1;
-    }
     plat_mutex_unlock(&r8_atlas_lock);
-    return 0;
+    return hits > 0;
 }
 
 // Copies the whole storage into the image (every level and layer the image has).
@@ -1019,9 +1028,8 @@ static void upload(Tex *e) {
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
     if (!bpb || !t->mem) return;
     uint64_t p0 = perf_begin(), u0 = kern_now_ns();
-    if (bpb == 1 && d->width >= 1024 && d->height >= 512) {
-        int lin = nvn_tex_is_linear(d);
-        register_r8_atlas(e, (uint8_t *)t->mem, d->width, d->height, lin ? nvn_tex_linear_stride(d) : d->width, lin);
+    if (bpb == 1 && e->pub.mirrored && nvn_tex_is_linear(d) && d->width == 8192 && d->height == 2048) {
+        register_r8_atlas(e, (uint8_t *)t->mem, d->width, d->height, nvn_tex_linear_stride(d), 1);
     }
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
@@ -1418,6 +1426,7 @@ void vk_texture_release(const tex_t *t) {
     lock();
     Tex *e = nvn_hm_get(&by_key, &k);
     if (e && !e->released) {
+        unregister_r8_tex(e);
         e->released = 1;
         e->rel_ms = coarse_ms;
         e->rel_seq = use_counter;
@@ -1551,7 +1560,7 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
         s->cepoch = 0;
     }
     Tex *e = s->ce;
-    if (e && !e->pub.mirrored && e->t.d.format == 1 && e->t.d.width >= 1024 && e->t.d.height >= 512)
+    if (e && !e->pub.mirrored && !e->pub.gone && !e->released && e->t.d.format == 1 && e->t.d.width == 8192 && e->t.d.height == 2048)
         register_r8_gpu_atlas(e);
     // Bindings of one submit share one check, answered from the submit's write-watch snapshot (guest writes during a
     // replay race the GPU read on hardware too). After one check an entry is either uploaded or never uploads (not
@@ -1588,17 +1597,6 @@ static void apply_r8_patches(void);
 void vk_texture_new_submit(void) {
     lock();
     if (!++submit_epoch) submit_epoch = 1;
-    plat_mutex_lock(&r8_atlas_lock);
-    for (int i = 0; i < n_r8_atlases; i++) {
-        if (r8_atlases[i].dirty && r8_atlases[i].tex && !r8_atlases[i].tex->released) {
-            r8_atlases[i].dirty = 0;
-            Tex *e = r8_atlases[i].tex;
-            plat_mutex_unlock(&r8_atlas_lock);
-            upload(e);
-            plat_mutex_lock(&r8_atlas_lock);
-        }
-    }
-    plat_mutex_unlock(&r8_atlas_lock);
     apply_r8_patches();
     coarse_ms = plat_now_ms();
     sweep_pressure();
@@ -1844,7 +1842,7 @@ static void apply_r8_patches(void) {
     plat_mutex_lock(&r8_atlas_lock);
     for (int i = 0; i < n_r8_patches; i++) {
         R8RectPatch p = r8_patches[i];
-        if (p.tex && !p.tex->released) {
+        if (p.tex && !p.tex->released && !p.tex->pub.gone && p.tex->pub.image) {
             NVNcopyRegion r = {(int)p.x, (int)p.y, 0, (int)p.w, (int)p.h, 1};
             Region g;
             if (region_of(&p.tex->t, NULL, &r, p.w, (uint64_t)p.w * p.h, &g)) {
