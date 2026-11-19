@@ -127,7 +127,7 @@ static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
 static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int px) {
-    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.86f;
+    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.68f;
     GlyphBox box = {cx, cy, s, s};
     if (kind == PK_DPAD) {
         if (dev == INPUT_DEV_KEYBOARD) glyph_keycap(c, box, NULL, arg);
@@ -215,6 +215,83 @@ static void obs_check_glyph(Cpu *c) {
     rt_original(c);
 }
 
+int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h, uint64_t *cached_atlas_off);
+
+#define MAX_SYNTH_GLYPHS 64
+typedef struct {
+    uint32_t cp;
+    int px, kind, arg, dev;
+    uint8_t *cur_bytes;
+    uint64_t atlas_off;
+    int miss_count;
+} SynthGlyph;
+static SynthGlyph g_synth[MAX_SYNTH_GLYPHS];
+static int g_n_synth, g_last_tick_dev = -1;
+
+static void render_button_bytes(int dev, int kind, int arg, int px, uint8_t *out) {
+    static int font_init;
+    if (!font_init) {
+        font_init = 1;
+        glyph_font_set(menu_roboto_ttf());
+    }
+    static GlyphCanvas canvas;
+    memset(&canvas, 0, sizeof canvas);
+    canvas.size = px;
+    draw_button_icon(&canvas, dev, kind, arg, px);
+    for (int y = 0; y < px; y++) {
+        for (int x = 0; x < px; x++) {
+            int idx = y * px + x;
+            float v = canvas.body[idx] * (1.0f - canvas.mark[idx] * 0.85f);
+            int iv = (int)(v * 255.0f + 0.5f);
+            out[idx] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
+        }
+    }
+}
+
+static void record_synth_glyph(uint32_t cp, int px, int kind, int arg, int dev, const uint8_t *bytes) {
+    size_t sz = (size_t)px * (size_t)px;
+    for (int i = 0; i < g_n_synth; i++) {
+        if (g_synth[i].cp == cp && g_synth[i].px == px) {
+            memcpy(g_synth[i].cur_bytes, bytes, sz);
+            g_synth[i].kind = kind;
+            g_synth[i].arg = arg;
+            g_synth[i].dev = dev;
+            g_synth[i].atlas_off = UINT64_MAX;
+            g_synth[i].miss_count = 0;
+            return;
+        }
+    }
+    if (g_n_synth >= MAX_SYNTH_GLYPHS) return;
+    uint8_t *buf = malloc(sz);
+    if (!buf) return;
+    memcpy(buf, bytes, sz);
+    g_synth[g_n_synth++] = (SynthGlyph){cp, px, kind, arg, dev, buf, UINT64_MAX, 0};
+}
+
+void ov_font_tick(void) {
+    if (!g_n_synth) return;
+    int dev = active_icon_device();
+    plat_mutex_lock(&g_glyph_lock);
+    int dev_changed = (dev != g_last_tick_dev);
+    g_last_tick_dev = dev;
+    for (int i = 0; i < g_n_synth; i++) {
+        SynthGlyph *g = &g_synth[i];
+        if (g->dev == dev) continue;
+        if (dev_changed) g->miss_count = 0;
+        if (g->miss_count >= 4) continue;
+        uint8_t new_bytes[GLYPH_CELL_MAX * GLYPH_CELL_MAX];
+        render_button_bytes(dev, g->kind, g->arg, g->px, new_bytes);
+        if (vk_patch_r8_atlas(g->cur_bytes, new_bytes, g->px, g->px, &g->atlas_off)) {
+            memcpy(g->cur_bytes, new_bytes, (size_t)g->px * (size_t)g->px);
+            g->dev = dev;
+            g->miss_count = 0;
+        } else {
+            g->miss_count++;
+        }
+    }
+    plat_mutex_unlock(&g_glyph_lock);
+}
+
 static void obs_acquire_glyph(Cpu *c) {
     uint32_t cp = (uint32_t)c->x[1];
     int kind = 0, arg = 0;
@@ -223,11 +300,6 @@ static void obs_acquire_glyph(Cpu *c) {
         return;
     }
     plat_mutex_lock(&g_glyph_lock);
-    static int font_init;
-    if (!font_init) {
-        font_init = 1;
-        glyph_font_set(menu_roboto_ttf());
-    }
     if (!g_pool_base) {
         g_pool_base = mem_host_alloc((uint64_t)POOL_SLOTS * SLOT_BYTES, 0x1000);
         if (!g_pool_base) rt_fatal("font: out of memory for button glyph pool");
@@ -238,27 +310,18 @@ static void obs_acquire_glyph(Cpu *c) {
     int px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
     if (px < 16) px = 24;
     if (px > GLYPH_CELL_MAX) px = GLYPH_CELL_MAX;
-    static GlyphCanvas canvas;
-    memset(&canvas, 0, sizeof canvas);
-    canvas.size = px;
-    draw_button_icon(&canvas, active_icon_device(), kind, arg, px);
+    int dev = active_icon_device();
     uint8_t *dst = (uint8_t *)(uintptr_t)bits_addr;
-    for (int y = 0; y < px; y++) {
-        for (int x = 0; x < px; x++) {
-            int idx = y * px + x;
-            float v = canvas.body[idx] * (1.0f - canvas.mark[idx] * 0.85f);
-            int iv = (int)(v * 255.0f + 0.5f);
-            dst[y * px + x] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
-        }
-    }
+    render_button_bytes(dev, kind, arg, px, dst);
+    record_synth_glyph(cp, px, kind, arg, dev, dst);
     memset((void *)(uintptr_t)hdr, 0, 0x28);
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
     h[6] = 0;                        // loX
-    h[7] = (int16_t)(px * 85 / 100); // hiY
-    h[8] = (int16_t)(px + 2);        // dx
-    h[11] = (int16_t)(px + 2);       // advance
+    h[7] = (int16_t)(px * 82 / 100); // hiY (aligned with capital letter cap-height)
+    h[8] = (int16_t)px;              // dx
+    h[11] = (int16_t)px;             // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
     h[16] = (int16_t)px;             // bpl (bytes per line)

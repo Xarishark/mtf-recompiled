@@ -849,6 +849,89 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 // 8 GB of shared memory and the game closed before the title screen.
 #define UPLOAD_PART (32ull << 20)   // fits the staging pool (vk_staging takes up to half of its 64 MiB block)
 
+#define MAX_R8_ATLASES 8
+typedef struct { uint8_t *mem; uint32_t w, h, stride; } R8Atlas;
+static PlatMutex r8_atlas_lock = PLAT_MUTEX_INIT;
+static R8Atlas r8_atlases[MAX_R8_ATLASES];
+static int n_r8_atlases;
+
+static void register_r8_atlas(uint8_t *mem, uint32_t w, uint32_t h, uint32_t stride) {
+    if (!mem || !w || !h || stride < w) return;
+    plat_mutex_lock(&r8_atlas_lock);
+    for (int i = 0; i < n_r8_atlases; i++) {
+        if (r8_atlases[i].mem == mem) {
+            r8_atlases[i].w = w; r8_atlases[i].h = h; r8_atlases[i].stride = stride;
+            plat_mutex_unlock(&r8_atlas_lock);
+            return;
+        }
+    }
+    int idx = n_r8_atlases < MAX_R8_ATLASES ? n_r8_atlases++ : (MAX_R8_ATLASES - 1);
+    r8_atlases[idx] = (R8Atlas){mem, w, h, stride};
+    plat_mutex_unlock(&r8_atlas_lock);
+}
+
+static int atlas_match(const uint8_t *dst, uint32_t stride, const uint8_t *old_px, int w, int h) {
+    int mid = h / 2;
+    if (memcmp(dst + (size_t)mid * stride, old_px + (size_t)mid * w, (size_t)w) != 0) return 0;
+    for (int r = 0; r < h; r++) {
+        if (r != mid && memcmp(dst + (size_t)r * stride, old_px + (size_t)r * w, (size_t)w) != 0) return 0;
+    }
+    return 1;
+}
+
+static void atlas_write(uint8_t *dst, uint32_t stride, const uint8_t *new_px, int w, int h) {
+    for (int r = 0; r < h; r++) memcpy(dst + (size_t)r * stride, new_px + (size_t)r * w, (size_t)w);
+}
+
+// Patches a synthesized glyph in-place inside a mirrored linear R8 font atlas.
+// Guest memory writes trigger WriteWatch so make_fresh_snap re-uploads on the next draw.
+int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h, uint64_t *cached_atlas_off) {
+    if (!old_px || !new_px || w <= 0 || h <= 0) return 0;
+    plat_mutex_lock(&r8_atlas_lock);
+    if (cached_atlas_off && *cached_atlas_off != UINT64_MAX) {
+        int ai = (int)(*cached_atlas_off >> 48);
+        uint64_t off = *cached_atlas_off & 0xffffffffffffull;
+        if (ai >= 0 && ai < n_r8_atlases) {
+            R8Atlas *a = &r8_atlases[ai];
+            if (off + (uint64_t)(h - 1) * a->stride + (uint64_t)w <= (uint64_t)a->h * a->stride &&
+                atlas_match(a->mem + off, a->stride, old_px, w, h)) {
+                atlas_write(a->mem + off, a->stride, new_px, w, h);
+                plat_mutex_unlock(&r8_atlas_lock);
+                return 1;
+            }
+        }
+        *cached_atlas_off = UINT64_MAX;
+    }
+    int mid = h / 2, nz_x = 0;
+    const uint8_t *mid_row = old_px + (size_t)mid * w;
+    while (nz_x < w && mid_row[nz_x] == 0) nz_x++;
+    if (nz_x >= w) nz_x = 0;
+    uint8_t nz_val = mid_row[nz_x];
+    for (int ai = 0; ai < n_r8_atlases; ai++) {
+        R8Atlas *a = &r8_atlases[ai];
+        if ((uint32_t)w > a->w || (uint32_t)h > a->h) continue;
+        uint32_t max_y = a->h - (uint32_t)h;
+        uint32_t max_x = a->w - (uint32_t)w;
+        for (uint32_t y = 0; y <= max_y; y++) {
+            const uint8_t *row_ptr = a->mem + (size_t)(y + (uint32_t)mid) * a->stride;
+            for (uint32_t x = 0; x <= max_x; x++) {
+                if (row_ptr[x + (uint32_t)nz_x] == nz_val && memcmp(row_ptr + x, mid_row, (size_t)w) == 0) {
+                    uint8_t *cand = a->mem + (size_t)y * a->stride + x;
+                    if (atlas_match(cand, a->stride, old_px, w, h)) {
+                        atlas_write(cand, a->stride, new_px, w, h);
+                        if (cached_atlas_off)
+                            *cached_atlas_off = ((uint64_t)ai << 48) | ((uint64_t)y * a->stride + x);
+                        plat_mutex_unlock(&r8_atlas_lock);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    plat_mutex_unlock(&r8_atlas_lock);
+    return 0;
+}
+
 // Copies the whole storage into the image (every level and layer the image has).
 static void upload(Tex *e) {
     static volatile int32_t n_bad, n_undecoded, n_split;
@@ -857,6 +940,8 @@ static void upload(Tex *e) {
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
     if (!bpb || !t->mem) return;
     uint64_t p0 = perf_begin(), u0 = kern_now_ns();
+    if (bpb == 1 && e->pub.mirrored && nvn_tex_is_linear(d) && d->width >= 1024 && d->height >= 512)
+        register_r8_atlas((uint8_t *)t->mem, d->width, d->height, nvn_tex_linear_stride(d));
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;

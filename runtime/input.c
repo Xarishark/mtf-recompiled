@@ -427,6 +427,8 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
     for (int i = 0; i < 4; i++) kb_moved |= ka[i] > STICK_ACTIVE || ka[i] < -STICK_ACTIVE;
     if (pad_moved) __atomic_store_n(&last_dev, dt, __ATOMIC_RELAXED);
     else if (kb_moved) __atomic_store_n(&last_dev, INPUT_DEV_KEYBOARD, __ATOMIC_RELAXED);
+    extern void ov_font_tick(void);
+    ov_font_tick();
     b |= kb;
     for (int i = 0; i < 4; i++)
         if (ka[i]) a[i] = ka[i];
