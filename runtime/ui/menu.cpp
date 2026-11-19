@@ -481,10 +481,10 @@ static void tab_screen(float scale) {
     const char *fps_names[] = {"30", "40", "45", "60", "90", "120", "144", "240",
                                menu_text(UI_MENU_FPS_DISPLAY), menu_text(UI_MENU_FPS_UNLIMITED)};
     opt_choice_list("MTF_FPS_LIMIT", UI_MENU_FPS_LIMIT, fps_vals, fps_names, 10, UI_MENU_FPS_LIMIT_DESC);
-    static const char *const fg_vals[] = {"off", "auto", "2", "3", "4", "120", "144", "240"};
-    const char *fg_names[] = {menu_text(UI_MENU_OFF), menu_text(UI_MENU_FRAMEGEN_AUTO), "2x", "3x", "4x",
-                              "120 FPS", "144+ FPS", "240 FPS"};
-    opt_choice_list("MTF_FRAMEGEN", UI_MENU_FRAMEGEN, fg_vals, fg_names, 8, UI_MENU_FRAMEGEN_DESC);
+    static const char *const fg_vals[] = {"off", "120", "monitor", "unlimited"};
+    const char *fg_names[] = {menu_text(UI_MENU_OFF), "120 FPS", menu_text(UI_MENU_FPS_DISPLAY),
+                              menu_text(UI_MENU_FPS_UNLIMITED)};
+    opt_choice_list("MTF_FRAMEGEN", UI_MENU_FRAMEGEN, fg_vals, fg_names, 4, UI_MENU_FRAMEGEN_DESC);
     row_gpu();
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("MTF_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);

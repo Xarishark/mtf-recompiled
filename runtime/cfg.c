@@ -117,7 +117,7 @@ static CfgMeta metas[] = {
     {"FULLSCREEN", NULL, "0|1", LIVE}, {"WINDOW_SIZE", NULL, NULL, LIVE},
     {"VK_PRESENT", NULL, "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
     {"FPS_LIMIT", NULL, "30|40|45|60|90|120|144|240|display|unlimited", LIVE},
-    {"FRAMEGEN", NULL, "off|auto|2|3|4|120|144|240", LIVE},
+    {"FRAMEGEN", NULL, "off|120|monitor|unlimited", LIVE},
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"BACKGROUND_FPS", NULL, "0|10|15|20|30", LIVE},
     {"OUTPUT_RES", NULL, "auto|720|1080|1440|2160", RESTART}, {"RENDER_SCALE", NULL, "game|50|67|75|100", RESTART},

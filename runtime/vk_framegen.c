@@ -358,14 +358,15 @@ static int mult_now(void) {
     const char *v = cfg_value("MTF_FRAMEGEN");
     if (!strcmp(v, "off") || turbo_speed() > 1 || ov_movie_playing()) return 0;
     int m;
-    if (!strcmp(v, "120") || !strcmp(v, "144") || !strcmp(v, "240")) {
-        int target_fps = atoi(v);
+    if (!strcmp(v, "unlimited")) {
+        m = VK_FG_MAX;
+    } else if (!strcmp(v, "120")) {
         int iv = game_ticks(), n = frame_logic_hz();
-        m = (target_fps * iv + n - 1) / n;
+        m = (120 * iv + n - 1) / n;
         double hz = vk_present_refresh_hz();
         int refresh_room = hz > 0 ? (int)(hz * iv / n + 0.03) : m;
-        if (target_fps == 120 && m > refresh_room) m = refresh_room;
-    } else if (!strcmp(v, "auto") && !vrr()) {
+        if (m > refresh_room) m = refresh_room;
+    } else if ((!strcmp(v, "monitor") || !strcmp(v, "auto")) && !vrr()) {
         // the most frames that split the refreshes evenly; none (a 75 Hz screen: no game rate fits) shows the game's
         // own frames. Within what the swapchain has room for.
         int room = vk_present_ahead_max();
@@ -373,7 +374,7 @@ static int mult_now(void) {
         for (int k = VK_FG_MAX < room ? VK_FG_MAX : room; k >= 2 && m == 1; k--)
             if (fits(k)) m = k;
         return m;
-    } else if (!strcmp(v, "auto")) {   // a variable refresh screen shows any rate evenly: as many as fit in time
+    } else if (!strcmp(v, "monitor") || !strcmp(v, "auto")) {   // a variable refresh screen shows any rate evenly: as many as fit in time
         // The refreshes of the monitor that fit in one game frame, rounded down: rounded up a quarter early, a game
         // frame of 46 ms at 60 Hz (2.76 refreshes) asked for 3x, made 2 frames where 1.76 fit, so the GPU made frames
         // never shown (fg3-auto: 1.1 made per game frame), and it switched between 2x and 3x every few seconds. Kept
@@ -397,7 +398,7 @@ int vk_fg_wanted(void) { return strcmp(cfg_value("MTF_FRAMEGEN"), "off") != 0; }
 // The menu's note: the selected factor does not split this screen's refreshes evenly at the game's rate now.
 int vk_fg_uneven(void) {
     const char *v = cfg_value("MTF_FRAMEGEN");
-    if (!strcmp(v, "off") || !strcmp(v, "auto") || vrr() || !F.frames) return 0;
+    if (!strcmp(v, "off") || !strcmp(v, "monitor") || !strcmp(v, "auto") || vrr() || !F.frames) return 0;
     int m = mult_now();
     return m >= 2 && !fits(m);
 }
