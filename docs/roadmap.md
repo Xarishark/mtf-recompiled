@@ -66,9 +66,9 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
 > **Regra do Pipeline:** Antes de atacar qualquer issue abaixo, consultar [docs/switch2-recomp-rag.md](switch2-recomp-rag.md) para reaproveitar soluções comprovadas (código MIT copiável ou referência clean-room para GPL-3.0).
 
 1. **FPS Alto (> 60 FPS) & Frame Generation**
-   - [x] Expor `MTF_FPS_LIMIT` (`30|40|45|60|90|120|144|240|display|unlimited`) no `cfg.c`, menu in-game (`F1`) e pacer de `nro0` (`0x70035611b8`): medido **144 FPS** (`display`) e **~1925 FPS** (`unlimited` na abertura).
-   - [ ] **Desacoplar simulação do 60 Hz (`frame_rate.c` + delta-time patches):** teste em partida com `VK_PRESENT=immediate` e `FPS_LIMIT=144` confirmou que **o jogo acelera** (personagens se movem mais rápido), indicando passo fixo de `1/60s`. Usar `MTF_SCAN_DT` + análise de `nro0` para patch de `REALTIME` delta-time.
-   - [x] Portar `FRAMEGEN` (`vk_framegen.c`, `fg_*_spv.h` MIT de `mkw-recomp` / `SkyboundTotk`, modos `off|auto|2|3|4|120` com swapchain queue em `gfx_present.c`): gera quadros intermediários a 120+ FPS mantendo a simulação em `60 Hz` (`1x`).
+   - [x] Expor `MTF_FPS_LIMIT` (`30|40|45|60|90|120|144|240|display|unlimited`) no `cfg.c`, menu in-game (`F1`) e pacer de `nro0` (`0x70035611b8`): medido **144 FPS** (`display`) e **~1925 FPS** (`unlimited` na abertura) — útil para benchmark de otimizações.
+   - [x] **FPS > 60 em velocidade real `1x` funciona via Frame Generation (`MTF_FRAMEGEN`):** portado de `mkw-recomp` / `SkyboundTotk` (MIT, `vk_framegen.c` + `fg_*_spv.h`, modos `off|auto|2|3|4|120|144|240` com swapchain de 5 imagens em `gfx_present.c` para até `4x` = `240 FPS`). Validado em jogo pelo usuário (`60 FPS` base + `2x` = `120 FPS` fluidos a `1x`).
+   - [ ] *(Opcional / futuro)* Desacoplar simulação nativa do `60 Hz` (`frame_rate.c` + delta-time patches): teste em partida com `MTF_FPS_LIMIT=144` sem Frame Gen confirmou aceleração (~2.4x), pois o jogo usa passo fixo de `1/60s`.
 2. **Resoluções Maiores (> 4K / Supersampling), Ultrawide & Câmera/FOV**
    - [ ] Remover limite de `2160` linhas / `100%` em `runtime/ov_resolution.c` (suportar `125|150|200%` e resoluções livres).
    - [ ] Implementar `ULTRAWIDE`, `HUD_POSITION` (`edges|centered`) e `ASPECT_PATCH`.

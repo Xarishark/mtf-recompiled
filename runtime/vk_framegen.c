@@ -358,15 +358,13 @@ static int mult_now(void) {
     const char *v = cfg_value("MTF_FRAMEGEN");
     if (!strcmp(v, "off") || turbo_speed() > 1 || ov_movie_playing()) return 0;
     int m;
-    if (!strcmp(v, "120")) {
-        // Target 120 shown fps without speeding up the game: 60 x2 or 30 x4. Unlike Auto this does not ask a
-        // 240 Hz screen for 240 fps. Below 30 game fps, the existing four-frame limit takes precedence.
+    if (!strcmp(v, "120") || !strcmp(v, "144") || !strcmp(v, "240")) {
+        int target_fps = atoi(v);
         int iv = game_ticks(), n = frame_logic_hz();
-        m = (120 * iv + n / 2) / n;
+        m = (target_fps * iv + n - 1) / n;
         double hz = vk_present_refresh_hz();
-        // Do not synthesize pictures the display cannot show; tolerate fractional rates such as 119.88 Hz.
         int refresh_room = hz > 0 ? (int)(hz * iv / n + 0.03) : m;
-        if (m > refresh_room) m = refresh_room;
+        if (target_fps == 120 && m > refresh_room) m = refresh_room;
     } else if (!strcmp(v, "auto") && !vrr()) {
         // the most frames that split the refreshes evenly; none (a 75 Hz screen: no game rate fits) shows the game's
         // own frames. Within what the swapchain has room for.
