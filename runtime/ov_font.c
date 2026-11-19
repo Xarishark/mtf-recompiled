@@ -127,7 +127,7 @@ static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
 static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int px) {
-    float cx = px * 0.5f, cy = px * 0.5f, s = px > 4 ? (float)(px - 2) : (float)px;
+    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.78f;
     GlyphBox box = {cx, cy, s, s};
     if (kind == PK_DPAD) {
         if (dev == INPUT_DEV_KEYBOARD) glyph_keycap(c, box, NULL, arg);
@@ -240,6 +240,10 @@ static void render_button_bytes(int dev, int kind, int arg, int px, uint8_t *out
     draw_button_icon(&canvas, dev, kind, arg, px);
     for (int y = 0; y < px; y++) {
         for (int x = 0; x < px; x++) {
+            if (x < 2 || x >= px - 2 || y < 2 || y >= px - 2) {
+                out[y * px + x] = 0;
+                continue;
+            }
             int idx = y * px + x;
             float v = canvas.body[idx] * (1.0f - canvas.mark[idx] * 0.85f);
             int iv = (int)(v * 255.0f + 0.5f);
@@ -310,7 +314,7 @@ static void obs_acquire_glyph(Cpu *c) {
     uint64_t bits_addr = hdr + 0x28;
     int raw_px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
     if (raw_px < 16) raw_px = 24;
-    int px = (raw_px * 74 + 50) / 100;
+    int px = (raw_px * 80 + 50) / 100;
     if (px < 16) px = 16;
     if (px > GLYPH_CELL_MAX) px = GLYPH_CELL_MAX;
     int dev = active_icon_device();
@@ -321,10 +325,10 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
-    h[6] = 2;                        // loX (2px left margin for outline clearance)
-    h[7] = (int16_t)(px * 92 / 100); // hiY (aligned with '+' / capital letters)
-    h[8] = (int16_t)(px + 6);        // dx (6px total margin so outlines don't overlap)
-    h[11] = (int16_t)(px + 6);       // advance
+    h[6] = 0;                        // loX (4px internal padding gives clean outline clearance)
+    h[7] = (int16_t)(px * 86 / 100); // hiY (aligned with '+' / capital letters)
+    h[8] = (int16_t)(px + 4);        // dx (extra advance so outlines don't touch '/' or text)
+    h[11] = (int16_t)(px + 4);       // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
     h[16] = (int16_t)px;             // bpl (bytes per line)
