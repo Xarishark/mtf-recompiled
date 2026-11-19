@@ -207,3 +207,8 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Symptom:** Caixas pretas intermitentes (black box stuttering) ao redor dos personagens durante o gameplay (facilmente reproduzível no tutorial após fazer um saque e andar pela quadra), além da sombra do Mario dando stuttering no tutorial.
 - **Diagnostics:** Adicionada a hotkey `F7` ([runtime/gfx_window_win.c](file:///c:/Users/rafae/Documents/Coding/Vibecoding/Decompilation/MTF-Recomp/runtime/gfx_window_win.c), [runtime/vk_dump.c](file:///c:/Users/rafae/Documents/Coding/Vibecoding/Decompilation/MTF-Recomp/runtime/vk_dump.c)) para ligar/desligar captura contínua de logs (`[host]` + resumo de passes e frames em `logs/capture_<n>.log`) sem readback de PNG.
 - **Next step:** Capturar logs com `F7` durante o stuttering da sombra e das caixas pretas ao redor dos personagens e também testar `X` (Toss) + movimentação em `INPUT_SCRIPT`.
+
+## 26. `MTF_FPS_LIMIT > 60` acelera a simulação do jogo (Fork 1:1)
+- **Symptom:** Com `VK_PRESENT=immediate` e `MTF_FPS_LIMIT=144` em partida real, os personagens se movem mais rápido (simulação acelerada em ~2.4x) em vez de manter velocidade `1x` com mais quadros.
+- **Root Cause:** Sobrescrever apenas o ponteiro global de FPS alvo (`0x70035611b8` lido por `f_7003061ab8` em `nro0`) libera o pacer `nn::os::SleepThread` para rodar a 144/1900+ FPS, mas a lógica/física do jogo ainda usa passo fixo de `1/60s` por frame.
+- **Fix (Planned):** Localizar o delta-time de simulação com `MTF_SCAN_DT` + análise de `nro0` para patch de `REALTIME` (como `frame_rate.c` do `dkb-pc-recomp`) e/ou portar Frame Generation (`vk_framegen.c`, `Inhale` Auto mode) mantendo simulação em `60 Hz`.

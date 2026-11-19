@@ -19,6 +19,7 @@ typedef struct { OvNvAllocator graphics, devtools; uint64_t memory, memory_size;
 void gfx_window_start(void);                               // window thread, Vulkan device, swapchain; idempotent
 void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event; signalled at 60 Hz
 int gfx_vsync_hz(void);                                     // the emulated display's rate (MTF_VSYNC_HZ, 60)
+int gfx_window_refresh_hz(void);                            // the monitor's refresh rate in Hz (0 if unknown)
 
 // ---- shader service client (gfx_shader.c)
 enum { GFX_STAGE_VS, GFX_STAGE_TCS, GFX_STAGE_TES, GFX_STAGE_GS, GFX_STAGE_FS, GFX_STAGE_CS };

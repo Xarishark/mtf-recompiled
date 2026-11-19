@@ -709,8 +709,9 @@ NVN_API(nvnWindowSetCrop) {
 static volatile uint64_t g_present_period_ns;   // the last present's period, for the overlay
 
 static uint64_t present_period(const win_t *o) {
-    if (frame_step_realtime()) return frame_step_cap_ns();
-    uint64_t period = (o->interval > 0 ? (uint64_t)o->interval : 1ull) * 1000000000ull / VSYNC_HZ;
+    uint64_t period = frame_step_realtime()
+                          ? frame_step_cap_ns()
+                          : (o->interval > 0 ? (uint64_t)o->interval : 1ull) * 1000000000ull / VSYNC_HZ;
     uint64_t background = gfx_background_period_ns();
     if (background > period) period = background;
     __atomic_store_n(&g_present_period_ns, period, __ATOMIC_RELAXED);

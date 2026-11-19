@@ -477,6 +477,10 @@ static void tab_screen(float scale) {
     row_window_size();
     static const UiTextId present[] = {UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE};
     opt_choice("MTF_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC);
+    static const char *const fps_vals[] = {"30", "40", "45", "60", "90", "120", "144", "240", "display", "unlimited"};
+    const char *fps_names[] = {"30", "40", "45", "60", "90", "120", "144", "240",
+                               menu_text(UI_MENU_FPS_DISPLAY), menu_text(UI_MENU_FPS_UNLIMITED)};
+    opt_choice_list("MTF_FPS_LIMIT", UI_MENU_FPS_LIMIT, fps_vals, fps_names, 10, UI_MENU_FPS_LIMIT_DESC);
     row_gpu();
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("MTF_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);

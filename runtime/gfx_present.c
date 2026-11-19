@@ -133,6 +133,11 @@ void gfx_window_set_refresh(double hz) {
     if (plat_xchg32(&g_rate_mhz, mhz) != mhz) rt_log("gfx: monitor refresh rate %.3f Hz", hz);
 }
 
+int gfx_window_refresh_hz(void) {
+    int32_t mhz = __atomic_load_n(&g_rate_mhz, __ATOMIC_ACQUIRE);
+    return mhz > 0 ? (mhz + 500) / 1000 : 0;
+}
+
 // ---- swapchain and present state (g_pl)
 static PlatRMutex g_pl;
 static VkSwapchainKHR g_sc;

@@ -29,10 +29,53 @@ void res_fov_live(void) {}
 void res_present(Cpu *c) { (void)c; }
 void playtime_save(void) {}
 
-// ---- frame pacing: the game's own present interval paces it
-int frame_step_realtime(void) { return 0; }
-uint64_t frame_step_cap_ns(void) { return 0; }
-void frame_step_present(uint64_t display_ns, int interval) { (void)display_ns, (void)interval; }
+// ---- frame pacing: MTF_FPS_LIMIT (30..240, display, unlimited) drives both host present pacing and the game's
+// target-FPS global (0x70035611b8, read by f_7003061ab8).
+static int fps_limit_target(void) {
+    static unsigned seen;
+    static int cached = 60, init;
+    unsigned v = cfg_version();
+    const char *s = cfg_value("MTF_FPS_LIMIT");
+    if (!init || v != seen || !strcmp(s, "display")) {
+        init = 1;
+        seen = v;
+        if (!strcmp(s, "unlimited")) {
+            cached = 0;
+        } else if (!strcmp(s, "display")) {
+            int hz = gfx_window_refresh_hz();
+            cached = hz >= 30 ? hz : 60;
+        } else {
+            int n = atoi(s);
+            cached = n >= 30 ? n : 60;
+        }
+    }
+    return cached;
+}
+
+int frame_step_realtime(void) { return fps_limit_target() != 60 || gfx_vsync_hz() != 60; }
+
+uint64_t frame_step_cap_ns(void) {
+    int t = fps_limit_target();
+    if (t == 60 && gfx_vsync_hz() != 60) t = gfx_vsync_hz();
+    return t > 0 ? 1000000000ull / (uint64_t)t : 0;
+}
+
+void frame_step_present(uint64_t display_ns, int interval) {
+    (void)display_ns, (void)interval;
+    int t = fps_limit_target();
+    if (t == 60 && gfx_vsync_hz() != 60) t = gfx_vsync_hz();
+    uint32_t want = t > 0 ? (uint32_t)t : 10000u;
+    if (mem_guest_readable(0x70035611b8ull, 8)) {
+        uint64_t p = *(const uint64_t *)0x70035611b8ull;
+        if (p && mem_guest_readable(p, 4)) {
+            uint32_t *fps = (uint32_t *)(uintptr_t)p;
+            if (*fps != want) {
+                rt_log("frame_rate: target fps global %u -> %u", *fps, want);
+                *fps = want;
+            }
+        }
+    }
+}
 
 // ---- performance counters: the render thread's waits per frame, the event counts and the GPU's busy time, taken while
 // the full performance overlay shows them (perf_set_overlay) or MTF_TRACE=perf asks. Off, perf_begin answers 0, perf_end
