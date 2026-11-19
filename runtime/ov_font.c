@@ -245,7 +245,7 @@ static void obs_acquire_glyph(Cpu *c) {
     uint8_t *dst = (uint8_t *)(uintptr_t)bits_addr;
     for (int y = 0; y < px; y++) {
         for (int x = 0; x < px; x++) {
-            int idx = y * GLYPH_CELL_MAX + x;
+            int idx = y * px + x;
             float v = canvas.body[idx] * (1.0f - canvas.mark[idx] * 0.85f);
             int iv = (int)(v * 255.0f + 0.5f);
             dst[y * px + x] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
