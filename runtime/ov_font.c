@@ -234,7 +234,7 @@ static void obs_acquire_glyph(Cpu *c) {
     }
     uint32_t slot = g_pool_next++ % POOL_SLOTS;
     uint64_t hdr = g_pool_base + (uint64_t)slot * SLOT_BYTES;
-    uint64_t bits_addr = hdr + 64;
+    uint64_t bits_addr = hdr + 0x28;
     int px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
     if (px < 16) px = 24;
     if (px > GLYPH_CELL_MAX) px = GLYPH_CELL_MAX;
@@ -251,12 +251,10 @@ static void obs_acquire_glyph(Cpu *c) {
             dst[y * px + x] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
         }
     }
-    memset((void *)(uintptr_t)hdr, 0, 64);
-    uint64_t *pbits = (uint64_t *)(uintptr_t)hdr;
+    memset((void *)(uintptr_t)hdr, 0, 0x28);
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
-    *pbits = bits_addr;
-    *psize = (uint32_t)(px * px + 72);
+    *psize = (uint32_t)(0x28 + px * px);
     h[6] = 0;                        // loX
     h[7] = (int16_t)(px * 85 / 100); // hiY
     h[8] = (int16_t)(px + 2);        // dx
