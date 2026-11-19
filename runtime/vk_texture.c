@@ -1839,6 +1839,36 @@ void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uin
 
 // WriteTexels: a mirrored texture gets the texels in its pool bytes (and in its image once the GPU owns it); every
 // other texture in its image.
+// Convert an 8-bit alpha glyph (0..255) into the 8-bit SDF expected by nn::font's GPU atlas (~196 at edge, +-20/px).
+static void alpha_to_sdf(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h) {
+    const int R = 10;
+    for (int y = 0; y < (int)h; y++) {
+        for (int x = 0; x < (int)w; x++) {
+            int inside = src[y * (int)w + x] >= 128;
+            int best_d2 = (R + 1) * (R + 1);
+            int y0 = y - R < 0 ? 0 : y - R, y1 = y + R >= (int)h ? (int)h - 1 : y + R;
+            int x0 = x - R < 0 ? 0 : x - R, x1 = x + R >= (int)w ? (int)w - 1 : x + R;
+            for (int ny = y0; ny <= y1; ny++) {
+                int dy = ny - y, dy2 = dy * dy;
+                if (dy2 >= best_d2) continue;
+                for (int nx = x0; nx <= x1; nx++) {
+                    if ((src[ny * (int)w + nx] >= 128) == inside) continue;
+                    int dx = nx - x, d2 = dx * dx + dy2;
+                    if (d2 < best_d2) best_d2 = d2;
+                }
+            }
+            float dist = sqrtf((float)best_d2) - 0.5f;
+            if (dist < 0.0f) dist = 0.0f;
+            float sdist = inside ? dist : -dist;
+            // Subpixel refinement right on the contour from AA alpha
+            float a = src[y * (int)w + x] / 255.0f;
+            if (dist < 1.0f) sdist = (a - 0.5f);
+            int v = (int)(196.0f + sdist * 20.0f + 0.5f);
+            dst[y * (int)w + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    }
+}
+
 static void apply_r8_patches(void) {
     plat_mutex_lock(&r8_atlas_lock);
     for (int i = 0; i < n_r8_patches; i++) {
@@ -1847,8 +1877,10 @@ static void apply_r8_patches(void) {
             NVNcopyRegion r = {(int)p.x, (int)p.y, 0, (int)p.w, (int)p.h, 1};
             Region g;
             if (region_of(&p.tex->t, NULL, &r, p.w, (uint64_t)p.w * p.h, &g)) {
+                uint8_t sdf[128 * 128];
+                alpha_to_sdf(p.px, sdf, p.w, p.h);
                 plat_mutex_unlock(&r8_atlas_lock);
-                image_texels(p.tex, &g, &r, p.px, 1);
+                image_texels(p.tex, &g, &r, sdf, 1);
                 plat_mutex_lock(&r8_atlas_lock);
             }
         }

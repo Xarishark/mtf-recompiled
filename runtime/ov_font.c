@@ -325,10 +325,10 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
-    h[6] = 4;                        // loX (symmetric left margin before icon)
+    h[6] = 6;                        // loX (6px left margin to balance '/' right space)
     h[7] = (int16_t)(px * 86 / 100); // hiY (aligned with '+' / capital letters)
-    h[8] = (int16_t)(px + 10);       // dx (healthy symmetric spacing around '/' and '+')
-    h[11] = (int16_t)(px + 10);      // advance
+    h[8] = (int16_t)(px + 16);       // dx (symmetric healthy spacing around '/' and '+')
+    h[11] = (int16_t)(px + 16);      // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
     h[16] = (int16_t)px;             // bpl (bytes per line)
