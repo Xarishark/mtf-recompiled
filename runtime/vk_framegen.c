@@ -284,10 +284,13 @@ int vk_fg_record(VkCommandBuffer cb, VkImage src, int sw, int sh, const int crop
     const int cur = F.cur, prev = cur ^ 1;
     const VkPipelineStageFlags2 ALL = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, XF = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     if (F.fresh) {
-        Img *all[] = {&F.pic[0], &F.pic[1], &F.lf[0], &F.lf[1], &F.lq[0], &F.lq[1], &F.le[0],   &F.le[1],   &F.fl[0],
-                      &F.fl[1],  &F.fl[2],  &F.fl[3], &F.fl[4], &F.fl[5], &F.made[0], &F.made[1], &F.made[2]};
+        Img *all[] = {&F.pic[0], &F.pic[1], &F.lf[0], &F.lf[1], &F.lq[0], &F.lq[1], &F.le[0], &F.le[1],
+                      &F.fl[0],  &F.fl[1],  &F.fl[2], &F.fl[3], &F.fl[4], &F.fl[5]};
         for (size_t i = 0; i < sizeof all / sizeof *all; i++)
             img_barrier(cb, all[i]->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_NONE, 0, ALL,
+                        VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        for (int i = 0; i < VK_FG_MAX - 1; i++)
+            img_barrier(cb, F.made[i].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_NONE, 0, ALL,
                         VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         F.fresh = 0;
     }

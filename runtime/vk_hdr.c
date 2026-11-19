@@ -33,7 +33,7 @@
 #include "vk_rec.h"
 #include "platform/platform.h"
 
-#define SLOTS 8
+#define SLOTS 16
 
 // ---- settings
 

@@ -23,7 +23,7 @@
 #include "area_down_spv.h"
 #include "host.h"
 
-#define SLOTS 8
+#define SLOTS 16
 
 static struct {
     int tried, ok;

@@ -71,18 +71,27 @@ static void present_main(void *arg) {
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
                      (unsigned long long)f, (unsigned long long)j.value);
-        plat_mutex_lock(&pl);
-        busy = 0;
-        plat_cond_broadcast(&pcv);
-        plat_mutex_unlock(&pl);
+        if (batch >= nf) {
+            plat_mutex_lock(&pl);
+            busy = 0;
+            plat_cond_broadcast(&pcv);
+            plat_mutex_unlock(&pl);
+        }
         uint64_t t0 = kern_now_ns();
         uint64_t first = nf && t0 > j.at ? t0 : j.at;
         for (int k = 1; k < nf; k++) {
             wait_until(first + (uint64_t)(k - 1) * step);
             vk_present_flip();
             perf_flip();
-            if (k - 1 + batch < nf)
+            if (k - 1 + batch < nf) {
                 vk_present_blit_ahead(fo[k - 1 + batch], VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM, fw, fh, NULL);
+                if (k + batch == nf) {
+                    plat_mutex_lock(&pl);
+                    busy = 0;
+                    plat_cond_broadcast(&pcv);
+                    plat_mutex_unlock(&pl);
+                }
+            }
         }
         uint64_t target = nf ? first + (uint64_t)(nf - 1) * step : j.at;
         wait_until(target);
