@@ -188,11 +188,11 @@ void glyph_dpad(GlyphCanvas *c, GlyphBox b, int dirs) {
 }
 
 void glyph_keycap(GlyphCanvas *c, GlyphBox b, const char *s, int dirs) {
-    float hh = b.s * 0.44f, hw = (s && strlen(s) > 1) ? minf(b.w / 2, b.s * 0.54f) : hh;
-    if (!s && dirs && (dirs & (dirs - 1))) hw = minf(b.w / 2, b.s * 0.54f);
+    float hh = b.s * 0.44f, hw = (s && strlen(s) > 1) ? minf(b.w / 2, b.s * 0.56f) : hh;
+    if (!s && dirs && (dirs & (dirs - 1))) hw = minf(b.w / 2, b.s * 0.56f);
     fill(c, c->body, box(b.cx, b.cy, hw, hh, b.s * 0.12f));
     if (s) {
-        label(c, s, b.cx, b.cy, b.s * (strlen(s) > 1 ? 0.30f : 0.48f), hw * 2 - b.s * 0.14f);
+        label(c, s, b.cx, b.cy, b.s * (strlen(s) > 1 ? 0.32f : 0.48f), hw * 2 - b.s * 0.10f);
         return;
     }
     int n = 0, d[4];

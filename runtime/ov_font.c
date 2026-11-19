@@ -127,7 +127,7 @@ static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
 static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int px) {
-    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.72f;
+    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.74f;
     GlyphBox box = {cx, cy, s, s};
     if (kind == PK_DPAD) {
         if (dev == INPUT_DEV_KEYBOARD) glyph_keycap(c, box, NULL, arg);
@@ -325,10 +325,10 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
-    h[6] = 6;                        // loX (6px left margin to balance '/' right space)
+    h[6] = 5;                        // loX (left margin to balance '/' right space)
     h[7] = (int16_t)(px * 86 / 100); // hiY (aligned with '+' / capital letters)
-    h[8] = (int16_t)(px + 16);       // dx (symmetric healthy spacing around '/' and '+')
-    h[11] = (int16_t)(px + 16);      // advance
+    h[8] = (int16_t)(px + 21);       // dx (symmetric healthy spacing around '/' and before text)
+    h[11] = (int16_t)(px + 21);      // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
     h[16] = (int16_t)px;             // bpl (bytes per line)
