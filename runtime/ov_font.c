@@ -126,8 +126,8 @@ static uint64_t g_pool_base;
 static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
-static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int px) {
-    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.74f;
+static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int w, int h) {
+    float cx = w * 0.5f, cy = h * 0.5f, s = h * 0.74f;
     GlyphBox box = {cx, cy, s, s};
     if (kind == PK_DPAD) {
         if (dev == INPUT_DEV_KEYBOARD) glyph_keycap(c, box, NULL, arg);
@@ -220,7 +220,7 @@ int vk_patch_r8_atlas(const uint8_t *old_px, const uint8_t *new_px, int w, int h
 #define MAX_SYNTH_GLYPHS 64
 typedef struct {
     uint32_t cp;
-    int px, kind, arg, dev;
+    int w, h, kind, arg, dev;
     uint8_t *cur_bytes;
     uint64_t atlas_off;
     int miss_count;
@@ -228,7 +228,7 @@ typedef struct {
 static SynthGlyph g_synth[MAX_SYNTH_GLYPHS];
 static int g_n_synth, g_last_tick_dev = -1;
 
-static void render_button_bytes(int dev, int kind, int arg, int px, uint8_t *out) {
+static void render_button_bytes(int dev, int kind, int arg, int w, int h, uint8_t *out) {
     static int font_init;
     if (!font_init) {
         font_init = 1;
@@ -236,15 +236,15 @@ static void render_button_bytes(int dev, int kind, int arg, int px, uint8_t *out
     }
     static GlyphCanvas canvas;
     memset(&canvas, 0, sizeof canvas);
-    canvas.size = px;
-    draw_button_icon(&canvas, dev, kind, arg, px);
-    for (int y = 0; y < px; y++) {
-        for (int x = 0; x < px; x++) {
-            if (x < 2 || x >= px - 2 || y < 2 || y >= px - 2) {
-                out[y * px + x] = 0;
+    canvas.size = w;
+    draw_button_icon(&canvas, dev, kind, arg, w, h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            if (x < 2 || x >= w - 2 || y < 2 || y >= h - 2) {
+                out[y * w + x] = 0;
                 continue;
             }
-            int idx = y * px + x;
+            int idx = y * w + x;
             float v = canvas.body[idx] * (1.0f - canvas.mark[idx]);
             int iv = (int)(v * 255.0f + 0.5f);
             out[idx] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
@@ -252,10 +252,10 @@ static void render_button_bytes(int dev, int kind, int arg, int px, uint8_t *out
     }
 }
 
-static void record_synth_glyph(uint32_t cp, int px, int kind, int arg, int dev, const uint8_t *bytes) {
-    size_t sz = (size_t)px * (size_t)px;
+static void record_synth_glyph(uint32_t cp, int w, int h, int kind, int arg, int dev, const uint8_t *bytes) {
+    size_t sz = (size_t)w * (size_t)h;
     for (int i = 0; i < g_n_synth; i++) {
-        if (g_synth[i].cp == cp && g_synth[i].px == px) {
+        if (g_synth[i].cp == cp && g_synth[i].w == w && g_synth[i].h == h) {
             memcpy(g_synth[i].cur_bytes, bytes, sz);
             g_synth[i].kind = kind;
             g_synth[i].arg = arg;
@@ -269,7 +269,7 @@ static void record_synth_glyph(uint32_t cp, int px, int kind, int arg, int dev, 
     uint8_t *buf = malloc(sz);
     if (!buf) return;
     memcpy(buf, bytes, sz);
-    g_synth[g_n_synth++] = (SynthGlyph){cp, px, kind, arg, dev, buf, UINT64_MAX, 0};
+    g_synth[g_n_synth++] = (SynthGlyph){cp, w, h, kind, arg, dev, buf, UINT64_MAX, 0};
 }
 
 void ov_font_tick(void) {
@@ -285,9 +285,9 @@ void ov_font_tick(void) {
         if (dev_changed) g->miss_count = 0;
         if (g->miss_count >= 4) continue;
         uint8_t new_bytes[GLYPH_CELL_MAX * GLYPH_CELL_MAX];
-        render_button_bytes(dev, g->kind, g->arg, g->px, new_bytes);
-        if (vk_patch_r8_atlas(g->cur_bytes, new_bytes, g->px, g->px, &g->atlas_off)) {
-            memcpy(g->cur_bytes, new_bytes, (size_t)g->px * (size_t)g->px);
+        render_button_bytes(dev, g->kind, g->arg, g->w, g->h, new_bytes);
+        if (vk_patch_r8_atlas(g->cur_bytes, new_bytes, g->w, g->h, &g->atlas_off)) {
+            memcpy(g->cur_bytes, new_bytes, (size_t)g->w * (size_t)g->h);
             g->dev = dev;
             g->miss_count = 0;
         } else {
@@ -314,24 +314,25 @@ static void obs_acquire_glyph(Cpu *c) {
     uint64_t bits_addr = hdr + 0x28;
     int raw_px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
     if (raw_px < 16) raw_px = 24;
-    int px = (raw_px * 82 + 50) / 100;
-    if (px < 16) px = 16;
-    if (px > GLYPH_CELL_MAX) px = GLYPH_CELL_MAX;
+    int h_px = (raw_px * 82 + 50) / 100;
+    if (h_px < 16) h_px = 16;
+    if (h_px > GLYPH_CELL_MAX - 10) h_px = GLYPH_CELL_MAX - 10;
+    int w_px = h_px + 10;
     int dev = active_icon_device();
     uint8_t *dst = (uint8_t *)(uintptr_t)bits_addr;
-    render_button_bytes(dev, kind, arg, px, dst);
-    record_synth_glyph(cp, px, kind, arg, dev, dst);
+    render_button_bytes(dev, kind, arg, w_px, h_px, dst);
+    record_synth_glyph(cp, w_px, h_px, kind, arg, dev, dst);
     memset((void *)(uintptr_t)hdr, 0, 0x28);
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
-    *psize = (uint32_t)(0x28 + px * px);
-    h[6] = 5;                        // loX (left margin to balance '/' right space)
-    h[7] = (int16_t)(px * 86 / 100); // hiY (aligned with '+' / capital letters)
-    h[8] = (int16_t)(px + 21);       // dx (symmetric healthy spacing around '/' and before text)
-    h[11] = (int16_t)(px + 21);      // advance
-    h[14] = (int16_t)px;             // width
-    h[15] = (int16_t)px;             // height
-    h[16] = (int16_t)px;             // bpl (bytes per line)
+    *psize = (uint32_t)(0x28 + w_px * h_px);
+    h[6] = 0;                          // loX = 0 (symmetric margin baked into w_px)
+    h[7] = (int16_t)(h_px * 86 / 100); // hiY (aligned with '+' / capital letters)
+    h[8] = (int16_t)w_px;              // dx == width
+    h[11] = (int16_t)w_px;             // advance == width
+    h[14] = (int16_t)w_px;             // width
+    h[15] = (int16_t)h_px;             // height
+    h[16] = (int16_t)w_px;             // bpl (bytes per line)
     h[18] = 8;                       // bitsPerPixel
     h[19] = (int16_t)c->x[2];        // mode
     plat_mutex_unlock(&g_glyph_lock);
