@@ -127,7 +127,7 @@ static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
 static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int w, int h) {
-    float cx = w * 0.5f, cy = h * 0.5f, s = h * 0.72f;
+    float cx = w * 0.5f, cy = h * 0.5f, s = h * 0.66f;
     GlyphBox box = {cx, cy, s, s};
     if (kind == PK_DPAD) {
         if (dev == INPUT_DEV_KEYBOARD) glyph_keycap(c, box, NULL, arg);
