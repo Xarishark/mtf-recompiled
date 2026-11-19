@@ -192,7 +192,7 @@ void glyph_keycap(GlyphCanvas *c, GlyphBox b, const char *s, int dirs) {
     if (!s && dirs && (dirs & (dirs - 1))) hw = minf(b.w / 2, b.s * 0.56f);
     fill(c, c->body, box(b.cx, b.cy, hw, hh, b.s * 0.12f));
     if (s) {
-        label(c, s, b.cx, b.cy, b.s * (strlen(s) > 1 ? 0.32f : 0.48f), hw * 2 - b.s * 0.10f);
+        label(c, s, b.cx, b.cy, b.s * (strlen(s) > 1 ? 0.25f : 0.48f), hw * 2 - b.s * 0.14f);
         return;
     }
     int n = 0, d[4];
