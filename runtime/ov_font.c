@@ -127,7 +127,7 @@ static uint32_t g_pool_next;
 static PlatMutex g_glyph_lock = PLAT_MUTEX_INIT;
 
 static void draw_button_icon(GlyphCanvas *c, int dev, int kind, int arg, int px) {
-    float cx = px * 0.5f, cy = px * 0.5f, s = px * 0.68f;
+    float cx = px * 0.5f, cy = px * 0.5f, s = px > 4 ? (float)(px - 2) : (float)px;
     GlyphBox box = {cx, cy, s, s};
     if (kind == PK_DPAD) {
         if (dev == INPUT_DEV_KEYBOARD) glyph_keycap(c, box, NULL, arg);
@@ -307,8 +307,10 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t slot = g_pool_next++ % POOL_SLOTS;
     uint64_t hdr = g_pool_base + (uint64_t)slot * SLOT_BYTES;
     uint64_t bits_addr = hdr + 0x28;
-    int px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
-    if (px < 16) px = 24;
+    int raw_px = __atomic_load_n(&g_last_px, __ATOMIC_RELAXED);
+    if (raw_px < 16) raw_px = 24;
+    int px = (raw_px * 74 + 50) / 100;
+    if (px < 16) px = 16;
     if (px > GLYPH_CELL_MAX) px = GLYPH_CELL_MAX;
     int dev = active_icon_device();
     uint8_t *dst = (uint8_t *)(uintptr_t)bits_addr;
@@ -318,10 +320,10 @@ static void obs_acquire_glyph(Cpu *c) {
     uint32_t *psize = (uint32_t *)(uintptr_t)(hdr + 8);
     int16_t *h = (int16_t *)(uintptr_t)hdr;
     *psize = (uint32_t)(0x28 + px * px);
-    h[6] = 0;                        // loX
-    h[7] = (int16_t)(px * 72 / 100); // hiY (aligned with capital letter cap-height)
-    h[8] = (int16_t)px;              // dx
-    h[11] = (int16_t)px;             // advance
+    h[6] = 0;                        // loX (tight left edge, no excess padding)
+    h[7] = (int16_t)(px * 84 / 100); // hiY (aligned with cap-height / '+' center)
+    h[8] = (int16_t)(px + 2);        // dx
+    h[11] = (int16_t)(px + 2);       // advance
     h[14] = (int16_t)px;             // width
     h[15] = (int16_t)px;             // height
     h[16] = (int16_t)px;             // bpl (bytes per line)
