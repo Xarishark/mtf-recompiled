@@ -458,6 +458,18 @@ static int create_device(void) {
     return 1;
 }
 
+static PFN_vkCmdSetCheckpointNV pfn_set_cp;
+static PFN_vkGetQueueCheckpointDataNV pfn_get_cp;
+
+PFN_vkCmdSetCheckpointNV vk_nv_checkpoint_fn(void) {
+    if (pfn_set_cp) return pfn_set_cp;
+    if (g_vk.has_nv_checkpoints && g_vk.device) {
+        pfn_set_cp = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(g_vk.device, "vkCmdSetCheckpointNV");
+        pfn_get_cp = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(g_vk.device, "vkGetQueueCheckpointDataNV");
+    }
+    return pfn_set_cp;
+}
+
 static long g_errors_total;     // outlives the device so the probe can print it after vk_shutdown
 
 static void destroy_all(void) {
@@ -520,6 +532,23 @@ void vk_device_fault_report(VkResult r) {
     vk_crumbs_report();
     vk_pass_marks_report();
     vk_draw_crumbs_report();
+    if (g_vk.has_nv_checkpoints && !pfn_get_cp && g_vk.device)
+        pfn_get_cp = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(g_vk.device, "vkGetQueueCheckpointDataNV");
+    if (pfn_get_cp && g_vk.gfx_queue) {
+        uint32_t n = 0;
+        pfn_get_cp(g_vk.gfx_queue, &n, NULL);
+        if (n) {
+            VkCheckpointDataNV *cp = calloc(n, sizeof *cp);
+            if (cp) {
+                for (uint32_t i = 0; i < n; i++) cp[i].sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+                pfn_get_cp(g_vk.gfx_queue, &n, cp);
+                rt_log("vk: NV queue checkpoints (%u):", n);
+                for (uint32_t i = 0; i < n; i++)
+                    vk_draw_crumbs_print_id((uint32_t)(uintptr_t)cp[i].pCheckpointMarker, (uint64_t)cp[i].stage);
+                free(cp);
+            }
+        }
+    }
     vk_mem_fault_log();
     VkCtx *c = vk_ctx();
     PFN_vkGetDeviceFaultInfoEXT get =

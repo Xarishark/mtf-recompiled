@@ -308,10 +308,14 @@ void vk_mvsurvey_draw(VkExec *ex) { (void)ex; }   // vk_dlaa.h
 VkPassMark * vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) { (void)cb, (void)kind, (void)fence; return NULL; }   // vk.h
 void vk_pass_mark_end(VkCommandBuffer cb, const VkPassMark *m) { (void)cb, (void)m; }   // vk.h
 void vk_pass_marks_report(void) {  }   // vk.h
-int vk_pass_marks_want_nv(void) {  return 0; }   // vk.h
+int vk_pass_marks_want_nv(void) { return cfg_bool("MTF_PASS_CRUMBS"); }   // vk.h
 void perf_gpu_wait(uint64_t t0) { (void)t0; }   // host.h
 // host.h
 int vk_contact_strength(void) {  return 0; }   // vk.h
 uint64_t vk_mvprev_step(int stage, int index, uint64_t size) { (void)stage, (void)index, (void)size; return 0; }   // vk.h
-void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) { (void)cb, (void)id, (void)end; }   // vk.h
+void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) {
+    (void)end;
+    PFN_vkCmdSetCheckpointNV cp = vk_nv_checkpoint_fn();
+    if (cp) cp(cb, (const void *)(uintptr_t)id);
+}   // vk.h
 void (*perf_gpu_stats)(PerfGpu *out);   // host.h: no GPU statistics consumer

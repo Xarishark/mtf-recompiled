@@ -709,6 +709,13 @@ void rec_polygon_mode(PFN_vkCmdSetPolygonModeEXT fn, VkCommandBuffer cb, VkPolyg
 
 typedef struct { uint32_t id; int end; } A_PassMark;
 
+void rec_pass_mark(VkCommandBuffer cb, uint32_t id, int end) {
+    if (!OWNED(cb)) { vk_pass_mark_cmd(cb, id, end); return; }
+    A_PassMark *a = put(R_PassMark, sizeof *a);
+    *a = (A_PassMark){id, end};
+    pub();
+}
+
 typedef struct { void *fn; uint32_t first, n; const void *v; } A_Targets;
 #define TARGET_CMD(fname, R, PFN, T)                                                                                    \
     void fname(PFN fn, VkCommandBuffer cb, uint32_t first, uint32_t n, const T *v) {                                    \

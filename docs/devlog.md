@@ -173,3 +173,13 @@
 - **Verification:**
   - Built `mtf-stage2.exe` cleanly (`0` errors) and ran with `TOTK_HDR=1 --seconds 8` (`work/test_hdr_err.log`): HDR10 swapchain (`format 64`), display metadata (`peak 1000 nits, paper white 203`), and clean exit (`0`).
   - Verified `python tools/check_content.py` (`0 violations`).
+
+### 2026-11-20 — Lightning Racket `SSign` GPU Hang & Multi-Match `pipe_worker` Driver Crash
+- **Changes:**
+  - `runtime/vk_pipeline.c` (`spirv_fixup`): Rewrites `GLSL.std.450` `SSign(int32)` (`ExtInst 5`) to `SClamp(x, -1, 1)` (`ExtInst 45`), injecting `int32` `-1`/`1` constants when absent. Fixes the `VK_ERROR_DEVICE_LOST` (`instruction pointer (invalid)`) GPU hang triggered by vertex shader `0fa55a01f31ef9a6` during Lightning Racket matches on NVIDIA Blackwell (`RTX 5070 Ti`, driver `610.88`).
+  - `runtime/vk_pipeline.c` (`vk_pipeline_async_enable`): Defaults `MTF_PIPE_SYNC=1` on NVIDIA (`vendorID == 0x10de`) when `!P.gpl` (`MTF_PIPE_SYNC=0` overrides), avoiding the `nvoglv64.dll+0x10ea90` (`0x8` null-read) access violation in `create_graphics` on background `pipe_worker` threads across 3–4+ consecutive matches.
+  - `runtime/vk.h`, `runtime/vk_device.c`, `runtime/vk_exec_draw.c`, `runtime/vk_rec.{h,c}`, `runtime/gfx_stubs.c`: Added draw/dispatch ring-buffer breadcrumbs + 4s hang watchdog + optional `VK_NV_device_diagnostic_checkpoints` (`MTF_PASS_CRUMBS=1`) + `MTF_SKIP_VS` diagnostic filter.
+- **Verification:**
+  - Standalone `spv_repro.exe` on `RTX 5070 Ti` (`610.88`): `0fa55a01f31ef9a6.spv` hung with `vkQueueWaitIdle: -4`, and passed (`vkQueueWaitIdle: 0`) after rewriting `SSign` to `SClamp(x, -1, 1)`.
+  - User verified Lightning Racket match runs without freezing/crashing, and `MTF_PIPE_SYNC=1` passed 10 consecutive matches with distinct characters and rackets.
+  - Rebuilt `build/fork/bin/mtf-recomp.exe` (`0` errors) and verified `python tools/check_content.py` (`0` violations).

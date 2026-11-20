@@ -944,18 +944,22 @@ out:
 //  - the CullDistance[1] member of gl_PerVertex next to ClipDistance[8] (Declarations.cs CreatePerVertexStructType):
 //    9 distances exceed maxCombinedClipAndCullDistances (8 on AMD). The translator never accesses CullDistance; the
 //    member goes when it is the struct's last and no access chain selects it.
+// 3. NVIDIA Blackwell (610.88) miscompiles GLSL.std.450 SSign(int32) in some shaders into an invalid SASS jump
+//    (VK_ERROR_DEVICE_LOST / instruction pointer invalid); SClamp(x, -1, 1) is bit-for-bit identical.
 static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
-    enum { OP_EXTENSION = 10, OP_CAPABILITY = 17, OP_MEMBER_NAME = 6, OP_EXECUTION_MODE = 16, OP_TYPE_ARRAY = 28,
-           OP_TYPE_STRUCT = 30, OP_CONSTANT = 43, OP_MEMBER_DECORATE = 72, OP_ACCESS_CHAIN = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66,
+    enum { OP_EXTENSION = 10, OP_EXT_INST_IMPORT = 11, OP_EXT_INST = 12, OP_CAPABILITY = 17, OP_MEMBER_NAME = 6,
+           OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_ARRAY = 28, OP_TYPE_STRUCT = 30, OP_CONSTANT = 43,
+           OP_MEMBER_DECORATE = 72, OP_ACCESS_CHAIN = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66,
            OP_BEGIN_INTERLOCK = 5364, OP_END_INTERLOCK = 5365, CAP_SAMPLE_INTERLOCK = 5363, CAP_PIXEL_INTERLOCK = 5378,
-           CAP_RATE_INTERLOCK = 5372, BUILTIN_CLIP = 3, BUILTIN_CULL = 4 };
+           CAP_RATE_INTERLOCK = 5372, BUILTIN_CLIP = 3, BUILTIN_CULL = 4, GLSL_SSIGN = 5, GLSL_SCLAMP = 45 };
     if (n < 5) return NULL;
     uint32_t bound = w[3] < (1u << 22) ? w[3] : (1u << 22);
     uint32_t *val = calloc(bound, sizeof *val), *elem = calloc(bound, sizeof *elem), *len = calloc(bound, sizeof *len),
              *pointee = calloc(bound, sizeof *pointee), *var_type = calloc(bound, sizeof *var_type);
     uint32_t *o = NULL;
-    int interlock_used = 0, interlock_declared = 0, cull_ok = 0;
+    int interlock_used = 0, interlock_declared = 0, cull_ok = 0, ssign_hits = 0;
     uint32_t cull_struct = 0, cull_member = 0, clip_member = ~0u, members = 0, member_types[8] = {0};
+    uint32_t glsl_id = 0, int32_t = 0, int32_one = 0, int32_neg1 = 0;
     if (!val || !elem || !len || !pointee || !var_type) goto out;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
@@ -965,7 +969,17 @@ static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
         else if (op == OP_EXECUTION_MODE && l >= 3 && a[1] >= 5366 && a[1] <= 5371) interlock_used = 1;
         else if (op == OP_CAPABILITY && l >= 2 && (a[0] == CAP_PIXEL_INTERLOCK || a[0] == CAP_SAMPLE_INTERLOCK || a[0] == CAP_RATE_INTERLOCK))
             interlock_declared = 1;
-        else if (op == OP_CONSTANT && l == 4 && a[1] < bound) val[a[1]] = a[2];
+        else if (op == OP_EXT_INST_IMPORT && l >= 2 && !strncmp((const char *)(a + 1), "GLSL.std.450", (l - 2) * 4))
+            glsl_id = a[0];
+        else if (op == OP_TYPE_INT && l >= 4 && a[1] == 32 && a[2] == 1 && !int32_t) int32_t = a[0];
+        else if (op == OP_CONSTANT && l == 4 && a[1] < bound) {
+            val[a[1]] = a[2];
+            if (int32_t && a[0] == int32_t) {
+                if (a[2] == 1) int32_one = a[1];
+                else if (a[2] == 0xffffffffu) int32_neg1 = a[1];
+            }
+        } else if (op == OP_EXT_INST && l == 6 && glsl_id && int32_t && a[0] == int32_t && a[2] == glsl_id && a[3] == GLSL_SSIGN)
+            ssign_hits++;
         else if (op == OP_TYPE_ARRAY && l >= 4 && a[0] < bound) elem[a[0]] = a[1], len[a[0]] = a[2] < bound ? val[a[2]] : 0;
         else if (op == SPV_OP_TYPE_POINTER && l >= 4 && a[0] < bound) pointee[a[0]] = a[2];
         else if (op == SPV_OP_VARIABLE && l >= 4 && a[1] < bound) var_type[a[1]] = a[0] < bound ? pointee[a[0]] : 0;
@@ -989,14 +1003,31 @@ static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
         cull_ok = clip_n + cull_n > limit && clip_n <= limit;
     }
     int strip = interlock_declared && !interlock_used;
-    if (!strip && !cull_ok) goto out;
-    o = malloc(n * 4);
+    if (!strip && !cull_ok && !ssign_hits) goto out;
+    uint32_t next_id = w[3];
+    int add_one = ssign_hits && !int32_one, add_neg1 = ssign_hits && !int32_neg1;
+    if (add_one) int32_one = next_id++;
+    if (add_neg1) int32_neg1 = next_id++;
+    o = malloc((n + (uint64_t)ssign_hits * 2 + (uint64_t)(add_one + add_neg1) * 4) * 4);
     if (!o) goto out;
     uint64_t on = 5;
     memcpy(o, w, 5 * 4);
+    o[3] = next_id;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
         const uint32_t *a = w + i + 1;
+        if (ssign_hits && op == OP_EXT_INST && l == 6 && a[0] == int32_t && a[2] == glsl_id && a[3] == GLSL_SSIGN) {
+            o[on++] = (8u << 16) | OP_EXT_INST;
+            o[on++] = a[0];
+            o[on++] = a[1];
+            o[on++] = glsl_id;
+            o[on++] = GLSL_SCLAMP;
+            o[on++] = a[4];
+            o[on++] = int32_neg1;
+            o[on++] = int32_one;
+            i += l;
+            continue;
+        }
         int drop = 0;
         if (strip && op == OP_CAPABILITY && (a[0] == CAP_PIXEL_INTERLOCK || a[0] == CAP_SAMPLE_INTERLOCK || a[0] == CAP_RATE_INTERLOCK)) drop = 1;
         if (strip && op == OP_EXTENSION && l >= 2 && !strncmp((const char *)a, "SPV_EXT_fragment_shader_interlock", (l - 1) * 4)) drop = 1;
@@ -1005,6 +1036,10 @@ static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
             memcpy(o + on, w + i, l * 4);
             if (cull_ok && op == OP_TYPE_STRUCT && a[0] == cull_struct) o[on] = (l - 1) << 16 | op;   // last member gone
             on += op == OP_TYPE_STRUCT && cull_ok && a[0] == cull_struct ? l - 1 : l;
+            if (op == OP_TYPE_INT && a[0] == int32_t) {
+                if (add_one) { o[on++] = (4u << 16) | OP_CONSTANT; o[on++] = int32_t; o[on++] = int32_one; o[on++] = 1u; add_one = 0; }
+                if (add_neg1) { o[on++] = (4u << 16) | OP_CONSTANT; o[on++] = int32_t; o[on++] = int32_neg1; o[on++] = 0xffffffffu; add_neg1 = 0; }
+            }
         }
         i += l;
     }
@@ -2389,7 +2424,13 @@ static int workers_start(void) {
 void vk_pipeline_async_enable(void) {
     U.on = strcmp(cfg_value("MTF_PIPE_WAIT"), "draw") != 0;
     const char *e = cfg_get("MTF_PIPE_SYNC");
-    if (e && *e && strcmp(e, "0")) return;
+    if (e && *e) {
+        if (strcmp(e, "0")) return;
+    } else if (vk_ctx()->props.vendorID == 0x10de && !P.gpl) {
+        // Background pipe_worker builds hit nvoglv64.dll+0x10ea90 (0x8 read) on NVIDIA 610.88 after several matches.
+        rt_log("vk_pipeline: synchronous pipeline builds on NVIDIA without GPL (MTF_PIPE_SYNC=0 overrides)");
+        return;
+    }
     A.on = 1;
 }
 

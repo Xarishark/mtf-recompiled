@@ -2547,6 +2547,19 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         return vk_exec_oq_dropped(ex), 0;
     }
     if (!p || !info) return vk_exec_oq_dropped(ex), warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
+    {
+        static const char *skip_vs;
+        static int skip_init;
+        if (!skip_init) skip_vs = cfg_get("MTF_SKIP_VS"), skip_init = 1;
+        if (skip_vs && *skip_vs && vs) {
+            const uint8_t *k = gfx_shader_key(vs);
+            if (k) {
+                char kh[17];
+                for (int i = 0; i < 8; i++) snprintf(kh + 2 * i, 3, "%02x", k[i]);
+                if (strstr(skip_vs, kh)) return vk_exec_oq_dropped(ex), 0;
+            }
+        }
+    }
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         // MTF_DYN_DELTA: only the dynamic states whose values changed since the last call in this command buffer. A
@@ -3347,7 +3360,8 @@ static void crumb_key(uint8_t out[8], const GfxShader *s) {
 }
 
 static void crumb_draw(const VkExec *ex, uint32_t kind, uint32_t count, uint32_t inst, uint32_t prim) {
-    uint32_t idx = __atomic_fetch_add(&draw_crumb_seq, 1, __ATOMIC_RELAXED) % DRAW_CRUMB_N;
+    uint32_t seq = __atomic_fetch_add(&draw_crumb_seq, 1, __ATOMIC_RELAXED);
+    uint32_t idx = seq % DRAW_CRUMB_N;
     DrawCrumb *c = &draw_crumbs[idx];
     c->fence = ex->fence;
     c->serial = ex->prog ? ex->prog->serial : 0;
@@ -3356,10 +3370,12 @@ static void crumb_draw(const VkExec *ex, uint32_t kind, uint32_t count, uint32_t
     crumb_key(c->vs, B.st.vs);
     crumb_key(c->fs, B.st.fs);
     memset(c->cs, 0, 8);
+    if (vk_nv_checkpoint_fn()) rec_pass_mark(ex->cb, seq, 0);
 }
 
 static void crumb_disp(const VkExec *ex, const GfxShader *cs, uint32_t kind, uint32_t x, uint32_t y, uint32_t z) {
-    uint32_t idx = __atomic_fetch_add(&draw_crumb_seq, 1, __ATOMIC_RELAXED) % DRAW_CRUMB_N;
+    uint32_t seq = __atomic_fetch_add(&draw_crumb_seq, 1, __ATOMIC_RELAXED);
+    uint32_t idx = seq % DRAW_CRUMB_N;
     DrawCrumb *c = &draw_crumbs[idx];
     c->fence = ex->fence;
     c->serial = ex->prog ? ex->prog->serial : 0;
@@ -3368,6 +3384,7 @@ static void crumb_disp(const VkExec *ex, const GfxShader *cs, uint32_t kind, uin
     memset(c->vs, 0, 8);
     memset(c->fs, 0, 8);
     crumb_key(c->cs, cs);
+    if (vk_nv_checkpoint_fn()) rec_pass_mark(ex->cb, seq, 0);
 }
 
 static void fmt_k8(char out[17], const uint8_t k[8]) {
@@ -3392,6 +3409,16 @@ static void print_crumb(uint32_t i, const DrawCrumb *c) {
     else
         rt_log("  [%u] fence=%llu %s cnt=%u inst=%u prim=%u %ux%u vs=%s fs=%s prog=%llu", i,
                (unsigned long long)c->fence, kn, c->a, c->b, c->c, c->w, c->h, vs, fs, (unsigned long long)c->serial);
+}
+
+void vk_draw_crumbs_print_id(uint32_t seq, uint64_t stage) {
+    uint32_t cur = __atomic_load_n(&draw_crumb_seq, __ATOMIC_RELAXED);
+    if (cur - seq >= DRAW_CRUMB_N) {
+        rt_log("  stage=%#llx marker=%u (evicted, cur=%u)", (unsigned long long)stage, seq, cur);
+        return;
+    }
+    rt_log("  stage=%#llx:", (unsigned long long)stage);
+    print_crumb(seq, &draw_crumbs[seq % DRAW_CRUMB_N]);
 }
 
 void vk_draw_crumbs_report_fence(uint64_t target_fence) {

@@ -212,3 +212,15 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Symptom:** Com `VK_PRESENT=immediate` e `MTF_FPS_LIMIT=144` em partida real, os personagens se movem mais rápido (simulação acelerada em ~2.4x) em vez de manter velocidade `1x` com mais quadros.
 - **Root Cause:** Sobrescrever apenas o ponteiro global de FPS alvo (`0x70035611b8` lido por `f_7003061ab8` em `nro0`) libera o pacer `nn::os::SleepThread` para rodar a 144/1900+ FPS, mas a lógica/física do jogo ainda usa passo fixo de `1/60s` por frame.
 - **Fix (Planned):** Localizar o delta-time de simulação com `MTF_SCAN_DT` + análise de `nro0` para patch de `REALTIME` (como `frame_rate.c` do `dkb-pc-recomp`) e/ou portar Frame Generation (`vk_framegen.c`, `Inhale` Auto mode) mantendo simulação em `60 Hz`.
+
+## 27. Lightning Racket `VK_ERROR_DEVICE_LOST` (`0fa55a01f31ef9a6` / `SSign` on Blackwell `610.88`)
+- **Symptom:** Starting a match with the Lightning Racket froze and crashed with `VK_ERROR_DEVICE_LOST (-4)` (`instruction pointer (invalid) at 0x200xxxxxx`) on RTX 5070 Ti (driver `610.88`).
+- **Root Cause:** Binary search inside `0fa55a01f31ef9a6.spv` (reproduced locally in standalone Vulkan) isolated `GLSL.std.450` `SSign(int32)` (`ExtInst 5`), whose `-1/0/+1` result is bitcast to `float` and used downstream, triggering an NVIDIA Blackwell `610.88` SPIR-V -> SASS compiler bug.
+- **Fix:** `spirv_fixup` in `runtime/vk_pipeline.c` rewrites `GLSL.std.450` `SSign(int32)` to `SClamp(x, -1, 1)` (`ExtInst 45`).
+- **Verification:** Standalone Vulkan repro switched from `vkQueueWaitIdle: -4` to `0`, and Lightning Racket match ran cleanly.
+
+## 28. `nvoglv64.dll+0x10ea90` Access Violation on 3rd–4th Match (`pipe_worker`)
+- **Symptom:** After 3–4 consecutive matches with different characters/rackets, `pipe_worker` crashed in `create_graphics` (`vkCreateGraphicsPipelines`, `runtime/vk_pipeline.c:1760`) at `nvoglv64.dll+0x10ea90` reading `0x8`, even with `pipeline-cache.bin` deleted.
+- **Root Cause:** NVIDIA `610.88` driver crash when building graphics pipelines concurrently on background `pipe_worker` threads without GPL (`!P.gpl`).
+- **Fix:** Default `MTF_PIPE_SYNC=1` in `vk_pipeline_async_enable` when `vendorID == 0x10de && !P.gpl` (`MTF_PIPE_SYNC=0` overrides).
+- **Verification:** User verified 10 consecutive matches with distinct characters and rackets without crashing.
