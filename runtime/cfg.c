@@ -147,7 +147,7 @@ static CfgMeta metas[] = {
     {"ASYNC_PREEMPT", NULL, "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART}, {"TIMER_1MS", NULL, "0|1", RESTART},
     // shaders and pipelines
     {"PIPE_SKIP", NULL, "strict|any|fullscreen", RESTART}, {"PIPE_PREBUILD", NULL, "0|1", RESTART},
-    {"GPL", "1", "0|1", RESTART},
+    {"GPL", "0", "0|1", RESTART},
     // textures and memory
     {"ASTC", NULL, "auto|gpu|native|cpu", RESTART}, {"MEMORY", NULL, "auto|import|mirror|verify", RESTART},
     {"TEX_ALIAS", NULL, "0|1", RESTART}, {"TEX_VRAM_PRESSURE", NULL, "0..100", RESTART}, {"ASTC_BC", "", "0|1", RESTART},

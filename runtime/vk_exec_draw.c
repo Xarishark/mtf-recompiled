@@ -2039,6 +2039,15 @@ static VkViewport viewport_at(VkExec *ex, uint32_t i) {
         float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
         x = ex->vp[i][0] * k, y = ex->vp[i][1] * k, w = ex->vp[i][2] * k, h = ex->vp[i][3] * k;
     }
+    const float lim = (float)vk_ctx()->props.limits.maxViewportDimensions[0];
+    if (lim > 0) {
+        if (w > lim) w = lim;
+        if (h > lim) h = lim;
+        if (x < -2.0f * lim) x = -2.0f * lim;
+        if (y < -2.0f * lim) y = -2.0f * lim;
+        if (x + w > 2.0f * lim - 1.0f) x = 2.0f * lim - 1.0f - w;
+        if (y + h > 2.0f * lim - 1.0f) y = 2.0f * lim - 1.0f - h;
+    }
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     return (VkViewport){x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
@@ -2490,6 +2499,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (pipe_memo_on() && PM.valid && !memcmp(&PM.s, &s, sizeof s)) {
         info = PM.info, pending = 0;
         p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
+        if (!p) pending = 1, PM.valid = 0;
     } else {
         w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
         p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
@@ -2815,7 +2825,7 @@ static uint32_t mo_vertex_buffers(VkExec *ex) {
     return (uint32_t)MQ.nvb++;
 }
 
-// Records the list into cb (the replay's command buffer, inside the motion pass's rendering), skipping what the draw
+//Records the list into cb (the replay's command buffer, inside the motion pass's rendering), skipping what the draw
 // before already set.
 static void mo_emit(VkCommandBuffer cb) {
     int dyn_vi = vk_pipeline_vertex_input_dynamic();
@@ -2828,6 +2838,7 @@ static void mo_emit(VkCommandBuffer cb) {
     const MoDraw *p = NULL;
     for (int n = 0; n < MQ.n; p = &MQ.d[n++]) {
         const MoDraw *q = &MQ.d[n];
+        if (!q->pipe || !q->info || !q->info->layout) continue;
         const VkPipeInfo *info = q->info;
         if (q->pipe != pipe) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, q->pipe), pipe = q->pipe, MO.e_pipe++;
         if (q->st != st) vk_pipeline_set_dynamic(cb, &MQ.st[q->st]), st = q->st, MO.e_dyn++;

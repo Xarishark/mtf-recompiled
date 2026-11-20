@@ -61,7 +61,7 @@ int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
     gpl_lib = f->graphicsPipelineLibrary;
     gpl_fast = p->graphicsPipelineLibraryFastLinking;
     const char *e = cfg_get("MTF_GPL");
-    vk_caps.gpl = gpl_lib && gpl_fast && !(e && !strcmp(e, "0"));
+    vk_caps.gpl = gpl_lib && gpl_fast && (e && !strcmp(e, "1"));
     return vk_caps.gpl;
 }
 

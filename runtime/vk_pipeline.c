@@ -2136,7 +2136,9 @@ static void pipe_worker(void *arg) {
             VkPipeline f = gpl_link(&j->s, &j->k, j->p->lay, 1, &final);   // releases P.lock while building
             j->p->fast_tried = 1;
             if (f && !j->p->info.pipeline) {
-                j->p->fast = j->p->info.pipeline = f, P.g.wlinks++;
+                j->p->fast = f;
+                __atomic_store_n(&j->p->info.pipeline, f, __ATOMIC_RELEASE);
+                P.g.wlinks++;
                 plat_cond_broadcast(&done_cv);
                 j->low = 1, j->worker = -1, P.g.requeued++;
                 j->prev = NULL, j->next = A.low;
@@ -2152,7 +2154,7 @@ static void pipe_worker(void *arg) {
         plat_mutex_unlock(&P.lock);
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
         plat_mutex_lock(&P.lock);
-        if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
+        if (pipe || !j->p->fast) __atomic_store_n(&j->p->info.pipeline, pipe, __ATOMIC_RELEASE);   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
         j->p->building = 0;
         j->p->job = NULL;
@@ -2413,7 +2415,8 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         }
         if (final) p->fast_tried = 1;
         if (f && !p->info.pipeline) {
-            p->fast = p->info.pipeline = f;
+            p->fast = f;
+            __atomic_store_n(&p->info.pipeline, f, __ATOMIC_RELEASE);
             job_lower(p->job);
             plat_cond_broadcast(&done_cv);
         } else if (f) {
@@ -2464,7 +2467,7 @@ static void warm_builder(void *arg) {
         plat_mutex_unlock(&P.lock);
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
         plat_mutex_lock(&P.lock);
-        if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
+        if (pipe || !j->p->fast) __atomic_store_n(&j->p->info.pipeline, pipe, __ATOMIC_RELEASE);   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
         j->p->building = 0;
         j->p->job = NULL;
