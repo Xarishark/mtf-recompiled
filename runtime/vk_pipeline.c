@@ -50,8 +50,10 @@
 enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SPV_OP_TYPE_VECTOR = 23,
        SPV_OP_TYPE_POINTER = 32, SPV_OP_CONSTANT = 43, SPV_OP_CONSTANT_COMPOSITE = 44,
        SPV_OP_CONSTANT_NULL = 46, SPV_OP_FUNCTION = 54, SPV_OP_VARIABLE = 59,
-       SPV_OP_DECORATE = 71, SPV_DEC_BUILTIN = 11, SPV_DEC_LOCATION = 30, SPV_DEC_INDEX = 32, SPV_DEC_BINDING = 33, SPV_DEC_DESCRIPTOR_SET = 34,
-       SPV_SC_OUTPUT = 3 };
+       SPV_OP_LOAD = 61, SPV_OP_ACCESS_CHAIN = 65, SPV_OP_IN_BOUNDS_ACCESS_CHAIN = 66,
+       SPV_OP_DECORATE = 71, SPV_OP_BITCAST = 124,
+       SPV_DEC_BUILTIN = 11, SPV_DEC_LOCATION = 30, SPV_DEC_INDEX = 32, SPV_DEC_BINDING = 33, SPV_DEC_DESCRIPTOR_SET = 34,
+       SPV_SC_INPUT = 1, SPV_SC_OUTPUT = 3 };
 
 #define MAX_BINDINGS 128
 #define PIPE_BUCKETS 4096
@@ -780,6 +782,162 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
     return o;
 }
 
+// Rewrites each vertex Input variable whose 2-bit code in `attr_type` (at 2 * loc) is non-zero to match the bound
+// vertex format's numeric type (1 = float, 2 = sint, 3 = uint), and inserts an OpBitcast after each OpLoad from it
+// (or its OpAccessChain) back to the shader's original type. Satisfies VUID-vkCmdDraw-format-08936 while preserving raw
+// attribute bits. NULL when nothing needs rewriting or the module layout is unexpected.
+static uint32_t *spirv_rewrite_inputs(const uint32_t *w, uint64_t n, uint32_t attr_type, uint64_t *out_n) {
+    if (!attr_type || n < 5) return NULL;
+    uint32_t orig_bound = w[3];
+    if (orig_bound >= (1u << 22)) return NULL;
+    uint64_t fn_at = 0;
+    uint32_t bound = orig_bound, scalar[3] = {0, 0, 0};
+    struct { uint32_t id, comp, count; } vec[64];
+    struct { uint32_t id, type; } ptr[64];
+    int nvec = 0, nptr = 0;
+    uint32_t *pointee = calloc(orig_bound, sizeof *pointee);
+    uint32_t *v_elem = calloc(orig_bound, sizeof *v_elem);
+    uint8_t *v_cnt = calloc(orig_bound, sizeof *v_cnt);
+    int8_t *loc_of = malloc(orig_bound);
+    uint8_t *var_t = calloc(orig_bound, 1);
+    uint32_t *ptr_new = calloc(orig_bound, sizeof *ptr_new);
+    uint32_t *val_new = calloc(orig_bound, sizeof *val_new);
+    uint32_t *o = NULL;
+    if (!pointee || !v_elem || !v_cnt || !loc_of || !var_t || !ptr_new || !val_new) goto out;
+    memset(loc_of, -1, orig_bound);
+
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto out;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_DECORATE && len >= 4 && a[1] == SPV_DEC_LOCATION && a[0] < orig_bound && a[2] < 16)
+            loc_of[a[0]] = (int8_t)a[2];
+        else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[1] == 32) scalar[GFX_TYPE_FLOAT] = a[0];
+        else if (op == SPV_OP_TYPE_INT && len >= 4 && a[1] == 32) scalar[a[2] ? GFX_TYPE_SINT : GFX_TYPE_UINT] = a[0];
+        else if (op == SPV_OP_TYPE_VECTOR && len >= 4 && a[0] < orig_bound) {
+            v_elem[a[0]] = a[1], v_cnt[a[0]] = (uint8_t)a[2];
+            if (nvec < 64) vec[nvec].id = a[0], vec[nvec].comp = a[1], vec[nvec++].count = a[2];
+        } else if (op == SPV_OP_TYPE_POINTER && len >= 4 && a[0] < orig_bound) {
+            pointee[a[0]] = a[2];
+            if (a[1] == SPV_SC_INPUT && nptr < 64) ptr[nptr].id = a[0], ptr[nptr++].type = a[2];
+        } else if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == SPV_SC_INPUT && a[1] < orig_bound) {
+            int l = loc_of[a[1]];
+            if (l >= 0 && ((attr_type >> (2 * l)) & 3)) var_t[a[1]] = (uint8_t)((attr_type >> (2 * l)) & 3);
+        } else if (op == SPV_OP_FUNCTION && !fn_at) {
+            fn_at = i;
+        }
+        i += len;
+    }
+    if (!fn_at) goto out;
+
+    uint32_t types[16 * 16];
+    int nt = 0;
+    #define ENSURE_SCALAR(t_) do { \
+        if (!scalar[t_]) { \
+            if (nt + 4 > (int)(sizeof types / sizeof *types)) goto out; \
+            scalar[t_] = bound++; \
+            if ((t_) == GFX_TYPE_FLOAT) types[nt++] = 3u << 16 | SPV_OP_TYPE_FLOAT, types[nt++] = scalar[t_], types[nt++] = 32; \
+            else types[nt++] = 4u << 16 | SPV_OP_TYPE_INT, types[nt++] = scalar[t_], types[nt++] = 32, types[nt++] = (t_) == GFX_TYPE_SINT; \
+        } \
+    } while (0)
+    #define FIND_OR_ADD_VEC(t_, cnt_, out_id_) do { \
+        ENSURE_SCALAR(t_); \
+        uint32_t base_ = scalar[t_]; \
+        if ((cnt_) <= 1) { (out_id_) = base_; } \
+        else { \
+            int k_ = 0; \
+            while (k_ < nvec && !(vec[k_].comp == base_ && vec[k_].count == (cnt_))) k_++; \
+            if (k_ == nvec) { \
+                if (nvec == 64 || nt + 4 > (int)(sizeof types / sizeof *types)) goto out; \
+                vec[nvec].id = bound++, vec[nvec].comp = base_, vec[nvec++].count = (cnt_); \
+                types[nt++] = 4u << 16 | SPV_OP_TYPE_VECTOR, types[nt++] = vec[k_].id, types[nt++] = base_, types[nt++] = (cnt_); \
+            } \
+            (out_id_) = vec[k_].id; \
+        } \
+    } while (0)
+    #define FIND_OR_ADD_PTR(val_t_, out_id_) do { \
+        int k_ = 0; \
+        while (k_ < nptr && ptr[k_].type != (val_t_)) k_++; \
+        if (k_ == nptr) { \
+            if (nptr == 64 || nt + 4 > (int)(sizeof types / sizeof *types)) goto out; \
+            ptr[nptr].id = bound++, ptr[nptr++].type = (val_t_); \
+            types[nt++] = 4u << 16 | SPV_OP_TYPE_POINTER, types[nt++] = ptr[k_].id, types[nt++] = SPV_SC_INPUT, types[nt++] = (val_t_); \
+        } \
+        (out_id_) = ptr[k_].id; \
+    } while (0)
+
+    uint32_t n_vars = 0, n_loads = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == SPV_SC_INPUT && a[1] < orig_bound && var_t[a[1]]) {
+            uint8_t t = (uint8_t)(var_t[a[1]] - 1);
+            uint32_t pt = pointee[a[0]];
+            uint32_t cnt = pt < orig_bound && v_cnt[pt] > 1 ? v_cnt[pt] : 1;
+            uint32_t vt = 0, pvt = 0;
+            FIND_OR_ADD_VEC(t, cnt, vt);
+            FIND_OR_ADD_PTR(vt, pvt);
+            val_new[a[1]] = vt, ptr_new[a[1]] = pvt;
+            n_vars++;
+        } else if ((op == SPV_OP_ACCESS_CHAIN || op == SPV_OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 &&
+                   a[1] < orig_bound && a[2] < orig_bound && var_t[a[2]]) {
+            uint8_t t = (uint8_t)(var_t[a[2]] - 1);
+            uint32_t pt = pointee[a[0]];
+            uint32_t cnt = pt < orig_bound && v_cnt[pt] > 1 ? v_cnt[pt] : 1;
+            uint32_t vt = 0, pvt = 0;
+            FIND_OR_ADD_VEC(t, cnt, vt);
+            FIND_OR_ADD_PTR(vt, pvt);
+            val_new[a[1]] = vt, ptr_new[a[1]] = pvt;
+        } else if (op == SPV_OP_LOAD && len >= 4 && a[2] < orig_bound && val_new[a[2]]) {
+            n_loads++;
+        }
+        i += len;
+    }
+    #undef ENSURE_SCALAR
+    #undef FIND_OR_ADD_VEC
+    #undef FIND_OR_ADD_PTR
+
+    if (!n_vars) goto out;
+    uint64_t total = n + (uint64_t)nt + (uint64_t)n_loads * 4;
+    o = malloc(total * 4);
+    if (!o) goto out;
+    uint32_t *p = o;
+    memcpy(p, w, 5 * 4), p += 5;
+    for (uint64_t i = 5; i < fn_at;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        memcpy(p, w + i, len * 4);
+        if (op == SPV_OP_VARIABLE && len >= 4 && w[i + 2] < orig_bound && ptr_new[w[i + 2]])
+            p[1] = ptr_new[w[i + 2]];
+        p += len, i += len;
+    }
+    if (nt) memcpy(p, types, (size_t)nt * 4), p += nt;
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if ((op == SPV_OP_ACCESS_CHAIN || op == SPV_OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 &&
+            w[i + 2] < orig_bound && ptr_new[w[i + 2]]) {
+            memcpy(p, w + i, len * 4);
+            p[1] = ptr_new[w[i + 2]];
+            p += len;
+        } else if (op == SPV_OP_LOAD && len >= 4 && w[i + 3] < orig_bound && val_new[w[i + 3]]) {
+            uint32_t orig_res_t = w[i + 1], res_id = w[i + 2], ptr_id = w[i + 3], tmp = bound++;
+            memcpy(p, w + i, len * 4);
+            p[1] = val_new[ptr_id], p[2] = tmp;
+            p += len;
+            p[0] = 4u << 16 | SPV_OP_BITCAST, p[1] = orig_res_t, p[2] = res_id, p[3] = tmp;
+            p += 4;
+        } else {
+            memcpy(p, w + i, len * 4);
+            p += len;
+        }
+        i += len;
+    }
+    o[3] = bound;
+    *out_n = (uint64_t)(p - o);
+out:
+    free(pointee), free(v_elem), free(v_cnt), free(loc_of), free(var_t), free(ptr_new), free(val_new);
+    return o;
+}
+
 // Two fixes for what the translator declares but a shader does not use (NULL: nothing to change):
 //  - the fragment shader interlock capability and extension, which the translator adds to every fragment shader when the host
 //    reports interlock support (SpirvGenerator.cs) and vk_device.c does not enable; kept when the shader interlocks;
@@ -1271,6 +1429,7 @@ typedef struct {                       // normalized: zero where the state is dy
     uint8_t rate[17];                  // per binding: 0 unused, 1 vertex, 2 instance
     uint8_t indep;                     // P.indep when built: the probe draws through both layouts
     uint8_t pad2[2];
+    uint32_t attr_type;                // 2 bits per location 0..15: 0 = shader type, 1/2/3 = GFX_TYPE_* + 1 when mismatched
 } GKey;
 
 static int blendable(VkFormat f) {
@@ -1343,6 +1502,20 @@ static void gkey_fill(const VkPipeState *s, GKey *k) {
             uint8_t *o = k->blend[i];
             o[0] = (uint8_t)blend_factor(b->src_rgb), o[1] = (uint8_t)blend_factor(b->dst_rgb), o[2] = (uint8_t)blend_op(b->eq_rgb);
             o[3] = (uint8_t)blend_factor(b->src_a), o[4] = (uint8_t)blend_factor(b->dst_a), o[5] = (uint8_t)blend_op(b->eq_a);
+        }
+    }
+    if (s->vs) {
+        GfxShaderIo io[32];
+        uint32_t used = gfx_shader_inputs(s->vs, io);
+        for (int l = 0; l < 16; l++) {
+            if (!(used >> l & 1)) continue;
+            va_st va;
+            memcpy(&va, &s->vattr[l], sizeof va);
+            if (!va.fmt || va.stream >= 16) continue;
+            int vtype = GFX_TYPE_FLOAT;
+            VkFormat f = vk_vertex_format((int)va.fmt, &vtype);
+            if (f != VK_FORMAT_UNDEFINED && vtype != io[l].type)
+                k->attr_type |= (uint32_t)(vtype + 1) << (2 * l);
         }
     }
     if (!P.dyn_vi) {
@@ -1441,6 +1614,15 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
         if (fcode) fm = make_module(fcode, fw);
+    }
+    if (k->attr_type && vcode) {
+        uint64_t n2 = 0;
+        uint32_t *rw = spirv_rewrite_inputs(vcode, vw, k->attr_type, &n2);
+        if (!rw) LOG_ONCE("vk_pipeline: cannot rewrite vertex input types (%#x)", k->attr_type);
+        else {
+            free(vpatched);
+            vcode = vpatched = rw, vw = n2;
+        }
     }
     vm = make_module(vcode, vw);
     free(vpatched), free(fpatched);
@@ -1578,7 +1760,7 @@ typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t 
 static Lib *libs[LIB_BUCKETS];
 
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
-typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
+typedef struct { uint32_t kind, missing, attr_type, pad0; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
 typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, pad; const GfxShader *fs; } FsKey;
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, pad[3]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;
@@ -1654,6 +1836,15 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         sw = vw;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
+        if (pk->attr_type && vcode) {
+            uint64_t n3 = 0;
+            uint32_t *rw = spirv_rewrite_inputs(vcode, vw, pk->attr_type, &n3);
+            if (!rw) LOG_ONCE("vk_pipeline: cannot rewrite vertex input types (%#x)", pk->attr_type);
+            else {
+                free(patched);
+                vcode = patched = rw, vw = n3;
+            }
+        }
         if (!(m = make_module(vcode, vw))) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
         pin_subgroup32(&st, &rq, scode, sw);
@@ -1833,7 +2024,7 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
     memcpy(v->attr_bind, k->attr_bind, sizeof v->attr_bind), memcpy(v->rate, k->rate, sizeof v->rate);
     memset(pk, 0, sizeof *pk);
     GfxShaderIo fin[32];
-    pk->kind = LIB_PR, pk->vs = s->vs, pk->clamp = k->clamp, pk->poly_mode = k->poly_mode, pk->minus_w = k->minus_w;
+    pk->kind = LIB_PR, pk->vs = s->vs, pk->attr_type = k->attr_type, pk->clamp = k->clamp, pk->poly_mode = k->poly_mode, pk->minus_w = k->minus_w;
     pk->missing = vs_union_missing(s, fin);
     for (int i = 0; i < 32; i++)
         if (pk->missing >> i & 1) pk->fin[i] = fin[i];

@@ -519,6 +519,7 @@ void vk_device_fault_report(VkResult r) {
     done = 1;
     vk_crumbs_report();
     vk_pass_marks_report();
+    vk_draw_crumbs_report();
     vk_mem_fault_log();
     VkCtx *c = vk_ctx();
     PFN_vkGetDeviceFaultInfoEXT get =

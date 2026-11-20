@@ -3330,9 +3330,77 @@ static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType
     ex->recorded++;
 }
 
+enum { DRAW_CRUMB_N = 32 };
+typedef struct {
+    uint64_t fence, serial;
+    uint32_t kind, a, b, c;
+    uint16_t w, h;
+    uint8_t vs[8], fs[8], cs[8];
+} DrawCrumb;
+static DrawCrumb draw_crumbs[DRAW_CRUMB_N];
+static volatile uint32_t draw_crumb_seq;
+
+static void crumb_key(uint8_t out[8], const GfxShader *s) {
+    const uint8_t *k = s ? gfx_shader_key(s) : NULL;
+    if (k) memcpy(out, k, 8);
+    else memset(out, 0, 8);
+}
+
+static void crumb_draw(const VkExec *ex, uint32_t kind, uint32_t count, uint32_t inst, uint32_t prim) {
+    uint32_t idx = __atomic_fetch_add(&draw_crumb_seq, 1, __ATOMIC_RELAXED) % DRAW_CRUMB_N;
+    DrawCrumb *c = &draw_crumbs[idx];
+    c->fence = ex->fence;
+    c->serial = ex->prog ? ex->prog->serial : 0;
+    c->kind = kind, c->a = count, c->b = inst, c->c = prim;
+    c->w = (uint16_t)ex->pass_w, c->h = (uint16_t)ex->pass_h;
+    crumb_key(c->vs, B.st.vs);
+    crumb_key(c->fs, B.st.fs);
+    memset(c->cs, 0, 8);
+}
+
+static void crumb_disp(const VkExec *ex, const GfxShader *cs, uint32_t kind, uint32_t x, uint32_t y, uint32_t z) {
+    uint32_t idx = __atomic_fetch_add(&draw_crumb_seq, 1, __ATOMIC_RELAXED) % DRAW_CRUMB_N;
+    DrawCrumb *c = &draw_crumbs[idx];
+    c->fence = ex->fence;
+    c->serial = ex->prog ? ex->prog->serial : 0;
+    c->kind = kind, c->a = x, c->b = y, c->c = z;
+    c->w = 0, c->h = 0;
+    memset(c->vs, 0, 8);
+    memset(c->fs, 0, 8);
+    crumb_key(c->cs, cs);
+}
+
+static void fmt_k8(char out[17], const uint8_t k[8]) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | k[i];
+    if (!v) { strcpy(out, "-"); return; }
+    for (int i = 0; i < 8; i++) snprintf(out + 2 * i, 3, "%02x", k[i]);
+}
+
+void vk_draw_crumbs_report(void) {
+    uint32_t seq = __atomic_load_n(&draw_crumb_seq, __ATOMIC_RELAXED);
+    uint32_t n = seq < DRAW_CRUMB_N ? seq : DRAW_CRUMB_N;
+    if (!n) return;
+    rt_log("vk: last %u recorded draws/dispatches (oldest -> newest):", n);
+    static const char *const kname[] = {"draw", "draw_idx", "draw_idx_ind", "draw_ind_multi", "dispatch", "dispatch_ind"};
+    for (uint32_t i = seq - n; i < seq; i++) {
+        const DrawCrumb *c = &draw_crumbs[i % DRAW_CRUMB_N];
+        char vs[17], fs[17], cs[17];
+        fmt_k8(vs, c->vs), fmt_k8(fs, c->fs), fmt_k8(cs, c->cs);
+        const char *kn = c->kind < 6 ? kname[c->kind] : "?";
+        if (c->kind >= 4)
+            rt_log("  [%u] fence=%llu %s %ux%ux%u cs=%s prog=%llu", i, (unsigned long long)c->fence, kn, c->a, c->b, c->c,
+                   cs, (unsigned long long)c->serial);
+        else
+            rt_log("  [%u] fence=%llu %s cnt=%u inst=%u prim=%u %ux%u vs=%s fs=%s prog=%llu", i,
+                   (unsigned long long)c->fence, kn, c->a, c->b, c->c, c->w, c->h, vs, fs, (unsigned long long)c->serial);
+    }
+}
+
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
+    crumb_draw(ex, 0, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, (uint32_t)d->prim);
     vk_exec_frame.draws++;
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
@@ -3385,6 +3453,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     if (d->itype < 0 || d->itype > 2) return warn_once(W_INDEX, "index type %d is unknown: draw skipped", d->itype);
     int restart = restart_for(ex, d->prim, d->itype);
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, restart)) return;
+    crumb_draw(ex, 1, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, (uint32_t)d->prim);
     vk_exec_frame.draws++;
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
@@ -3454,6 +3523,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     if (!vk_mem_resolve(d->ibuf, 1, &ib) || ib.offset % (d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4))
         return warn_once(W_INDEX, "index buffer %#llx is not backed or not aligned: indirect draws skipped", (unsigned long long)d->ibuf);
     if (!prepare_draw(ex, d->prim, 0x7fffffff, restart_for(ex, d->prim, d->itype))) return;
+    crumb_draw(ex, 2, 0, 0, (uint32_t)d->prim);
     vk_exec_frame.draws++;
     VK_MEM_USE(ip);
     VK_MEM_USE(ib);
@@ -3488,6 +3558,7 @@ static void op_draw_ind_multi(VkExec *ex, const p_draw_ind_multi *d) {
         return warn_once(W_INDEX, "index buffer %#llx is not backed or not aligned: indirect draws skipped",
                          (unsigned long long)d->ibuf);
     if (!prepare_draw(ex, d->prim, 0x7fffffff, indexed ? restart_for(ex, d->prim, d->itype) : 0)) return;
+    crumb_draw(ex, 3, (uint32_t)d->max, stride, (uint32_t)d->prim);
     vk_exec_frame.draws++;
     VK_MEM_USE(ip);
     if (d->count) VK_MEM_USE(cp);
@@ -3534,6 +3605,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     bind_resources(ex, info);
     twin_dispatch = 0;
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    crumb_disp(ex, cs, 4, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;
@@ -3572,6 +3644,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         B.c0_valid[2] = 0;   // the range no longer holds B.c0[2]
     }
     VkPassMark *m = dispatch_mark(ex, cs, 0, 0, 0);
+    crumb_disp(ex, cs, 5, 0, 0, 0);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;

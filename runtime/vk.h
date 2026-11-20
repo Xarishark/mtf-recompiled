@@ -86,6 +86,7 @@ void vk_crumbs_release(void);
 // thread that records cb may call it: never into a replay part while the recorder thread owns it (vk_rec.h).
 void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n);
 void vk_crumbs_report(void);         // logs the two codes and what they name
+void vk_draw_crumbs_report(void);    // logs the last 32 recorded draws/dispatches on device loss
 
 // ---- pass marks (vk_crumbs.c): the replay (vk_exec.c vk_exec_pass_begin / vk_exec_pass_end, vk_exec_draw.c
 // op_dispatch) marks where each render pass and dispatch starts and where it ends, so that a device loss names the
