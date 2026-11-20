@@ -304,6 +304,7 @@ static void watchdog_main(void *arg) {
                 rt_log("vk: HANG WATCHDOG (4s no progress): cur_fence=%llu issued=%llu done=%llu gpu_timeline=%llu draw_crumbs=%u",
                        (unsigned long long)cf, (unsigned long long)is, (unsigned long long)dn,
                        (unsigned long long)gpu, dc);
+                if (gpu < is) vk_draw_crumbs_report_fence(gpu + 1);
                 vk_draw_crumbs_report();
                 plat_mutex_lock(&st_lock);
             }

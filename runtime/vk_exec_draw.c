@@ -3330,7 +3330,7 @@ static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType
     ex->recorded++;
 }
 
-enum { DRAW_CRUMB_N = 32 };
+enum { DRAW_CRUMB_N = 4096 };
 typedef struct {
     uint64_t fence, serial;
     uint32_t kind, a, b, c;
@@ -3381,24 +3381,44 @@ uint32_t vk_draw_crumbs_seq(void) {
     return __atomic_load_n(&draw_crumb_seq, __ATOMIC_RELAXED);
 }
 
-void vk_draw_crumbs_report(void) {
+static void print_crumb(uint32_t i, const DrawCrumb *c) {
+    static const char *const kname[] = {"draw", "draw_idx", "draw_idx_ind", "draw_ind_multi", "dispatch", "dispatch_ind"};
+    char vs[17], fs[17], cs[17];
+    fmt_k8(vs, c->vs), fmt_k8(fs, c->fs), fmt_k8(cs, c->cs);
+    const char *kn = c->kind < 6 ? kname[c->kind] : "?";
+    if (c->kind >= 4)
+        rt_log("  [%u] fence=%llu %s %ux%ux%u cs=%s prog=%llu", i, (unsigned long long)c->fence, kn, c->a, c->b, c->c,
+               cs, (unsigned long long)c->serial);
+    else
+        rt_log("  [%u] fence=%llu %s cnt=%u inst=%u prim=%u %ux%u vs=%s fs=%s prog=%llu", i,
+               (unsigned long long)c->fence, kn, c->a, c->b, c->c, c->w, c->h, vs, fs, (unsigned long long)c->serial);
+}
+
+void vk_draw_crumbs_report_fence(uint64_t target_fence) {
     uint32_t seq = __atomic_load_n(&draw_crumb_seq, __ATOMIC_RELAXED);
     uint32_t n = seq < DRAW_CRUMB_N ? seq : DRAW_CRUMB_N;
     if (!n) return;
-    rt_log("vk: last %u recorded draws/dispatches (oldest -> newest):", n);
-    static const char *const kname[] = {"draw", "draw_idx", "draw_idx_ind", "draw_ind_multi", "dispatch", "dispatch_ind"};
+    uint32_t total = 0, printed = 0;
+    for (uint32_t i = seq - n; i < seq; i++)
+        if (draw_crumbs[i % DRAW_CRUMB_N].fence == target_fence) total++;
+    rt_log("vk: recorded draws/dispatches for fence=%llu (%u found in last %u):",
+           (unsigned long long)target_fence, total, n);
     for (uint32_t i = seq - n; i < seq; i++) {
         const DrawCrumb *c = &draw_crumbs[i % DRAW_CRUMB_N];
-        char vs[17], fs[17], cs[17];
-        fmt_k8(vs, c->vs), fmt_k8(fs, c->fs), fmt_k8(cs, c->cs);
-        const char *kn = c->kind < 6 ? kname[c->kind] : "?";
-        if (c->kind >= 4)
-            rt_log("  [%u] fence=%llu %s %ux%ux%u cs=%s prog=%llu", i, (unsigned long long)c->fence, kn, c->a, c->b, c->c,
-                   cs, (unsigned long long)c->serial);
-        else
-            rt_log("  [%u] fence=%llu %s cnt=%u inst=%u prim=%u %ux%u vs=%s fs=%s prog=%llu", i,
-                   (unsigned long long)c->fence, kn, c->a, c->b, c->c, c->w, c->h, vs, fs, (unsigned long long)c->serial);
+        if (c->fence != target_fence) continue;
+        if (printed < 64 || total - printed <= 16) print_crumb(i, c);
+        else if (printed == 64) rt_log("  ... (%u omitted) ...", total - 80);
+        printed++;
     }
+}
+
+void vk_draw_crumbs_report(void) {
+    uint32_t seq = __atomic_load_n(&draw_crumb_seq, __ATOMIC_RELAXED);
+    uint32_t n = seq < 32 ? seq : 32;
+    if (!n) return;
+    rt_log("vk: last %u recorded draws/dispatches (oldest -> newest):", n);
+    for (uint32_t i = seq - n; i < seq; i++)
+        print_crumb(i, &draw_crumbs[i % DRAW_CRUMB_N]);
 }
 
 static void op_draw(VkExec *ex, const p_draw *d) {
