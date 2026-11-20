@@ -281,6 +281,40 @@ static void completion_main(void *arg) {
     return;
 }
 
+static void watchdog_main(void *arg) {
+    VkCtx *c = arg;
+    uint64_t last_cf = 0, last_is = 0, last_dn = 0;
+    uint32_t last_dc = 0;
+    int stall_sec = 0, logged = 0;
+    plat_mutex_lock(&st_lock);
+    while (!stop) {
+        plat_cond_wait_ns(&cv_work, &st_lock, 1000000000ull);
+        if (stop) break;
+        uint64_t cf = __atomic_load_n(&cur_fence, __ATOMIC_RELAXED);
+        uint64_t is = __atomic_load_n(&issued, __ATOMIC_RELAXED);
+        uint64_t dn = __atomic_load_n(&done, __ATOMIC_RELAXED);
+        uint32_t dc = vk_draw_crumbs_seq();
+        if (is > 100 && cf == last_cf && is == last_is && dn == last_dn && dc == last_dc) {
+            stall_sec++;
+            if (stall_sec >= 4 && !logged) {
+                logged = 1;
+                plat_mutex_unlock(&st_lock);
+                uint64_t gpu = 0;
+                vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
+                rt_log("vk: HANG WATCHDOG (4s no progress): cur_fence=%llu issued=%llu done=%llu gpu_timeline=%llu draw_crumbs=%u",
+                       (unsigned long long)cf, (unsigned long long)is, (unsigned long long)dn,
+                       (unsigned long long)gpu, dc);
+                vk_draw_crumbs_report();
+                plat_mutex_lock(&st_lock);
+            }
+        } else {
+            last_cf = cf, last_is = is, last_dn = dn, last_dc = dc;
+            stall_sec = 0, logged = 0;
+        }
+    }
+    plat_mutex_unlock(&st_lock);
+}
+
 void vk_sync_start(void) {
     if (__atomic_load_n(&started, __ATOMIC_ACQUIRE)) return;
     plat_mutex_lock(&start_lock);
@@ -309,6 +343,7 @@ void vk_sync_start(void) {
         vk_mem_note_fence(now);
         completion_thread = plat_thread_new(completion_main, c, "vk completion");
         if (!completion_thread) rt_fatal("vk: cannot start the completion thread");
+        (void)plat_thread_new(watchdog_main, c, "vk watchdog");
         __atomic_store_n(&started, 1, __ATOMIC_RELEASE);
         vk_astc_mode();   // decides MTF_ASTC and builds the ASTC decoder now, not at the first ASTC upload
     }
@@ -399,7 +434,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     plat_mutex_lock(&sub_lock);
     vk_mem_dirty_submit();   // MTF_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
-    cur_fence = fence;
+    __atomic_store_n(&cur_fence, fence, __ATOMIC_RELEASE);
     // Before the first object is resolved: what any thread destroys from here on waits for this value (vk_memory.c
     // defer), since the recording may already name it. Noted after the submit, a game thread finalizing a texture while
     // another one recorded freed the image once the GPU reached the previous value, before this submission ran.

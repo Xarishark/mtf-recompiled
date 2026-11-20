@@ -3377,6 +3377,10 @@ static void fmt_k8(char out[17], const uint8_t k[8]) {
     for (int i = 0; i < 8; i++) snprintf(out + 2 * i, 3, "%02x", k[i]);
 }
 
+uint32_t vk_draw_crumbs_seq(void) {
+    return __atomic_load_n(&draw_crumb_seq, __ATOMIC_RELAXED);
+}
+
 void vk_draw_crumbs_report(void) {
     uint32_t seq = __atomic_load_n(&draw_crumb_seq, __ATOMIC_RELAXED);
     uint32_t n = seq < DRAW_CRUMB_N ? seq : DRAW_CRUMB_N;
