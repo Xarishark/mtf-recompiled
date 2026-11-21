@@ -631,26 +631,78 @@ static void tab_controls(float scale) {
 }
 
 static void tab_multiplayer(float scale) {
-    (void)scale;
     StreamHostInfo info;
     stream_host_info(&info);
+    static bool warn_open = false;
+
     ImGui::BeginChild("##mp_stream", ImVec2(0, -opt_bottom()), false);
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Browser Streaming (TryCloudflare / WebCodecs)");
     ImGui::TextWrapped("Hosts the game on this PC as Player 1 and streams video/audio to a browser link. "
                        "Remote players open the link in Chrome/Edge and automatically control Player 2-4.");
     ImGui::Spacing();
+
     if (info.state == STREAM_STATE_OFF) {
-        if (ImGui::Button("Start Streaming Server (Cloudflare)", ImVec2(320 * scale, 0))) stream_host_start();
+        if (ImGui::Button("Start Streaming Server", ImVec2(240 * scale, 0))) {
+            if (info.cf_installed) stream_host_start();
+            else {
+                warn_open = true;
+                ImGui::OpenPopup("Privacy Warning##no_cf_warn");
+            }
+        }
     } else {
         if (ImGui::Button("Stop Streaming Server", ImVec2(240 * scale, 0))) stream_host_stop();
     }
+
+    ImGui::SameLine(0, 18 * scale);
+    if (info.cf_installed) {
+        ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.45f, 1), "[x] cloudflared.exe installed");
+    } else {
+        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.30f, 1), "[ ] cloudflared.exe not installed");
+        ImGui::SameLine(0, 12 * scale);
+        if (info.cf_installing) {
+            ImGui::BeginDisabled();
+            ImGui::Button("Installing cloudflared...", ImVec2(210 * scale, 0));
+            ImGui::EndDisabled();
+        } else {
+            if (ImGui::Button("Install Cloudflare", ImVec2(180 * scale, 0))) stream_host_install_cloudflared();
+        }
+    }
+    if (info.cf_install_msg[0]) {
+        ImGui::TextDisabled("%s", info.cf_install_msg);
+    }
+
+    if (ImGui::BeginPopupModal("Privacy Warning##no_cf_warn", &warn_open, ImGuiWindowFlags_AlwaysAutoResize)) {
+        g_modal = true;
+        ImGui::PushTextWrapPos(480 * scale);
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "Warning: cloudflared.exe is not installed.");
+        ImGui::Spacing();
+        ImGui::TextWrapped("If you share your stream without Cloudflare (direct connection / port forwarding), "
+                           "your public IP address will be exposed to the connected players.\n\n"
+                           "Install Cloudflare first to hide your IP behind a trycloudflare.com tunnel, "
+                           "or click OK to start the local server anyway.");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        if (ImGui::Button("OK", ImVec2(140 * scale, 0))) {
+            stream_host_start();
+            warn_open = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(140 * scale, 0)) ||
+            ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
+            warn_open = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
     const char *st = info.state == STREAM_STATE_OFF        ? "Offline"
                    : info.state == STREAM_STATE_STARTING   ? "Starting Cloudflare tunnel..."
                    : info.state == STREAM_STATE_LIVE       ? "Online (Cloudflare)"
-                   : info.state == STREAM_STATE_LOCAL_ONLY ? "Local Only (cloudflared.exe not found)"
+                   : info.state == STREAM_STATE_LOCAL_ONLY ? "Local Only (No Cloudflare)"
                                                            : "Error";
     ImGui::Text("Status: %s", st);
     if (info.state != STREAM_STATE_OFF) {
@@ -667,16 +719,11 @@ static void tab_multiplayer(float scale) {
             if (ImGui::Button("Copy Link##cf", ImVec2(140 * scale, 0))) SDL_SetClipboardText(info.public_url);
         }
         if (info.local_url[0]) {
-            ImGui::Text("Local Link (same PC / LAN test):");
+            ImGui::Text("Local Link (exposes IP if shared directly):");
             ImGui::SetNextItemWidth(-160 * scale);
             ImGui::InputText("##loc_url", info.local_url, sizeof(info.local_url), ImGuiInputTextFlags_ReadOnly);
             ImGui::SameLine();
             if (ImGui::Button("Copy Link##loc", ImVec2(140 * scale, 0))) SDL_SetClipboardText(info.local_url);
-        }
-        ImGui::Spacing();
-        if (info.state == STREAM_STATE_LOCAL_ONLY) {
-            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1),
-                               "Tip: Place cloudflared.exe next to mtf-recomp.exe or in PATH to generate public trycloudflare links.");
         }
     }
     ImGui::EndChild();

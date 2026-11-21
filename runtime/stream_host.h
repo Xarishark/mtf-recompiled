@@ -19,14 +19,19 @@ typedef struct {
     int state;
     int clients;
     int port;
+    int cf_installed;
+    int cf_installing;
     char code[16];
     char local_url[128];
     char public_url[256];
     char status_msg[160];
+    char cf_install_msg[128];
     uint64_t frames_sent;
     uint64_t bytes_sent;
 } StreamHostInfo;
 
+int stream_host_has_cloudflared(void);
+int stream_host_install_cloudflared(void);
 int stream_host_start(void);
 void stream_host_stop(void);
 int stream_host_active(void);

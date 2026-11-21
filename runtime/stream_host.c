@@ -55,6 +55,8 @@ static HANDLE g_cf_pipe_r = NULL;
 static HANDLE g_srv_thread = NULL;
 static HANDLE g_cf_thread = NULL;
 static int g_atexit_registered = 0;
+static volatile int g_cf_installing = 0;
+static char g_cf_install_msg[128] = {0};
 
 // Video encoder state (protected by g_enc_lock)
 static PlatMutex g_enc_lock = PLAT_MUTEX_INIT;
@@ -482,6 +484,81 @@ static int find_cloudflared(char *out, size_t cap) {
     return 0;
 }
 
+int stream_host_has_cloudflared(void) {
+    char tmp[MAX_PATH];
+    return find_cloudflared(tmp, sizeof(tmp));
+}
+
+static DWORD WINAPI cf_install_thread(LPVOID arg) {
+    (void)arg;
+    char exe[MAX_PATH], dst[MAX_PATH], tmp[MAX_PATH], cmd[1024];
+    if (GetModuleFileNameA(NULL, exe, MAX_PATH) == 0) {
+        plat_mutex_lock(&g_lock);
+        snprintf(g_cf_install_msg, sizeof(g_cf_install_msg), "Failed to resolve executable path");
+        g_cf_installing = 0;
+        plat_mutex_unlock(&g_lock);
+        return 1;
+    }
+    char *sl = strrchr(exe, '\\');
+    if (sl) *sl = 0;
+    snprintf(dst, sizeof(dst), "%s\\cloudflared.exe", exe);
+    snprintf(tmp, sizeof(tmp), "%s\\cloudflared.exe.tmp", exe);
+    DeleteFileA(tmp);
+
+    snprintf(cmd, sizeof(cmd),
+             "curl.exe -fsSL -L --retry 2 -o \"%s\" "
+             "\"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe\"",
+             tmp);
+    STARTUPINFOA si = {sizeof(si)};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {0};
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    DWORD exit_code = 1;
+    if (ok) {
+        WaitForSingleObject(pi.hProcess, 180000);
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    if (ok && exit_code == 0 && GetFileAttributesA(tmp) != INVALID_FILE_ATTRIBUTES &&
+        MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING)) {
+        plat_mutex_lock(&g_lock);
+        snprintf(g_cf_install_msg, sizeof(g_cf_install_msg), "Installed cloudflared.exe");
+        g_cf_installing = 0;
+        plat_mutex_unlock(&g_lock);
+        rt_log("stream: installed cloudflared.exe to %s", dst);
+        return 0;
+    }
+    DeleteFileA(tmp);
+    plat_mutex_lock(&g_lock);
+    snprintf(g_cf_install_msg, sizeof(g_cf_install_msg),
+             "Download failed (exit %lu). Check internet or place cloudflared.exe next to mtf-recomp.exe",
+             (unsigned long)exit_code);
+    g_cf_installing = 0;
+    plat_mutex_unlock(&g_lock);
+    rt_log("stream: cloudflared.exe download failed (ok=%d exit=%lu)", (int)ok, (unsigned long)exit_code);
+    return 1;
+}
+
+int stream_host_install_cloudflared(void) {
+    plat_mutex_lock(&g_lock);
+    if (g_cf_installing) { plat_mutex_unlock(&g_lock); return 0; }
+    g_cf_installing = 1;
+    snprintf(g_cf_install_msg, sizeof(g_cf_install_msg), "Downloading cloudflared.exe...");
+    plat_mutex_unlock(&g_lock);
+    HANDLE th = CreateThread(NULL, 0, cf_install_thread, NULL, 0, NULL);
+    if (!th) {
+        plat_mutex_lock(&g_lock);
+        g_cf_installing = 0;
+        snprintf(g_cf_install_msg, sizeof(g_cf_install_msg), "Failed to start installer thread");
+        plat_mutex_unlock(&g_lock);
+        return 0;
+    }
+    CloseHandle(th);
+    return 1;
+}
+
 static DWORD WINAPI cf_reader_thread(LPVOID arg) {
     (void)arg;
     char buf[512];
@@ -677,9 +754,12 @@ int stream_host_active(void) { return g_running != 0; }
 
 void stream_host_info(StreamHostInfo *out) {
     if (!out) return;
+    int has_cf = stream_host_has_cloudflared();
     plat_mutex_lock(&g_lock);
     out->state = g_state;
     out->port = g_port;
+    out->cf_installed = has_cf;
+    out->cf_installing = g_cf_installing;
     int c = 0;
     for (int i = 0; i < STREAM_MAX_CLIENTS; i++) c += g_clients[i].active ? 1 : 0;
     out->clients = c;
@@ -687,6 +767,7 @@ void stream_host_info(StreamHostInfo *out) {
     snprintf(out->local_url, sizeof(out->local_url), "%s", g_local_url);
     snprintf(out->public_url, sizeof(out->public_url), "%s", g_public_url);
     snprintf(out->status_msg, sizeof(out->status_msg), "%s", g_status_msg);
+    snprintf(out->cf_install_msg, sizeof(out->cf_install_msg), "%s", g_cf_install_msg);
     out->frames_sent = g_frames_sent;
     out->bytes_sent = g_bytes_sent;
     plat_mutex_unlock(&g_lock);
