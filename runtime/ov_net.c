@@ -25,30 +25,40 @@ static void unavailable(Cpu *c) { ret_x(c, RES_UNAVAILABLE); }
 static void zero(Cpu *c) { ret_x(c, 0); }
 
 // ---- nn::ldn: local wireless (Link Play) via ldn.c when MTF_NET=ldn, or offline when MTF_NET=offline.
-static void ldn_ov_init(Cpu *c) { ret_x(c, ldn_initialize()); }
-static void ldn_ov_fini(Cpu *c) { (void)c; ldn_finalize(); }
+static void ldn_ov_init(Cpu *c) { uint32_t r = ldn_initialize(); rt_log("ldn: Initialize() -> %#x", r); ret_x(c, r); }
+static void ldn_ov_fini(Cpu *c) { (void)c; rt_log("ldn: Finalize()"); ldn_finalize(); }
 static void ldn_ov_state(Cpu *c) { ret_x(c, ldn_get_state()); }
 static void ldn_ov_attach(Cpu *c) {
+    rt_log("ldn: AttachStateChangeEvent(%#llx)", (unsigned long long)arg_x(c, 0));
     kern_bind_system_event(c, arg_x(c, 0), 0);
     ldn_attach_state_event(arg_x(c, 0));
 }
-static void ldn_ov_open_station(Cpu *c) { ret_x(c, ldn_open_station()); }
-static void ldn_ov_close_station(Cpu *c) { ret_x(c, ldn_close_station()); }
-static void ldn_ov_open_ap(Cpu *c) { ret_x(c, ldn_open_access_point()); }
-static void ldn_ov_close_ap(Cpu *c) { ret_x(c, ldn_close_access_point()); }
-static void ldn_ov_disconnect(Cpu *c) { ret_x(c, ldn_disconnect()); }
-static void ldn_ov_destroy(Cpu *c) { ret_x(c, ldn_destroy_network()); }
+static void ldn_ov_open_station(Cpu *c) { uint32_t r = ldn_open_station(); rt_log("ldn: OpenStation() -> %#x", r); ret_x(c, r); }
+static void ldn_ov_close_station(Cpu *c) { uint32_t r = ldn_close_station(); rt_log("ldn: CloseStation() -> %#x", r); ret_x(c, r); }
+static void ldn_ov_open_ap(Cpu *c) { uint32_t r = ldn_open_access_point(); rt_log("ldn: OpenAccessPoint() -> %#x", r); ret_x(c, r); }
+static void ldn_ov_close_ap(Cpu *c) { uint32_t r = ldn_close_access_point(); rt_log("ldn: CloseAccessPoint() -> %#x", r); ret_x(c, r); }
+static void ldn_ov_disconnect(Cpu *c) { uint32_t r = ldn_disconnect(); rt_log("ldn: Disconnect() -> %#x", r); ret_x(c, r); }
+static void ldn_ov_destroy(Cpu *c) { uint32_t r = ldn_destroy_network(); rt_log("ldn: DestroyNetwork() -> %#x", r); ret_x(c, r); }
 static void ldn_ov_scan(Cpu *c) {
-    ret_x(c, ldn_scan(arg_p(c, 0), arg_p(c, 1), (int32_t)arg_x(c, 4), arg_p(c, 3)));
+    int32_t *cnt = arg_p(c, 1);
+    uint32_t r = ldn_scan(arg_p(c, 0), cnt, (int32_t)arg_x(c, 4), arg_p(c, 3));
+    rt_log("ldn: Scan(max=%d) -> %#x (found=%d)", (int)arg_x(c, 4), r, cnt ? *cnt : -1);
+    ret_x(c, r);
 }
 static void ldn_ov_create(Cpu *c) {
-    ret_x(c, ldn_create_network(arg_p(c, 0), arg_p(c, 1), arg_p(c, 2)));
+    uint32_t r = ldn_create_network(arg_p(c, 0), arg_p(c, 1), arg_p(c, 2));
+    rt_log("ldn: CreateNetwork() -> %#x", r);
+    ret_x(c, r);
 }
 static void ldn_ov_create_priv(Cpu *c) {
-    ret_x(c, ldn_create_network(arg_p(c, 0), arg_p(c, 1), arg_p(c, 3)));
+    uint32_t r = ldn_create_network(arg_p(c, 0), arg_p(c, 1), arg_p(c, 3));
+    rt_log("ldn: CreateNetworkPrivate() -> %#x", r);
+    ret_x(c, r);
 }
 static void ldn_ov_connect(Cpu *c) {
-    ret_x(c, ldn_connect(arg_p(c, 0), arg_p(c, 1), arg_p(c, 2)));
+    uint32_t r = ldn_connect(arg_p(c, 0), arg_p(c, 1), arg_p(c, 2));
+    rt_log("ldn: Connect() -> %#x", r);
+    ret_x(c, r);
 }
 static void ldn_ov_get_net_info(Cpu *c) { ret_x(c, ldn_get_network_info(arg_p(c, 0))); }
 static void ldn_ov_ip(Cpu *c) { ret_x(c, ldn_get_ipv4_address(arg_p(c, 0), arg_p(c, 1))); }
@@ -87,10 +97,15 @@ HOST_OVERRIDE("_ZN2nn3ldn6RejectENS0_11Ipv4AddressE", ldn_ov_ok_if_enabled);
 // ---- nn::nifm: available when LDN is active, otherwise offline. The request is on hold for the first query after
 // a submission, as the service evaluates it asynchronously on the console (network threads rely on that order).
 static volatile int32_t nifm_hold;
-static void nifm_submit(Cpu *c) { (void)c; plat_xchg32(&nifm_hold, 1); }
-static void nifm_cancel(Cpu *c) { (void)c; plat_xchg32(&nifm_hold, 0); }
+static void nifm_submit(Cpu *c) { (void)c; rt_log("nifm: SubmitNetworkRequest()"); plat_xchg32(&nifm_hold, 1); }
+static void nifm_cancel(Cpu *c) { (void)c; rt_log("nifm: CancelNetworkRequest()"); plat_xchg32(&nifm_hold, 0); }
 static void nifm_on_hold(Cpu *c) { ret_x(c, (uint64_t)(plat_xchg32(&nifm_hold, 0) > 0)); }
-static void nifm_available(Cpu *c) { ret_x(c, (uint64_t)ldn_nifm_available()); }
+static void nifm_available(Cpu *c) {
+    int a = ldn_nifm_available();
+    static int logged = -1;
+    if (logged != a) { logged = a; rt_log("nifm: IsNetworkAvailable() -> %d", a); }
+    ret_x(c, (uint64_t)a);
+}
 static void nifm_ip(Cpu *c) {
     if (ldn_enabled()) {
         ret_x(c, ldn_nifm_ip_info(arg_p(c, 0), arg_p(c, 1), arg_p(c, 2), arg_p(c, 3), arg_p(c, 4)));
@@ -121,7 +136,9 @@ static int efd_index(int fd) { return fd >= EFD_BASE && fd < EFD_BASE + EFD_MAX 
 
 static void sk_errno(Cpu *c) { ret_x(c, (uint64_t)(ldn_enabled() ? ldn_sock_last_errno() : SK_ENETDOWN)); }
 static void sk_socket(Cpu *c) {
-    ret_x(c, (uint64_t)(int64_t)ldn_sock_socket((int)arg_x(c, 0), (int)arg_x(c, 1), (int)arg_x(c, 2)));
+    int fd = ldn_sock_socket((int)arg_x(c, 0), (int)arg_x(c, 1), (int)arg_x(c, 2));
+    rt_log("socket: Socket(fam=%d, type=%d, proto=%d) -> %d", (int)arg_x(c, 0), (int)arg_x(c, 1), (int)arg_x(c, 2), fd);
+    ret_x(c, (uint64_t)(int64_t)fd);
 }
 static void sk_bind(Cpu *c) {
     ret_x(c, (uint64_t)(int64_t)ldn_sock_bind((int)arg_x(c, 0), arg_p(c, 1), (uint32_t)arg_x(c, 2)));

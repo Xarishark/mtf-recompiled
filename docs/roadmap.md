@@ -95,10 +95,13 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
 5. **Menu de Configurações (`F1`) & Remapeamento de Controles**
    - [x] Portar remapeamento completo de teclado (2 slots + `SHAKE` + analógicos) e gamepad (`binds_page.cpp` + `input_map.{c,h}` + `input_capture` + `MTF_BIND_*`) na aba Controles do menu `F1` (sub-abas **Controle** e **Teclado**, salvamento imediato em `mtf.ini` e aplicação ao vivo).
    - [x] Complementar a aba Avançado do menu `F1` com as opções da Tier 2 (`MTF_REPLAY_THREADS`, `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, `MTF_NAN_GUARD`).
-6. **Multiplayer Online / Link Play (Prioridade Máxima após Menu de Configurações)**
+6. **Multiplayer Online / Link Play (Prioridade Máxima — Branch `feat/multiplayer-ldn`)**
+   Roadmap completo e backlog detalhado em [docs/multiplayer-roadmap.md](multiplayer-roadmap.md).
    - [x] Mapear os serviços de rede/sessão local do Switch 2 usados por *Mario Tennis Fever* (`nn::ldn`, `nn::socket` / `bsd:u`, `nn::nifm`, `nn::friends`) via `bindb.sqlite` e traces de execução: confirmado uso de `nn::ldn` completo + `nn::nifm` + `nn::socket` exclusivamente UDP (`Socket`, `Bind`, `SetSockOpt`, `SendTo`, `RecvFrom`, `Poll`, `Close`, `Shutdown`, `EventFd*`).
-   - [x] Implementar camada HLE *clean-room* MIT de **Link Play** (`runtime/ldn.h`, `runtime/ldn.c`, `runtime/ov_net.c`, `runtime/cfg.c`) com `nn::ldn` sobre UDP (`LDN1` na porta `MTF_LDN_PORT=11452`, sub-rede virtual `10.114.0.0/16`, mapeamento de portas efêmeras para 2 instâncias no mesmo PC, broadcast LAN e peer remoto via `MTF_LDN_HOST`) + backend `nn::socket` UDP/Winsock2 + `WSAPoll`.
-   - [ ] Validar conexão, descoberta de sala, sincronização de partida e estabilidade entre dois clientes Windows em rede local e internet.
+   - [x] Implementar camada HLE *clean-room* MIT de **Link Play** (`runtime/ldn.h`, `runtime/ldn.c`, `runtime/ov_net.c`, `runtime/cfg.c`) + seleção de inputs Multiplayer (`P1..P4`) no menu `F1` + correções de crash (`ProfanityFilter`) e *split-screen* (`vk_dlaa.c`).
+   - [ ] **Fase 1:** Destravar o fluxo completo de **Local Play** dentro do jogo e validar partida UDP entre duas instâncias.
+   - [ ] **Fase 2:** MVP P2P com **Código de Sala** ofuscado (sem servidor) entre PCs distintos.
+   - [ ] **Fase 3:** Servidor Gateway/Relay leve (oculta IP do Host + salas públicas/privadas) e tela **Online Room** no `F1`.
 7. **Diagnóstico, Mods & Pipeline de Build**
    - [ ] Portar `flight.c` (`FLIGHT`), `vk_crumbs.c`, `prof_win.c`/`perf.c`, `rdoc.c`, `mods_scan.h` (`ROMFS_MODS`/`ROMFS_PATCHES`), `MOUSE_CAMERA` e `RUMBLE_TRIGGERS`.
    - [ ] Manter `tools/build_fork.py` + `tools/mtf_launcher.py` alinhados à build limpa do fork.
