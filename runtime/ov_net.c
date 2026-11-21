@@ -12,6 +12,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "ldn.h"
 #include "platform/platform.h"
 
 #define RES_UNAVAILABLE 0x2A2u   // the generic failure of a network feature that is not there
@@ -23,55 +24,78 @@ static void ok(Cpu *c) { ret_x(c, 0); }
 static void unavailable(Cpu *c) { ret_x(c, RES_UNAVAILABLE); }
 static void zero(Cpu *c) { ret_x(c, 0); }
 
-// ---- nn::ldn: local wireless is cut; scans find nothing, the state event never fires
-static void ldn_scan(Cpu *c) {
-    int32_t *n = arg_p(c, 1);
-    if (n) *n = 0;
-    ret_x(c, RES_UNAVAILABLE);
+// ---- nn::ldn: local wireless (Link Play) via ldn.c when MTF_NET=ldn, or offline when MTF_NET=offline.
+static void ldn_ov_init(Cpu *c) { ret_x(c, ldn_initialize()); }
+static void ldn_ov_fini(Cpu *c) { (void)c; ldn_finalize(); }
+static void ldn_ov_state(Cpu *c) { ret_x(c, ldn_get_state()); }
+static void ldn_ov_attach(Cpu *c) {
+    kern_bind_system_event(c, arg_x(c, 0), 0);
+    ldn_attach_state_event(arg_x(c, 0));
 }
-static void ldn_ip(Cpu *c) {
-    uint32_t *a = arg_p(c, 0), *m = arg_p(c, 1);
-    if (a) *a = 0;
-    if (m) *m = 0;
-    ret_x(c, RES_UNAVAILABLE);
+static void ldn_ov_open_station(Cpu *c) { ret_x(c, ldn_open_station()); }
+static void ldn_ov_close_station(Cpu *c) { ret_x(c, ldn_close_station()); }
+static void ldn_ov_open_ap(Cpu *c) { ret_x(c, ldn_open_access_point()); }
+static void ldn_ov_close_ap(Cpu *c) { ret_x(c, ldn_close_access_point()); }
+static void ldn_ov_disconnect(Cpu *c) { ret_x(c, ldn_disconnect()); }
+static void ldn_ov_destroy(Cpu *c) { ret_x(c, ldn_destroy_network()); }
+static void ldn_ov_scan(Cpu *c) {
+    ret_x(c, ldn_scan(arg_p(c, 0), arg_p(c, 1), (int32_t)arg_x(c, 4), arg_p(c, 3)));
 }
-static void ldn_attach(Cpu *c) { kern_bind_system_event(c, arg_x(c, 0), 0); }
+static void ldn_ov_create(Cpu *c) {
+    ret_x(c, ldn_create_network(arg_p(c, 0), arg_p(c, 1), arg_p(c, 2)));
+}
+static void ldn_ov_create_priv(Cpu *c) {
+    ret_x(c, ldn_create_network(arg_p(c, 0), arg_p(c, 1), arg_p(c, 3)));
+}
+static void ldn_ov_connect(Cpu *c) {
+    ret_x(c, ldn_connect(arg_p(c, 0), arg_p(c, 1), arg_p(c, 2)));
+}
+static void ldn_ov_get_net_info(Cpu *c) { ret_x(c, ldn_get_network_info(arg_p(c, 0))); }
+static void ldn_ov_ip(Cpu *c) { ret_x(c, ldn_get_ipv4_address(arg_p(c, 0), arg_p(c, 1))); }
+static void ldn_ov_get_sec(Cpu *c) { ret_x(c, ldn_get_security_parameter(arg_p(c, 0))); }
+static void ldn_ov_set_adv(Cpu *c) { ret_x(c, ldn_set_advertise_data(arg_p(c, 0), arg_x(c, 1))); }
+static void ldn_ov_ok_if_enabled(Cpu *c) { ret_x(c, ldn_enabled() ? LDN_RES_OK : RES_UNAVAILABLE); }
 
-HOST_OVERRIDE("_ZN2nn3ldn10InitializeEv", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn8FinalizeEv", nothing);
-HOST_OVERRIDE("_ZN2nn3ldn8GetStateEv", zero);
-HOST_OVERRIDE("_ZN2nn3ldn22AttachStateChangeEventEPNS_2os15SystemEventTypeE", ldn_attach);
+HOST_OVERRIDE("_ZN2nn3ldn10InitializeEv", ldn_ov_init);
+HOST_OVERRIDE("_ZN2nn3ldn8FinalizeEv", ldn_ov_fini);
+HOST_OVERRIDE("_ZN2nn3ldn8GetStateEv", ldn_ov_state);
+HOST_OVERRIDE("_ZN2nn3ldn22AttachStateChangeEventEPNS_2os15SystemEventTypeE", ldn_ov_attach);
 HOST_OVERRIDE("_ZN2nn3ldn11SetProtocolENS0_8ProtocolE", nothing);
-HOST_OVERRIDE("_ZN2nn3ldn11OpenStationEv", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn12CloseStationEv", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn15OpenAccessPointEv", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn16CloseAccessPointEv", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn10DisconnectEv", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn14DestroyNetworkEv", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", ldn_scan);
-HOST_OVERRIDE("_ZN2nn3ldn11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", ldn_scan);
-HOST_OVERRIDE("_ZN2nn3ldn13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE", unavailable);
+HOST_OVERRIDE("_ZN2nn3ldn11OpenStationEv", ldn_ov_open_station);
+HOST_OVERRIDE("_ZN2nn3ldn12CloseStationEv", ldn_ov_close_station);
+HOST_OVERRIDE("_ZN2nn3ldn15OpenAccessPointEv", ldn_ov_open_ap);
+HOST_OVERRIDE("_ZN2nn3ldn16CloseAccessPointEv", ldn_ov_close_ap);
+HOST_OVERRIDE("_ZN2nn3ldn10DisconnectEv", ldn_ov_disconnect);
+HOST_OVERRIDE("_ZN2nn3ldn14DestroyNetworkEv", ldn_ov_destroy);
+HOST_OVERRIDE("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", ldn_ov_scan);
+HOST_OVERRIDE("_ZN2nn3ldn11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", ldn_ov_scan);
+HOST_OVERRIDE("_ZN2nn3ldn13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE", ldn_ov_create);
 HOST_OVERRIDE("_ZN2nn3ldn20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE",
-              unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE", unavailable);
+              ldn_ov_create_priv);
+HOST_OVERRIDE("_ZN2nn3ldn7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE", ldn_ov_connect);
 HOST_OVERRIDE("_ZN2nn3ldn14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE",
               unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn14GetNetworkInfoEPNS0_11NetworkInfoE", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE", ldn_ip);
-HOST_OVERRIDE("_ZN2nn3ldn20GetSecurityParameterEPNS0_17SecurityParameterE", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn16SetAdvertiseDataEPKvm", unavailable);
+HOST_OVERRIDE("_ZN2nn3ldn14GetNetworkInfoEPNS0_11NetworkInfoE", ldn_ov_get_net_info);
+HOST_OVERRIDE("_ZN2nn3ldn14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE", ldn_ov_ip);
+HOST_OVERRIDE("_ZN2nn3ldn20GetSecurityParameterEPNS0_17SecurityParameterE", ldn_ov_get_sec);
+HOST_OVERRIDE("_ZN2nn3ldn16SetAdvertiseDataEPKvm", ldn_ov_set_adv);
 HOST_OVERRIDE("_ZN2nn3ldn19GetDisconnectReasonEv", zero);
-HOST_OVERRIDE("_ZN2nn3ldn20AddAcceptFilterEntryENS0_10MacAddressE", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn22SetStationAcceptPolicyENS0_12AcceptPolicyE", unavailable);
-HOST_OVERRIDE("_ZN2nn3ldn6RejectENS0_11Ipv4AddressE", unavailable);
+HOST_OVERRIDE("_ZN2nn3ldn20AddAcceptFilterEntryENS0_10MacAddressE", ldn_ov_ok_if_enabled);
+HOST_OVERRIDE("_ZN2nn3ldn22SetStationAcceptPolicyENS0_12AcceptPolicyE", ldn_ov_ok_if_enabled);
+HOST_OVERRIDE("_ZN2nn3ldn6RejectENS0_11Ipv4AddressE", ldn_ov_ok_if_enabled);
 
-// ---- nn::nifm: the network is never available. The request is on hold for the first query after a submission, as
-// the service evaluates it asynchronously on the console (network threads rely on that order).
+// ---- nn::nifm: available when LDN is active, otherwise offline. The request is on hold for the first query after
+// a submission, as the service evaluates it asynchronously on the console (network threads rely on that order).
 static volatile int32_t nifm_hold;
 static void nifm_submit(Cpu *c) { (void)c; plat_xchg32(&nifm_hold, 1); }
 static void nifm_cancel(Cpu *c) { (void)c; plat_xchg32(&nifm_hold, 0); }
 static void nifm_on_hold(Cpu *c) { ret_x(c, (uint64_t)(plat_xchg32(&nifm_hold, 0) > 0)); }
+static void nifm_available(Cpu *c) { ret_x(c, (uint64_t)ldn_nifm_available()); }
 static void nifm_ip(Cpu *c) {
+    if (ldn_enabled()) {
+        ret_x(c, ldn_nifm_ip_info(arg_p(c, 0), arg_p(c, 1), arg_p(c, 2), arg_p(c, 3), arg_p(c, 4)));
+        return;
+    }
     for (int i = 0; i < 5; i++) {
         uint32_t *p = arg_p(c, i);
         if (p) *p = 0;
@@ -79,7 +103,7 @@ static void nifm_ip(Cpu *c) {
     ret_x(c, RES_UNAVAILABLE);
 }
 HOST_OVERRIDE("_ZN2nn4nifm10InitializeEv", ok);
-HOST_OVERRIDE("_ZN2nn4nifm18IsNetworkAvailableEv", zero);
+HOST_OVERRIDE("_ZN2nn4nifm18IsNetworkAvailableEv", nifm_available);
 HOST_OVERRIDE("_ZN2nn4nifm19SetLocalNetworkModeEb", nothing);
 HOST_OVERRIDE("_ZN2nn4nifm20SubmitNetworkRequestEv", nifm_submit);
 HOST_OVERRIDE("_ZN2nn4nifm20CancelNetworkRequestEv", nifm_cancel);
@@ -88,16 +112,35 @@ HOST_OVERRIDE("_ZN2nn4nifm22GetCurrentIpConfigInfoEPNS_6socket6InAddrES3_S3_S3_S
 HOST_OVERRIDE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", unavailable);
 HOST_OVERRIDE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", zero);   // bool: the system screen resolved nothing
 
-// ---- nn::socket: the library initialises, every socket fails with ENETDOWN. Event descriptors work: they are host
-// counters a game's network thread uses to wake itself.
+// ---- nn::socket: UDP backend over Winsock2 (ldn.c) when MTF_NET=ldn, plus host EventFd counters.
 #define EFD_BASE 0x4000
 #define EFD_MAX 64
 static struct { volatile int used; volatile uint64_t count; int semaphore; } efd[EFD_MAX];
 static PlatMutex efd_lock = PLAT_MUTEX_INIT;
 static int efd_index(int fd) { return fd >= EFD_BASE && fd < EFD_BASE + EFD_MAX && efd[fd - EFD_BASE].used ? fd - EFD_BASE : -1; }
 
-static void sk_fail(Cpu *c) { ret_x(c, (uint64_t)-1); }
-static void sk_errno(Cpu *c) { ret_x(c, SK_ENETDOWN); }
+static void sk_errno(Cpu *c) { ret_x(c, (uint64_t)(ldn_enabled() ? ldn_sock_last_errno() : SK_ENETDOWN)); }
+static void sk_socket(Cpu *c) {
+    ret_x(c, (uint64_t)(int64_t)ldn_sock_socket((int)arg_x(c, 0), (int)arg_x(c, 1), (int)arg_x(c, 2)));
+}
+static void sk_bind(Cpu *c) {
+    ret_x(c, (uint64_t)(int64_t)ldn_sock_bind((int)arg_x(c, 0), arg_p(c, 1), (uint32_t)arg_x(c, 2)));
+}
+static void sk_setsockopt(Cpu *c) {
+    ret_x(c, (uint64_t)(int64_t)ldn_sock_setsockopt((int)arg_x(c, 0), (int)arg_x(c, 1), (int)arg_x(c, 2),
+                                                     arg_p(c, 3), (uint32_t)arg_x(c, 4)));
+}
+static void sk_sendto(Cpu *c) {
+    ret_x(c, (uint64_t)ldn_sock_sendto((int)arg_x(c, 0), arg_p(c, 1), arg_x(c, 2), (int)arg_x(c, 3),
+                                       arg_p(c, 4), (uint32_t)arg_x(c, 5)));
+}
+static void sk_recvfrom(Cpu *c) {
+    ret_x(c, (uint64_t)ldn_sock_recvfrom((int)arg_x(c, 0), arg_p(c, 1), arg_x(c, 2), (int)arg_x(c, 3),
+                                         arg_p(c, 4), arg_p(c, 5)));
+}
+static void sk_shutdown(Cpu *c) {
+    ret_x(c, (uint64_t)(int64_t)ldn_sock_shutdown((int)arg_x(c, 0), (int)arg_x(c, 1)));
+}
 static void sk_gai(Cpu *c) {
     void **res = arg_p(c, 3);
     if (res) *res = NULL;
@@ -142,16 +185,18 @@ static void sk_eventfd_write(Cpu *c) {
     ret_x(c, 0);
 }
 static void sk_close(Cpu *c) {
-    int i = efd_index((int)arg_x(c, 0));
+    int fd = (int)arg_x(c, 0);
+    int i = efd_index(fd);
     if (i >= 0) {
         efd[i].used = 0;
         ret_x(c, 0);
+    } else if (ldn_sock_is_fd(fd)) {
+        ret_x(c, (uint64_t)(int64_t)ldn_sock_close(fd));
     } else {
         ret_x(c, (uint64_t)-1);
     }
 }
-// int Poll(pollfd *, nfds, timeout ms): event descriptors with a count are readable; nothing else ever is. With none
-// ready the timeout passes (a negative one is capped at 100 ms: no other descriptor can become ready).
+// int Poll(pollfd *, nfds, timeout ms): checks both event descriptors and LDN UDP sockets.
 typedef struct { int32_t fd; int16_t events, revents; } PollFd;
 static void sk_poll(Cpu *c) {
     PollFd *p = arg_p(c, 0);
@@ -162,8 +207,18 @@ static void sk_poll(Cpu *c) {
         int ready = 0;
         for (uint64_t k = 0; p && k < n; k++) {
             int i = efd_index(p[k].fd);
-            p[k].revents = (int16_t)(i >= 0 && efd[i].count && (p[k].events & 1) ? 1 : 0);
-            ready += p[k].revents != 0;
+            if (i >= 0) {
+                p[k].revents = (int16_t)(efd[i].count && (p[k].events & 1) ? 1 : 0);
+                ready += p[k].revents != 0;
+            } else {
+                int16_t rev = 0;
+                if (ldn_sock_poll_ready(p[k].fd, p[k].events, &rev)) {
+                    p[k].revents = rev;
+                    ready += rev != 0;
+                } else {
+                    p[k].revents = 0;
+                }
+            }
         }
         uint64_t now = kern_now_ns();
         if (ready || now >= deadline) { ret_x(c, (uint64_t)ready); return; }
@@ -178,16 +233,16 @@ static void one(Cpu *c) { ret_x(c, 1); }
 HOST_OVERRIDE("_ZN2nn6socket13IsInitializedEv", one);   // bool: Initialize succeeded
 HOST_OVERRIDE("_ZN2nn6socket12GetLastErrnoEv", sk_errno);
 HOST_OVERRIDE("_ZN2nn6socket12GetLastErrorEv", sk_errno);
-HOST_OVERRIDE("_ZN2nn6socket6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket6SocketEiii", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket4BindEiPK8sockaddrj", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket4BindEiPKNS0_8SockAddrEj", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", sk_fail);
-HOST_OVERRIDE("_ZN2nn6socket8ShutdownEii", sk_fail);
+HOST_OVERRIDE("_ZN2nn6socket6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE", sk_socket);
+HOST_OVERRIDE("_ZN2nn6socket6SocketEiii", sk_socket);
+HOST_OVERRIDE("_ZN2nn6socket4BindEiPK8sockaddrj", sk_bind);
+HOST_OVERRIDE("_ZN2nn6socket4BindEiPKNS0_8SockAddrEj", sk_bind);
+HOST_OVERRIDE("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", sk_setsockopt);
+HOST_OVERRIDE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", sk_sendto);
+HOST_OVERRIDE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", sk_sendto);
+HOST_OVERRIDE("_ZN2nn6socket8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj", sk_recvfrom);
+HOST_OVERRIDE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", sk_recvfrom);
+HOST_OVERRIDE("_ZN2nn6socket8ShutdownEii", sk_shutdown);
 HOST_OVERRIDE("_ZN2nn6socket5CloseEi", sk_close);
 HOST_OVERRIDE("_ZN2nn6socket4PollEP6pollfdmi", sk_poll);
 HOST_OVERRIDE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", sk_eventfd);
