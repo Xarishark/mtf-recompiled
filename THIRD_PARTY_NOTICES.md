@@ -28,6 +28,7 @@ Files that contain adapted code say so in their first lines.
 | Roboto Medium | https://fonts.google.com/specimen/Roboto, Copyright 2011 Google Inc. | Apache-2.0 (`runtime/ui/fonts/LICENSE-Roboto.txt`) | `runtime/ui/fonts/Roboto-Medium.ttf`, embedded in the menu |
 | Optical-flow frame generation (`vk_framegen.c`, `fg_*_spv.h`) | Adapted from [mkw-recomp](https://github.com/adriadam10/mkw-recomp) (`runtime/gfx/vk/device/vk_framegen.c`), after [SkyboundTotk](https://github.com/NotRexed/SkyboundTotk) @ `a4495f9` | MIT | `runtime/vk_framegen.c`, `runtime/fg_{luma,flow,median,synth}_spv.h` |
 | SDF button icon renderer (`glyph_draw.c`, `glyph_draw.h`) | [mkw-recomp](https://github.com/adriadam10/mkw-recomp) (`runtime/ui/glyphs/glyph_draw.{c,h}`), after [SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp) | MIT | `runtime/glyph_draw.c`, `runtime/glyph_draw.h` |
+| DKB Recomp memory & VRAM optimizations (`vk_headroom.c`, `HEAP_LAZY`, `SPARSE_MIRROR_COPY`) | Adapted from `dkb-pc-recomp` @ `4e7f9b2` (`runtime/vk_headroom.c`, `runtime/platform/win32.c`, `runtime/memory.c`, `runtime/vk_memory.c`, `runtime/mirror_sparse_spv.h`, `runtime/shaders/mirror_sparse.comp`) | MIT | `runtime/vk_headroom.c`, `runtime/platform/{platform.h,win32.c}`, `runtime/memory.c`, `runtime/romfs.c`, `runtime/fs_host.c`, `runtime/vk_memory.c`, `runtime/mirror_sparse_spv.h`, `runtime/shaders/mirror_sparse.comp` |
 
 Design ideas taken without code: Savage Wind Recomp (https://github.com/Revivedx/SavageWindRecomp), for the recorder
 thread and the depth twins of `vk_exec_draw.c`.

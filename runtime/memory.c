@@ -118,6 +118,8 @@ void mem_thaw(uint64_t a, uint64_t n) {
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
 // reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again.
+static int heap_lazy(void);
+
 static int freeze_locked(uint64_t r) {
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[16][2];
     int n = 0;
@@ -126,7 +128,7 @@ static int freeze_locked(uint64_t r) {
         if (st >= PLAT_PROT_NONE) {
             if (st != PLAT_PROT_RW || n == 16) return 0;
             run[n][0] = x, run[n][1] = y, n++;
-        } else if (st != PLAT_MEM_RESERVED) return 0;
+        } else if (st != PLAT_MEM_RESERVED || (heap_lazy() && x >= L.heap.base && x < L.heap.base + heap_size)) return 0;
     }
     for (int i = 0; i < n; i++)
         if (!plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_READ)) {
@@ -308,15 +310,50 @@ static int overlaps(uint64_t a, uint64_t n, uint64_t b, uint64_t m) { return a <
 static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <= r.size && a - r.base <= r.size - n; }
 
 // ---- 0x01 SetHeapSize
+// MTF_HEAP_LAZY=1 (Windows only): guest heap pages commit on first touch via fault_veh, reducing commit charge.
+static int heap_lazy(void) {
+#ifdef _WIN32
+    static int on = -1;
+    if (on < 0) on = cfg_bool("MTF_HEAP_LAZY");
+    return on;
+#else
+    return 0;
+#endif
+}
+
+void mem_touch(uint64_t a, uint64_t n) {
+    if (!n || !heap_lazy()) return;
+    uint64_t lo = L.heap.base, hi = lo + __atomic_load_n(&heap_size, __ATOMIC_RELAXED);
+    uint64_t s = a & ~0xffffull, e = (a + n + 0xffff) & ~0xffffull;
+    if (s < lo) s = lo;
+    if (e > hi) e = hi;
+    if (s >= e) return;
+    plat_mutex_lock(&frz_lock);
+    for (uint64_t x = s, y; x < e; x = y) {
+        int st = plat_mem_state(x, e, &y);
+        if (st == PLAT_MEM_RESERVED && !plat_mem_commit(x, y - x)) {
+            plat_mutex_unlock(&frz_lock);
+            rt_fatal("memory: lazy heap commit %#llx+%#llx failed", (unsigned long long)x, (unsigned long long)(y - x));
+        }
+    }
+    plat_mutex_unlock(&frz_lock);
+}
+
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     plat_mutex_lock(&lock);
     if (size > L.heap.size || size % 0x200000 || size + image_bytes() > L.pool) {
         plat_mutex_unlock(&lock);
         return R_INVALID_STATE;
     }
-    if (size > heap_size) commit(L.heap.base + heap_size, size - heap_size, "heap");
+    if (size > heap_size && !heap_lazy()) commit(L.heap.base + heap_size, size - heap_size, "heap");
+#ifdef _WIN32
+    if (heap_lazy() && size < heap_size) plat_mem_lazy(L.heap.base, size);
+#endif
     if (size < heap_size) decommit(L.heap.base + size, heap_size - size, "heap");
     heap_size = size;
+#ifdef _WIN32
+    if (heap_lazy()) plat_mem_lazy(L.heap.base, heap_size);
+#endif
     plat_mutex_unlock(&lock);
     if (addr) *addr = L.heap.base;
     return R_OK;

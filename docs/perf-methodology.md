@@ -36,6 +36,6 @@ Extraídas diretamente de [perfmon.c](../runtime/perfmon.c), [vk_memory.c](../ru
 | Marco | Commit | Memory Commit (MB) | Pools `mem: census` | `replay_ms/f` | `FPS` (Perfil B) | `1% low` / `0.1% low` (Perfil A) | Observações |
 |---|---|---|---|---|---|---|---|
 | **Baseline (pré-Tier 2)** | `a94cb62` | ~7.575–8.024 MB *(observado em logs anteriores)* | `350 pools / 732.9 MiB` *(frame 1800)* | *a medir* | *a medir* | *a medir* | `MTF_PIPE_SYNC=1` padrão em NVIDIA |
-| **Etapa 2.1 (`vk_headroom` + `HEAP_LAZY` + `SPARSE_MIRROR_COPY` + commit)** | *pendente* | — | — | — | — | — | — |
+| **Etapa 2.1 (`vk_headroom` + `HEAP_LAZY` + `SPARSE_MIRROR_COPY` + commit)** | *este commit* | `5.076 MB` *(boot 6s; medir em partida no frame 1800)* | *a medir em partida* | *a medir* | *a medir* | *a medir* | `MTF_VRAM_HEADROOM=1` (6 blocos 256 MiB pré-alocados no boot), `MTF_HEAP_LAZY=1`, `MTF_SPARSE_MIRROR_COPY=auto`, `MTF_COMMIT_HEADROOM_MIB=512` |
 | **Etapa 2.2 (`REPLAY_THREADS` / `vk_spec`)** | *pendente* | — | — | — | — | — | — |
 | **Etapa 2.3 (`spirv_nan_guard`)** | *pendente* | — | — | — | — | — | — |

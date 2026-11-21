@@ -860,6 +860,7 @@ static File *file_of(uint64_t h, PlatFile **fh, int *mode) {
 // Positional reads: bytes read at off, 0 at the end, -1 on an error.
 static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     mem_thaw((uintptr_t)buf, n);   // the kernel's write would fail on a frozen page instead of faulting
+    mem_touch((uintptr_t)buf, n);
     int64_t got = plat_file_pread(f, buf, n, off);
     if (got == -2)   // a read-only page in the buffer: a frozen region missed its thaw
         rt_log("fs: read of %u bytes into %p refused: the buffer is not writable", n, buf);
@@ -932,6 +933,7 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     if (file->save) save_touched();
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
+        mem_touch((uintptr_t)buffer + done, chunk);
         int64_t put = plat_file_pwrite(f, (const uint8_t *)buffer + done, chunk, (uint64_t)offset + done);
         if (put <= 0) rt_fatal("fs: host save write failure");
         done += (uint64_t)put;

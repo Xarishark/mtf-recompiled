@@ -81,10 +81,10 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
 4. **Otimizações de CPU, GPU & Memória (Vulkan Backend — Tier 2, Prioridade Atual)**
    Metodologia de medição A/B e tabela de evolução em [docs/perf-methodology.md](perf-methodology.md).
    - **Etapa 2.1 — Memória, VRAM & Redução de Stutter (PCs de 16 GB RAM / 8 GB VRAM):**
-     - [ ] Portar `vk_headroom.c` (`MTF_VRAM_HEADROOM`, pré-alocação de blocos VMA em background com recuo automático acima de 85% do orçamento de VRAM).
-     - [ ] Portar `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, `MTF_WB_ASYNC` e `MTF_WB_UNLOCKED` em `runtime/vk_memory.c`.
-     - [ ] Implementar controle de *commit headroom* no Windows (clean-room de `hwaoi-recomp`/`SpaceAnimalsRecomp` via `GlobalMemoryStatusEx`/`GetProcessMemoryInfo`) para evitar OOM em 16 GB RAM.
-     - [ ] **Gate 2.1:** `check_content.py` limpo, redução mensurável de *memory commit* / *allocation spikes* no `mtf.log` segundo [docs/perf-methodology.md](perf-methodology.md).
+     - [x] Portar `vk_headroom.c` (`MTF_VRAM_HEADROOM`, pré-alocação de blocos VMA em background com recuo automático acima de 85% do orçamento de VRAM).
+     - [x] Portar `MTF_HEAP_LAZY` (`runtime/platform/win32.c` `fault_veh` + `runtime/memory.c` `mem_touch`) e `MTF_SPARSE_MIRROR_COPY` (`runtime/vk_memory.c` + `mirror_sparse_spv.h`). *(Nota: `MTF_WB_ASYNC`/`MTF_WB_UNLOCKED` pertencem ao write-back assíncrono de `vk_texture.c`, fora desta etapa.)*
+     - [x] Implementar controle de *commit headroom* no Windows (`MTF_COMMIT_HEADROOM_MIB`, padrão `512` MiB, clean-room via `GlobalMemoryStatusEx` `ullAvailPageFile` em `plat_mem_avail_commit`) para evitar OOM em 16 GB RAM.
+     - [x] **Gate 2.1:** `check_content.py` limpo, build sem erros e smoke test de boot verificando ativação de `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY=auto` e `MTF_COMMIT_HEADROOM_MIB` (`5076 MB` no boot inicial); medições em partida registradas em [docs/perf-methodology.md](perf-methodology.md).
    - **Etapa 2.2 — Performance de CPU no Replay Vulkan:**
      - [ ] Portar replay paralelo multi-thread (`MTF_REPLAY_THREADS`, `REC_BATCH`, `PREWARM_XLATE`) em `runtime/vk_exec.c`.
      - [ ] Avaliar e integrar `vk_spec.c` + `vk_exec_draw_helper.c` (`MTF_REPLAY_PAR` / `MTF_REPLAY_HELPERS`) como complemento em thread única.

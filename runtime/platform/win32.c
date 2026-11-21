@@ -540,18 +540,80 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 }
 
 static int (*fault_hook)(uint64_t addr);
+static volatile uint64_t lazy_base, lazy_end, lazy_faults, lazy_fail_addr;
+static volatile uint32_t lazy_fail_err;
 
-// A write access violation (ExceptionInformation[0] == 1) goes to the hook; registered first, before the crash handler.
+void plat_mem_lazy(uint64_t base, uint64_t size) {
+    __atomic_store_n(&lazy_base, base, __ATOMIC_RELAXED);
+    __atomic_store_n(&lazy_end, base + size, __ATOMIC_RELEASE);
+}
+
+uint64_t plat_mem_lazy_faults(void) { return __atomic_load_n(&lazy_faults, __ATOMIC_RELAXED); }
+
+uint32_t plat_mem_lazy_failure(uint64_t *addr) {
+    *addr = __atomic_load_n(&lazy_fail_addr, __ATOMIC_RELAXED);
+    return __atomic_load_n(&lazy_fail_err, __ATOMIC_RELAXED);
+}
+
+static int lazy_commit(uint64_t addr, uint64_t lo, uint64_t hi) {
+    uint64_t a = addr & ~0xffffull, e = a + 0x10000;
+    if (a < lo) a = lo;
+    if (e > hi) e = hi;
+    for (uint64_t x = a, y; x < e; x = y) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((void *)(uintptr_t)x, &mbi, sizeof mbi)) return 0;
+        y = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (y > e) y = e;
+        if (mbi.State != MEM_RESERVE) continue;
+        DWORD err = 0;
+        int ok = 0;
+        for (int t = 0; t < 5 && !ok; t++) {
+            if (t) Sleep(20);
+            ok = VirtualAlloc((void *)(uintptr_t)x, y - x, MEM_COMMIT, PAGE_READWRITE) != NULL;
+            if (!ok) err = GetLastError();
+        }
+        if (!ok) {
+            __atomic_store_n(&lazy_fail_addr, x, __ATOMIC_RELAXED);
+            __atomic_store_n(&lazy_fail_err, (uint32_t)err, __ATOMIC_RELAXED);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// An access violation inside the lazy heap range on a reserved page commits 64 KiB and retries; write-watch faults go
+// to fault_hook. Registered first, before the crash handler. No lock.
 static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
-        return EXCEPTION_CONTINUE_SEARCH;
-    return fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    uint64_t a = (uint64_t)er->ExceptionInformation[1];
+    uint64_t hi = __atomic_load_n(&lazy_end, __ATOMIC_ACQUIRE), lo = __atomic_load_n(&lazy_base, __ATOMIC_RELAXED);
+    if (er->ExceptionInformation[0] <= 1 && a >= lo && a < hi) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) && mbi.State == MEM_RESERVE) {
+            lazy_commit(a, lo, hi);
+            __atomic_add_fetch(&lazy_faults, 1, __ATOMIC_RELAXED);
+        }
+        if (VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD)) {
+            DWORD p = mbi.Protect & 0xff;
+            if (p == PAGE_READWRITE || (p == PAGE_READONLY && er->ExceptionInformation[0] == 0))
+                return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    if (er->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
+    return fault_hook(a) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
     AddVectoredExceptionHandler(1, fault_veh);
+}
+
+int plat_mem_avail_commit(uint64_t *avail_bytes) {
+    MEMORYSTATUSEX ms = { .dwLength = sizeof ms };
+    if (!GlobalMemoryStatusEx(&ms)) return 0;
+    *avail_bytes = (uint64_t)ms.ullAvailPageFile;
+    return 1;
 }
 
 static void (*crash_fn)(const PlatCrash *c);
@@ -804,9 +866,13 @@ void plat_reexec(void) {
 int plat_mem_readable(uint64_t addr, uint64_t n) {
     for (uint64_t a = addr, end = addr + n; a < end || a == addr;) {
         MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
-        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+        if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) return 0;
+        int lazy = mbi.State == MEM_RESERVE && a >= __atomic_load_n(&lazy_base, __ATOMIC_RELAXED) &&
+                   a < __atomic_load_n(&lazy_end, __ATOMIC_ACQUIRE);
+        if (!lazy && mbi.State != MEM_COMMIT) return 0;
+        if (!lazy && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
         a = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (lazy && a > __atomic_load_n(&lazy_end, __ATOMIC_ACQUIRE)) a = __atomic_load_n(&lazy_end, __ATOMIC_ACQUIRE);
         if (a >= end) return 1;
     }
     return 1;

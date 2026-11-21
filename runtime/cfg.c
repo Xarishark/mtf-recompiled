@@ -150,6 +150,7 @@ static CfgMeta metas[] = {
     {"GPL", "0", "0|1", RESTART},
     // textures and memory
     {"ASTC", NULL, "auto|gpu|native|cpu", RESTART}, {"MEMORY", NULL, "auto|import|mirror|verify", RESTART},
+    {"SPARSE_MIRROR_COPY", NULL, "0|1", RESTART}, {"COMMIT_HEADROOM_MIB", "512", NULL, RESTART},
     {"TEX_ALIAS", NULL, "0|1", RESTART}, {"TEX_VRAM_PRESSURE", NULL, "0..100", RESTART}, {"ASTC_BC", "", "0|1", RESTART},
     // render fixes
     {"FIX_C0", NULL, "0|1", RESTART}, {"FIX_ZERO", NULL, "0|1", RESTART}, {"BIND_SKIP", "1", "0|1", RESTART},
@@ -157,7 +158,7 @@ static CfgMeta metas[] = {
     {"DESC_TEMPLATE", NULL, "0|1", RESTART}, {"PUSH_SKIP", NULL, "0|1", RESTART}, {"SPLIT_DRAWS", NULL, "0..1000", RESTART},
     // Vulkan
     {"VK_VALIDATION", "0", "0|1", RESTART}, {"VK_DYN_VERTEX", "", "0|1", RESTART}, {"VK_DYN_A2C", "", "0|1", RESTART},
-    {"VK_SUBGROUP_PIN", NULL, "0|1", RESTART},
+    {"VK_SUBGROUP_PIN", NULL, "0|1", RESTART}, {"VRAM_HEADROOM", "1", "0|1", RESTART}, {"HEAP_LAZY", "1", "0|1", RESTART},
     // diagnostics
     {"TRACE", "", NULL, RESTART},
 };

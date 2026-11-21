@@ -169,6 +169,7 @@ void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse afte
 int mem_guest_readable(uint64_t a, uint64_t n);            // [a, a+n) can be read without a fault: inside a loaded
                                                            // module or the committed heap answered from the layout,
                                                            // anything else by plat_mem_readable (an OS query)
+void mem_touch(uint64_t a, uint64_t n);                    // commits the lazy guest heap (MTF_HEAP_LAZY) over [a, a+n)
 
 // ---- modules (loader.c)
 typedef struct {

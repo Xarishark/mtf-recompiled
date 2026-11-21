@@ -477,6 +477,7 @@ static void destroy_all(void) {
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
+    if (g_vk.device) vk_mem_sparse_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
     vk_headroom_stop();
     if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);

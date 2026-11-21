@@ -300,9 +300,6 @@ void vk_contact_pass_begin(VkExec *ex) { (void)ex; }   // vk_exec.h
 void vk_crumbs_init(VkCtx *c) { (void)c; }   // vk.h
 void vk_crumbs_release(void) {  }   // vk.h
 void vk_crumbs_report(void) {  }   // vk.h
-const VmaDeviceMemoryCallbacks * vk_headroom_callbacks(void) {  return NULL; }   // vk.h
-void vk_headroom_start(void) {  }   // vk.h
-void vk_headroom_stop(void) {  }   // vk.h
 void vk_mvprev_draw(VkExec *ex) { (void)ex; }   // vk_dlaa.h
 void vk_mvsurvey_draw(VkExec *ex) { (void)ex; }   // vk_dlaa.h
 VkPassMark * vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) { (void)cb, (void)kind, (void)fence; return NULL; }   // vk.h

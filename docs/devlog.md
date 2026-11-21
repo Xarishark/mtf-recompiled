@@ -183,3 +183,18 @@
   - Standalone `spv_repro.exe` on `RTX 5070 Ti` (`610.88`): `0fa55a01f31ef9a6.spv` hung with `vkQueueWaitIdle: -4`, and passed (`vkQueueWaitIdle: 0`) after rewriting `SSign` to `SClamp(x, -1, 1)`.
   - User verified Lightning Racket match runs without freezing/crashing, and `MTF_PIPE_SYNC=1` passed 10 consecutive matches with distinct characters and rackets.
   - Rebuilt `build/fork/bin/mtf-recomp.exe` (`0` errors) and verified `python tools/check_content.py` (`0` violations).
+
+### 2026-11-20 — Tier 2 / Etapa 2.1: Memória, VRAM Headroom, Lazy Heap & Sparse Mirror Copy
+- **Changes:**
+  - `runtime/vk_headroom.c`, `CMakeLists.txt`, `runtime/gfx_stubs.c`, `runtime/cfg.c`: Ported `vk_headroom.c` (`MTF_VRAM_HEADROOM=1` default) from `dkb-pc-recomp` (`4e7f9b2`, MIT) to pre-allocate the next 256 MiB VMA block per memory type in background and back off above 85% of VRAM budget.
+  - `runtime/platform/platform.h`, `runtime/platform/win32.c`, `runtime/host.h`, `runtime/memory.c`, `runtime/romfs.c`, `runtime/fs_host.c`, `runtime/vk_memory.c`, `runtime/cfg.c`: Ported `MTF_HEAP_LAZY=1` (default) via `fault_veh` 64 KiB on-demand commit + `mem_touch` before host file reads / pool imports.
+  - `runtime/vk_memory.c`, `runtime/mirror_sparse_spv.h`, `runtime/shaders/mirror_sparse.comp`, `runtime/vk.h`, `runtime/vk_device.c`, `runtime/cfg.c`: Ported `MTF_SPARSE_MIRROR_COPY` (compute dispatch for small write-back ranges, `auto` on NVIDIA) from `dkb-pc-recomp` (`4e7f9b2`, MIT).
+  - `runtime/platform/win32.c` (`plat_mem_avail_commit`), `runtime/vk_memory.c`, `runtime/cfg.c`: Added clean-room Windows commit headroom (`MTF_COMMIT_HEADROOM_MIB=512` default) using `GlobalMemoryStatusEx` (`ullAvailPageFile`) to keep pools imported instead of mirroring when system commit charge is tight.
+- **Verification:**
+  - Built `build/fork/bin/mtf-recomp.exe` cleanly via `ninja` (`0` errors).
+  - 6s smoke test (`build/fork/bin/mtf-recomp.exe`, `alive=True`, commit `5076 MB`) confirmed `build/fork/bin/logs/mtf.log` entries:
+    - `mem: small write-back ranges are copied by one compute dispatch a pool (MTF_SPARSE_MIRROR_COPY=auto)`
+    - `mem: Windows commit headroom 512 MiB (MTF_COMMIT_HEADROOM_MIB)`
+    - `vk: headroom: a 256 MiB block of memory type ... allocated ahead (6 so far; 13 allocations of 32 MiB or more on other threads)`
+  - A/B boot check for `HEAP_LAZY`: `HEAP_LAZY=0` (`5072 MB` at 6s) vs `HEAP_LAZY=1` (`5079.3 MB` at 6s); commit savings take effect when guest expands heap via `svcSetHeapSize`.
+  - Verified `python tools/check_content.py` (`0` violations).

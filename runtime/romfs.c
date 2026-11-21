@@ -137,6 +137,7 @@ uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uin
     uint64_t done = 0;
     while (done < want) {
         uint32_t chunk = want - done > 0x40000000ull ? 0x40000000u : (uint32_t)(want - done);
+        mem_touch((uintptr_t)buffer + done, chunk);
         int64_t got = plat_file_pread(f, (uint8_t *)buffer + done, chunk, (uint64_t)offset + done);
         if (got < 0)
             rt_fatal("romfs: read of %u bytes at %#llx failed (%s)", chunk, (unsigned long long)(offset + done),
