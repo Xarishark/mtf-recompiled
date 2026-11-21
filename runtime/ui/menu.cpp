@@ -646,11 +646,21 @@ static void tab_multiplayer(float scale) {
     if (info.state == STREAM_STATE_OFF) {
         reveal_link = false;
         if (!info.cf_installed) ImGui::BeginDisabled();
-        if (ImGui::Button("CloudFlare (recommended)", ImVec2(240 * scale, 0))) stream_host_start_mode(1);
+        if (ImGui::Button("CloudFlare (recommended)", ImVec2(220 * scale, 0))) stream_host_start_mode(STREAM_MODE_CLOUDFLARE);
         if (!info.cf_installed) ImGui::EndDisabled();
 
-        ImGui::SameLine(0, 12 * scale);
-        if (ImGui::Button("Local Host", ImVec2(160 * scale, 0))) {
+        ImGui::SameLine(0, 10 * scale);
+        if (ImGui::Button("WebRTC (Low Latency UDP)", ImVec2(230 * scale, 0))) {
+            if (info.cf_installed) {
+                stream_host_start_mode(STREAM_MODE_WEBRTC);
+            } else {
+                warn_open = true;
+                ImGui::OpenPopup("Privacy Warning##no_cf_warn");
+            }
+        }
+
+        ImGui::SameLine(0, 10 * scale);
+        if (ImGui::Button("Local Host", ImVec2(140 * scale, 0))) {
             warn_open = true;
             ImGui::OpenPopup("Privacy Warning##no_cf_warn");
         }
@@ -706,9 +716,9 @@ static void tab_multiplayer(float scale) {
     ImGui::Separator();
     ImGui::Spacing();
     const char *st = info.state == STREAM_STATE_OFF        ? "Offline"
-                   : info.state == STREAM_STATE_STARTING   ? "Starting Cloudflare tunnel..."
-                   : info.state == STREAM_STATE_LIVE       ? "Online (Cloudflare)"
-                   : info.state == STREAM_STATE_LOCAL_ONLY ? "Online (Local Host)"
+                   : info.state == STREAM_STATE_STARTING   ? (info.mode == STREAM_MODE_WEBRTC ? "Starting WebRTC + Cloudflare..." : "Starting Cloudflare tunnel...")
+                   : info.state == STREAM_STATE_LIVE       ? (info.mode == STREAM_MODE_WEBRTC ? "Online (WebRTC UDP)" : "Online (Cloudflare WS)")
+                   : info.state == STREAM_STATE_LOCAL_ONLY ? (info.mode == STREAM_MODE_WEBRTC ? "Online (WebRTC Local)" : "Online (Local Host)")
                                                            : "Error";
     ImGui::Text("Status: %s", st);
     if (info.state != STREAM_STATE_OFF) {

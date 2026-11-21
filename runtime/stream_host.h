@@ -8,6 +8,12 @@ extern "C" {
 #endif
 
 enum {
+    STREAM_MODE_LOCAL = 0,
+    STREAM_MODE_CLOUDFLARE = 1,
+    STREAM_MODE_WEBRTC = 2,
+};
+
+enum {
     STREAM_STATE_OFF = 0,
     STREAM_STATE_STARTING = 1,
     STREAM_STATE_LOCAL_ONLY = 2,
@@ -19,6 +25,7 @@ typedef struct {
     int state;
     int clients;
     int port;
+    int mode;
     int use_cf;
     int cf_installed;
     int cf_installing;

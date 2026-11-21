@@ -16,6 +16,7 @@
 #include "host.h"
 #include "platform/platform.h"
 #include "stream_host.h"
+#include "stream_webrtc.h"
 
 #define STREAM_PORT_DEFAULT 11455
 #define STREAM_MAX_CLIENTS 3   // Players 2..4 (indices 1..3)
@@ -37,6 +38,7 @@ static PlatMutex g_lock = PLAT_MUTEX_INIT;
 static PlatMutex g_send_lock = PLAT_MUTEX_INIT;
 static volatile int g_running = 0;
 static volatile int g_state = STREAM_STATE_OFF;
+static volatile int g_mode = STREAM_MODE_CLOUDFLARE;
 static volatile int g_use_cf = 0;
 static SOCKET g_listen = INVALID_SOCKET;
 static int g_port = STREAM_PORT_DEFAULT;
@@ -138,7 +140,40 @@ static int sock_send_all(SOCKET s, const uint8_t *buf, size_t len) {
     return 0;
 }
 
+static void ws_send_frame(SOCKET s, uint8_t opcode, const uint8_t *payload, size_t len) {
+    uint8_t hdr[10];
+    size_t hlen = 0;
+    hdr[0] = 0x80 | (opcode & 0x0f);
+    if (len < 126) {
+        hdr[1] = (uint8_t)len;
+        hlen = 2;
+    } else if (len < 65536) {
+        hdr[1] = 126;
+        hdr[2] = (uint8_t)(len >> 8);
+        hdr[3] = (uint8_t)(len & 0xff);
+        hlen = 4;
+    } else {
+        hdr[1] = 127;
+        for (int i = 0; i < 8; i++) hdr[2 + i] = (uint8_t)(((uint64_t)len >> ((7 - i) * 8)) & 0xff);
+        hlen = 10;
+    }
+    plat_mutex_lock(&g_send_lock);
+    if (s != INVALID_SOCKET) {
+        sock_send_all(s, hdr, hlen);
+        if (len) sock_send_all(s, payload, len);
+    }
+    plat_mutex_unlock(&g_send_lock);
+}
+
 static void ws_broadcast_bin(const uint8_t *payload, size_t len) {
+    if (g_mode == STREAM_MODE_WEBRTC) {
+        webrtc_broadcast_media(payload, len);
+        int any = 0;
+        for (int i = 0; i < STREAM_MAX_CLIENTS; i++)
+            if (webrtc_peer_is_open(i)) { any = 1; break; }
+        if (any) g_bytes_sent += len;
+        return;
+    }
     uint8_t hdr[10];
     size_t hlen = 0;
     hdr[0] = 0x82; // FIN + Binary
@@ -199,7 +234,7 @@ static const char k_html_page[] =
 "<script>"
 "const qs=new URLSearchParams(location.search),roomCode=(qs.get('code')||'').toUpperCase();"
 "const statEl=document.getElementById('stat'),cv=document.getElementById('cv'),ctx=cv.getContext('2d',{alpha:false,desynchronized:true});"
-"let ws=null,vdec=null,adec=null,actx=null,audioOn=false,cropMode=0,nextPlayTime=0,needKf=true;"
+"let ws=null,pc=null,dcIn=null,vdec=null,adec=null,actx=null,audioOn=false,cropMode=0,nextPlayTime=0,needKf=true,useRtc=false;"
 "const keys={};"
 "window.addEventListener('keydown',e=>{keys[e.code]=1;if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))e.preventDefault();});"
 "window.addEventListener('keyup',e=>{keys[e.code]=0;});"
@@ -229,17 +264,8 @@ static const char k_html_page[] =
 "src.start(nextPlayTime);nextPlayTime+=buf.duration;},error:e=>console.error('adec',e)});"
 "adec.configure({codec:'opus',sampleRate:48000,numberOfChannels:2});}"
 "}"
-"function connect(){"
-"if(ws){ws.close();ws=null;}"
-"if(!('VideoDecoder'in window)){statEl.textContent='WebCodecs not supported in this browser';return;}"
-"initDecoders();"
-"const proto=location.protocol==='https:'?'wss://':'ws://';"
-"ws=new WebSocket(proto+location.host+'/ws'+(roomCode?'?code='+encodeURIComponent(roomCode):''));"
-"ws.binaryType='arraybuffer';"
-"ws.onopen=()=>{statEl.textContent='Connected (waiting frames...)';};"
-"ws.onclose=e=>{statEl.textContent='Disconnected ('+(e.reason||e.code)+')';};"
-"ws.onmessage=ev=>{"
-"const u=new Uint8Array(ev.data),dv=new DataView(ev.data),t=u[0];"
+"function onMediaBuf(ab){"
+"const u=new Uint8Array(ab),dv=new DataView(ab),t=u[0];"
 "if(t===1&&vdec&&vdec.state==='configured'){"
 "const kf=u[1]===1,ts=dv.getUint32(6,true)*1000;"
 "if(needKf&&!kf)return; needKf=false;"
@@ -247,7 +273,44 @@ static const char k_html_page[] =
 "}else if(t===2&&adec&&adec.state==='configured'&&audioOn){"
 "const ts=dv.getUint32(4,true)*1000;"
 "adec.decode(new EncodedAudioChunk({type:'key',timestamp:ts,data:u.subarray(8)}));"
-"}else if(t===3){statEl.textContent='Connected as Player '+(u[1]+1);}"
+"}else if(t===3){"
+"useRtc=u.length>2&&u[2]===1;"
+"statEl.textContent='Connected as Player '+(u[1]+1)+(useRtc?' (WebRTC UDP negotiating...)':' (WebSocket)');"
+"if(useRtc)startRtc(u[1]+1);"
+"}}"
+"async function startRtc(pnum){"
+"if(pc){try{pc.close()}catch(_){}}"
+"dcIn=null;"
+"pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});"
+"pc.onicecandidate=e=>{if(e.candidate&&ws&&ws.readyState===1)"
+"ws.send(JSON.stringify({type:'candidate',candidate:e.candidate.candidate,mid:e.candidate.sdpMid||'0'}));};"
+"pc.ondatachannel=ev=>{"
+"const dc=ev.channel;dc.binaryType='arraybuffer';"
+"if(dc.label==='media'){dc.onopen=()=>{statEl.textContent='Connected as Player '+pnum+' (WebRTC UDP)';};"
+"dc.onmessage=m=>onMediaBuf(m.data);}"
+"else if(dc.label==='input'){dcIn=dc;}"
+"};}"
+"function connect(){"
+"if(pc){try{pc.close()}catch(_){} pc=null; dcIn=null;}"
+"if(ws){ws.close();ws=null;}"
+"if(!('VideoDecoder'in window)){statEl.textContent='WebCodecs not supported in this browser';return;}"
+"initDecoders();useRtc=false;"
+"const proto=location.protocol==='https:'?'wss://':'ws://';"
+"ws=new WebSocket(proto+location.host+'/ws'+(roomCode?'?code='+encodeURIComponent(roomCode):''));"
+"ws.binaryType='arraybuffer';"
+"ws.onopen=()=>{statEl.textContent='Connected (waiting frames...)';};"
+"ws.onclose=e=>{if(!useRtc)statEl.textContent='Disconnected ('+(e.reason||e.code)+')';};"
+"ws.onmessage=async ev=>{"
+"if(typeof ev.data==='string'){"
+"const msg=JSON.parse(ev.data);"
+"if(msg.type==='offer'&&pc){"
+"await pc.setRemoteDescription({type:'offer',sdp:msg.sdp});"
+"const ans=await pc.createAnswer();await pc.setLocalDescription(ans);"
+"ws.send(JSON.stringify({type:'answer',sdp:ans.sdp}));"
+"}else if(msg.type==='candidate'&&pc&&msg.candidate){"
+"try{await pc.addIceCandidate({candidate:msg.candidate,sdpMid:msg.mid||'0'});}catch(_){}"
+"}return;}"
+"onMediaBuf(ev.data);"
 "};}"
 "document.getElementById('btnConn').onclick=connect;"
 "function readInput(){"
@@ -271,11 +334,12 @@ static const char k_html_page[] =
 "if(gp.axes.length>=4){const x=gp.axes[2],y=-gp.axes[3];if(Math.abs(x)>0.08)rx=(x*32767)|0;if(Math.abs(y)>0.08)ry=(y*32767)|0;}"
 "break;}"
 "return [b,lx,ly,rx,ry];}"
-"setInterval(()=>{if(!ws||ws.readyState!==1)return;"
+"setInterval(()=>{"
 "const [b,lx,ly,rx,ry]=readInput();"
 "const buf=new ArrayBuffer(13),dv=new DataView(buf);"
 "dv.setUint8(0,0x11);dv.setUint32(1,b>>>0,true);dv.setInt16(5,lx,true);dv.setInt16(7,ly,true);dv.setInt16(9,rx,true);dv.setInt16(11,ry,true);"
-"ws.send(buf);},8);"
+"if(dcIn&&dcIn.readyState==='open')dcIn.send(buf);"
+"else if(!useRtc&&ws&&ws.readyState===1)ws.send(buf);},8);"
 "connect();"
 "</script></body></html>";
 
@@ -289,18 +353,63 @@ static int recv_exact(SOCKET s, uint8_t *buf, size_t len) {
     return 0;
 }
 
+static void apply_input_pkt(int slot, const uint8_t *buf, size_t plen) {
+    if (plen < 13 || buf[0] != 0x11) return;
+    uint32_t b;
+    int16_t lx, ly, rx, ry;
+    memcpy(&b, buf + 1, 4);
+    memcpy(&lx, buf + 5, 2);
+    memcpy(&ly, buf + 7, 2);
+    memcpy(&rx, buf + 9, 2);
+    memcpy(&ry, buf + 11, 2);
+    plat_mutex_lock(&g_lock);
+    g_clients[slot].buttons = b;
+    g_clients[slot].lx = lx;
+    g_clients[slot].ly = ly;
+    g_clients[slot].rx = rx;
+    g_clients[slot].ry = ry;
+    g_clients[slot].last_input_ns = plat_now_ns();
+    plat_mutex_unlock(&g_lock);
+}
+
+static void on_rtc_signal(void *user, const char *json_msg) {
+    int slot = (int)(intptr_t)user;
+    if (slot < 0 || slot >= STREAM_MAX_CLIENTS || !json_msg) return;
+    SOCKET s = g_clients[slot].sock;
+    if (s != INVALID_SOCKET) ws_send_frame(s, 0x1, (const uint8_t *)json_msg, strlen(json_msg));
+}
+
+static void on_rtc_input(void *user, int slot, const uint8_t *data, size_t len) {
+    (void)user;
+    apply_input_pkt(slot, data, len);
+}
+
+static void on_rtc_state(void *user, int slot, int connected) {
+    (void)user;
+    if (connected) {
+        plat_mutex_lock(&g_lock);
+        g_clients[slot].need_keyframe = 1;
+        g_clients[slot].last_input_ns = plat_now_ns();
+        plat_mutex_unlock(&g_lock);
+        rt_log("stream: Player %d WebRTC UDP DataChannel open", slot + 2);
+    } else {
+        rt_log("stream: Player %d WebRTC UDP closed", slot + 2);
+    }
+}
+
 static DWORD WINAPI ws_client_thread(LPVOID param) {
     int slot = (int)(intptr_t)param;
     SOCKET s = g_clients[slot].sock;
-    uint8_t hello[2] = {0x03, (uint8_t)g_clients[slot].player_idx};
-    uint8_t wh[2] = {0x82, 2};
-    plat_mutex_lock(&g_send_lock);
-    sock_send_all(s, wh, 2);
-    sock_send_all(s, hello, 2);
-    plat_mutex_unlock(&g_send_lock);
+    int is_rtc = (g_mode == STREAM_MODE_WEBRTC);
+    uint8_t hello[3] = {0x03, (uint8_t)g_clients[slot].player_idx, (uint8_t)(is_rtc ? 1 : 0)};
+    ws_send_frame(s, 0x2, hello, sizeof(hello));
 
-    uint8_t buf[256];
-    while (g_running && g_clients[slot].active) {
+    if (is_rtc) {
+        webrtc_peer_start(slot, NULL, NULL, on_rtc_signal, (void *)(intptr_t)slot, on_rtc_input, on_rtc_state, NULL);
+    }
+
+    uint8_t *buf = malloc(8192);
+    while (buf && g_running && g_clients[slot].active) {
         uint8_t h[2];
         if (recv_exact(s, h, 2) < 0) break;
         uint8_t opcode = h[0] & 0x0f;
@@ -318,38 +427,27 @@ static DWORD WINAPI ws_client_thread(LPVOID param) {
         }
         uint8_t mask[4] = {0};
         if (masked && recv_exact(s, mask, 4) < 0) break;
-        if (plen > sizeof(buf)) break;
+        if (plen >= 8192) break;
         if (plen > 0 && recv_exact(s, buf, (size_t)plen) < 0) break;
         if (masked) {
             for (uint64_t i = 0; i < plen; i++) buf[i] ^= mask[i & 3];
         }
+        buf[plen] = 0;
         if (opcode == 0x8) break; // Close
         if (opcode == 0x9) {      // Ping -> Pong
-            uint8_t pong[2] = {0x8A, (uint8_t)plen};
-            plat_mutex_lock(&g_send_lock);
-            sock_send_all(s, pong, 2);
-            if (plen) sock_send_all(s, buf, (size_t)plen);
-            plat_mutex_unlock(&g_send_lock);
+            ws_send_frame(s, 0xA, buf, (size_t)plen);
+            continue;
+        }
+        if (opcode == 0x1 && is_rtc) {
+            webrtc_peer_handle_signal(slot, (const char *)buf);
             continue;
         }
         if ((opcode == 0x2 || opcode == 0x0) && plen >= 13 && buf[0] == 0x11) {
-            uint32_t b;
-            int16_t lx, ly, rx, ry;
-            memcpy(&b, buf + 1, 4);
-            memcpy(&lx, buf + 5, 2);
-            memcpy(&ly, buf + 7, 2);
-            memcpy(&rx, buf + 9, 2);
-            memcpy(&ry, buf + 11, 2);
-            plat_mutex_lock(&g_lock);
-            g_clients[slot].buttons = b;
-            g_clients[slot].lx = lx;
-            g_clients[slot].ly = ly;
-            g_clients[slot].rx = rx;
-            g_clients[slot].ry = ry;
-            g_clients[slot].last_input_ns = plat_now_ns();
-            plat_mutex_unlock(&g_lock);
+            apply_input_pkt(slot, buf, (size_t)plen);
         }
     }
+    free(buf);
+    if (is_rtc) webrtc_peer_close(slot);
     plat_mutex_lock(&g_lock);
     if (g_clients[slot].sock != INVALID_SOCKET) closesocket(g_clients[slot].sock);
     g_clients[slot].sock = INVALID_SOCKET;
@@ -667,7 +765,8 @@ static void start_cloudflared(int port) {
     g_cf_thread = CreateThread(NULL, 0, cf_reader_thread, NULL, 0, NULL);
 }
 
-int stream_host_start_mode(int use_cloudflared) {
+int stream_host_start_mode(int mode) {
+    int want_cf = (mode == STREAM_MODE_CLOUDFLARE) || (mode == STREAM_MODE_WEBRTC && stream_host_has_cloudflared());
     plat_mutex_lock(&g_lock);
     if (g_running) { plat_mutex_unlock(&g_lock); return 1; }
     WSADATA wsa;
@@ -688,7 +787,7 @@ int stream_host_start_mode(int use_cloudflared) {
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(use_cloudflared ? INADDR_LOOPBACK : INADDR_ANY);
+    sa.sin_addr.s_addr = htonl(want_cf ? INADDR_LOOPBACK : INADDR_ANY);
     sa.sin_port = htons(STREAM_PORT_DEFAULT);
     if (bind(ls, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         sa.sin_port = 0; // ephemeral fallback
@@ -714,12 +813,15 @@ int stream_host_start_mode(int use_cloudflared) {
 
     snprintf(g_local_url, sizeof(g_local_url), "http://127.0.0.1:%d/?code=%s", g_port, g_code);
     g_public_url[0] = 0;
-    g_use_cf = use_cloudflared ? 1 : 0;
-    if (use_cloudflared) {
-        snprintf(g_status_msg, sizeof(g_status_msg), "Starting Cloudflare tunnel...");
+    g_mode = mode;
+    g_use_cf = want_cf ? 1 : 0;
+    if (want_cf) {
+        snprintf(g_status_msg, sizeof(g_status_msg),
+                 mode == STREAM_MODE_WEBRTC ? "Starting WebRTC signaling tunnel..." : "Starting Cloudflare tunnel...");
         g_state = STREAM_STATE_STARTING;
     } else {
-        snprintf(g_status_msg, sizeof(g_status_msg), "Local Host active");
+        snprintf(g_status_msg, sizeof(g_status_msg),
+                 mode == STREAM_MODE_WEBRTC ? "WebRTC local signaling active" : "Local Host active");
         g_state = STREAM_STATE_LOCAL_ONLY;
     }
     g_frames_sent = 0;
@@ -731,8 +833,8 @@ int stream_host_start_mode(int use_cloudflared) {
     plat_mutex_unlock(&g_lock);
 
     g_srv_thread = CreateThread(NULL, 0, server_thread_fn, NULL, 0, NULL);
-    if (use_cloudflared) start_cloudflared(g_port);
-    rt_log("stream: server listening on port %d (cf=%d)", g_port, use_cloudflared);
+    if (want_cf) start_cloudflared(g_port);
+    rt_log("stream: server listening on port %d (mode=%d cf=%d)", g_port, mode, want_cf);
     return 1;
 }
 
@@ -783,6 +885,7 @@ void stream_host_stop(void) {
     if (cf_pipe) CloseHandle(cf_pipe);
     if (srv_th) { WaitForSingleObject(srv_th, 1000); CloseHandle(srv_th); }
     if (cf_th) { WaitForSingleObject(cf_th, 1000); CloseHandle(cf_th); }
+    webrtc_shutdown();
 
     plat_mutex_lock(&g_enc_lock);
     if (g_vpx_ok) { vpx_codec_destroy(&g_vpx); vpx_img_free(&g_vpx_img); g_vpx_ok = 0; g_vpx_w = g_vpx_h = 0; }
@@ -803,6 +906,7 @@ void stream_host_info(StreamHostInfo *out) {
     plat_mutex_lock(&g_lock);
     out->state = g_state;
     out->port = g_port;
+    out->mode = g_mode;
     out->use_cf = g_use_cf;
     out->cf_installed = has_cf;
     out->cf_installing = g_cf_installing;
