@@ -366,8 +366,14 @@ static void swkbd_show(Cpu *c) {
 }
 HOST_OVERRIDE("_ZN2nn3err9ShowErrorERKNS0_18ErrorResultVariantE", err_show_variant);
 HOST_OVERRIDE("_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE", swkbd_show);
-HOST_OVERRIDE("_ZN2nn3ngc15ProfanityFilterC1Ev", nothing);
+// Let sdk's real ProfanityFilter::ProfanityFilter() run so the object's vtable is populated (required by ~ProfanityFilter()).
 HOST_OVERRIDE("_ZN2nn3ngc15ProfanityFilter10InitializeEPvm", ok);
+HOST_OVERRIDE("_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKcm", ok);
+HOST_OVERRIDE("_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKtm", ok);
+HOST_OVERRIDE("_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKDsm", ok);
+HOST_OVERRIDE("_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPcj", ok);
+HOST_OVERRIDE("_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPtj", ok);
+HOST_OVERRIDE("_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPDsj", ok);
 
 // ---- nn::vi: closing and querying the one display
 // BufferMaxResolution is an enum, 0 1280x720, 1 1920x1080, 2 2560x1440, 3 3840x2160:
