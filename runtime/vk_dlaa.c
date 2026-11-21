@@ -1263,13 +1263,22 @@ void vk_dlaa_submission_end(VkExec *ex) {
     D.mv_ready = 1;
 }
 
+static int is_full_aspect(uint32_t w, uint32_t h) {
+    unsigned o[2], s[2];
+    res_sizes(o, s);
+    if (!o[0] || !o[1] || !w || !h) return 1;
+    uint64_t a = (uint64_t)w * o[1], b = (uint64_t)h * o[0];
+    return a * 4 >= b * 3 && b * 4 >= a * 3;   // skips split-screen half-width / half-height targets
+}
+
 void vk_dlaa_pass(VkExec *ex) {
     const VkExecTarget *c = &ex->color[0], *z = &ex->depth;
     if (!dl_active() || D.done) return;
     // The G-buffer: several colour targets with a D32F depth of at least DLAA_SCENE_MIN_W wide. Only the light target drawn after it
     // arms the frame; at night the game draws into the light target alone with the scene depth before the G-buffer too,
     // and DLAA then ran at a small pass ahead of the whole scene, which reached the screen jittered.
-    if (ex->pass_ncolor >= 3 && z->image && scene_depth(z->format) && z->width >= DLAA_SCENE_MIN_W) {
+    if (ex->pass_ncolor >= 3 && z->image && scene_depth(z->format) && z->width >= DLAA_SCENE_MIN_W &&
+        is_full_aspect(z->width, z->height)) {
         D.gbuf = 1, D.armed = 0;
         // target 0 is the object-class buffer (RGBA8, the scene size): the characters' bias mask reads its green. A
         // smaller pass of the same shape (640x360, seen while loading) does not replace the scene's in the same frame.
@@ -1284,6 +1293,7 @@ void vk_dlaa_pass(VkExec *ex) {
     // the scene's own light target, which left every object black.
     if (D.gbuf && ex->pass_ncolor == 1 && c->image && scene_color(c->format) && z->image && scene_depth(z->format) &&
         c->width == z->width && c->height == z->height && c->width >= DLAA_SCENE_MIN_W &&
+        is_full_aspect(c->width, c->height) &&
         (!D.armed || (c->width >= D.color.width && c->height >= D.color.height)) &&
         c->samples <= 1 && !c->is3d) {
         int first = !D.armed;
