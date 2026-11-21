@@ -28,6 +28,7 @@ INCLUDE_FILES = [
     "README.md",
     "THIRD_PARTY_NOTICES.md",
     "CMakeLists.txt",
+    "VERSION",
     "config.example.toml",
 ]
 
