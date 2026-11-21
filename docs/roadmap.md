@@ -78,10 +78,20 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
    - [ ] Portar `SMAA` (`vk_smaa.c` + `smaa_*_spv.h`).
    - [ ] Portar `HDR_NATIVE` + `spirv_hdr_shoulder.c`.
    - [ ] Expor `SHADOW_RES` e `SHADOW_SCALE` no menu in-game (`metas[]` em `runtime/cfg.c`).
-4. **Otimizações de CPU, GPU & Memória (Vulkan Backend)**
-   - [ ] Replay paralelo multi-thread (`REPLAY_THREADS`, `vk_spec.c`, `vk_exec_draw_helper.c`, `REC_BATCH`, `PREWARM_XLATE`).
-   - [ ] Gerenciamento de memória/VRAM (`vk_headroom.c`, `HEAP_LAZY`, `WB_ASYNC`, `WB_UNLOCKED`, `SPARSE_MIRROR_COPY`).
-   - [ ] Passes de robustez/otimização SPIR-V (`spirv_rewrite.c`, `spirv_lq_fold.cpp`, `spirv_nan_guard.c`, `spirv_screen_uv.c`).
+4. **Otimizações de CPU, GPU & Memória (Vulkan Backend — Tier 2, Prioridade Atual)**
+   Metodologia de medição A/B e tabela de evolução em [docs/perf-methodology.md](perf-methodology.md).
+   - **Etapa 2.1 — Memória, VRAM & Redução de Stutter (PCs de 16 GB RAM / 8 GB VRAM):**
+     - [ ] Portar `vk_headroom.c` (`MTF_VRAM_HEADROOM`, pré-alocação de blocos VMA em background com recuo automático acima de 85% do orçamento de VRAM).
+     - [ ] Portar `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, `MTF_WB_ASYNC` e `MTF_WB_UNLOCKED` em `runtime/vk_memory.c`.
+     - [ ] Implementar controle de *commit headroom* no Windows (clean-room de `hwaoi-recomp`/`SpaceAnimalsRecomp` via `GlobalMemoryStatusEx`/`GetProcessMemoryInfo`) para evitar OOM em 16 GB RAM.
+     - [ ] **Gate 2.1:** `check_content.py` limpo, redução mensurável de *memory commit* / *allocation spikes* no `mtf.log` segundo [docs/perf-methodology.md](perf-methodology.md).
+   - **Etapa 2.2 — Performance de CPU no Replay Vulkan:**
+     - [ ] Portar replay paralelo multi-thread (`MTF_REPLAY_THREADS`, `REC_BATCH`, `PREWARM_XLATE`) em `runtime/vk_exec.c`.
+     - [ ] Avaliar e integrar `vk_spec.c` + `vk_exec_draw_helper.c` (`MTF_REPLAY_PAR` / `MTF_REPLAY_HELPERS`) como complemento em thread única.
+     - [ ] **Gate 2.2:** Ganho mensurável em `replay_ms/frame` e `fps` destravado no benchmark A/B de [docs/perf-methodology.md](perf-methodology.md).
+   - **Etapa 2.3 — Robustez de Shaders & Documentação:**
+     - [ ] Portar `spirv_nan_guard.c` (`MTF_NAN_GUARD` opcional para fragment shaders).
+     - [ ] Registrar créditos MIT de `dkb-pc-recomp` (`4e7f9b2`) em `THIRD_PARTY_NOTICES.md`.
 5. **Diagnóstico, Mods & Pipeline de Build**
    - [ ] Portar `flight.c` (`FLIGHT`), `vk_crumbs.c`, `prof_win.c`/`perf.c`, `rdoc.c`, `mods_scan.h` (`ROMFS_MODS`/`ROMFS_PATCHES`), `MOUSE_CAMERA` e `RUMBLE_TRIGGERS`.
    - [ ] Manter `tools/build_fork.py` + `tools/mtf_launcher.py` alinhados à build limpa do fork.
