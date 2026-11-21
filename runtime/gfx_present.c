@@ -533,6 +533,7 @@ static void record_thumb(VkCommandBuffer cb, VkImage dst, unsigned fence_slot) {
 #define ST_BYTES ((VkDeviceSize)ST_W * ST_H * 4)
 static VkImage g_st_img;
 static VmaAllocation g_st_img_alloc;
+static VkFormat g_st_fmt;
 static VkBuffer g_st_buf;
 static VmaAllocation g_st_alloc;
 static uint8_t *g_st_ptr;
@@ -565,9 +566,14 @@ static int ensure_stream_cap(void) {
         }
         g_st_ptr = info.pMappedData;
     }
+    if (g_st_img && g_st_fmt != g_sc_fmt) {
+        vmaDestroyImage(c->vma, g_st_img, g_st_img_alloc);
+        g_st_img = VK_NULL_HANDLE;
+    }
     if (!g_st_img) {
+        VkFormat stf = g_sc_fmt ? g_sc_fmt : VK_FORMAT_B8G8R8A8_SRGB;
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-                                .format = VK_FORMAT_B8G8R8A8_UNORM, .extent = {ST_W, ST_H, 1}, .mipLevels = 1,
+                                .format = stf, .extent = {ST_W, ST_H, 1}, .mipLevels = 1,
                                 .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
@@ -577,6 +583,7 @@ static int ensure_stream_cap(void) {
             g_st_failed = 1;
             return 0;
         }
+        g_st_fmt = stf;
     }
     return 1;
 }

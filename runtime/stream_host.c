@@ -178,7 +178,6 @@ static const char k_html_page[] =
 "*{box-sizing:border-box;margin:0;padding:0;font-family:system-ui,-apple-system,sans-serif}"
 "body{background:#0b0e14;color:#e6edf3;display:flex;flex-direction:column;height:100vh;overflow:hidden}"
 "#bar{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#131924;border-bottom:1px solid #263042;font-size:13px}"
-"#bar input{background:#0b0e14;color:#fff;border:1px solid #334155;border-radius:6px;padding:5px 8px;width:95px;text-transform:uppercase}"
 "#bar button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font-weight:600}"
 "#bar button.sec{background:#334155}"
 "#stat{margin-left:auto;color:#94a3b8}"
@@ -188,20 +187,18 @@ static const char k_html_page[] =
 "</style></head><body>"
 "<div id='bar'>"
 "<strong>MTF Stream</strong>"
-"<label>Code <input id='code' maxlength='12'></label>"
-"<button id='btnConn'>Connect</button>"
+"<button id='btnConn'>Reconnect</button>"
 "<button id='btnCrop' class='sec'>View: Full</button>"
 "<button id='btnAudio' class='sec'>Audio: Off</button>"
 "<button id='btnFs' class='sec'>Fullscreen</button>"
-"<span id='stat'>Disconnected</span>"
+"<span id='stat'>Connecting...</span>"
 "</div>"
 "<div id='stage'><canvas id='cv' width='960' height='540'></canvas>"
 "<div id='hint'>Controls: Gamepad (automatic) or Keyboard (WASD=Stick, J/K/U/I=A/B/Y/X, Q/E=L/R, Enter=+)</div>"
 "</div>"
 "<script>"
-"const qs=new URLSearchParams(location.search);"
-"const codeEl=document.getElementById('code'),statEl=document.getElementById('stat'),cv=document.getElementById('cv'),ctx=cv.getContext('2d');"
-"codeEl.value=(qs.get('code')||'').toUpperCase();"
+"const qs=new URLSearchParams(location.search),roomCode=(qs.get('code')||'').toUpperCase();"
+"const statEl=document.getElementById('stat'),cv=document.getElementById('cv'),ctx=cv.getContext('2d',{alpha:false,desynchronized:true});"
 "let ws=null,vdec=null,adec=null,actx=null,audioOn=false,cropMode=0,nextPlayTime=0,needKf=true;"
 "const keys={};"
 "window.addEventListener('keydown',e=>{keys[e.code]=1;if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))e.preventDefault();});"
@@ -221,14 +218,14 @@ static const char k_html_page[] =
 "if(cropMode===0){if(cv.width!==sw||cv.height!==sh){cv.width=sw;cv.height=sh;}ctx.drawImage(f,0,0,sw,sh);}"
 "else{const hw=(sw/2)|0,sx=cropMode===1?(sw-hw):0;if(cv.width!==hw||cv.height!==sh){cv.width=hw;cv.height=sh;}ctx.drawImage(f,sx,0,hw,sh,0,0,hw,sh);}"
 "f.close();},error:e=>console.error('vdec',e)});"
-"vdec.configure({codec:'vp8',optimizeForLatency:true});"
+"vdec.configure({codec:'vp8',optimizeForLatency:true,colorSpace:{primaries:'bt709',transfer:'iec61966-2-1',matrix:'bt470bg',fullRange:true}});"
 "if(adec)try{adec.close()}catch(_){}"
 "if('AudioDecoder'in window){adec=new AudioDecoder({output:ad=>{"
 "if(!audioOn||!actx){ad.close();return;}"
 "const ch=ad.numberOfChannels,n=ad.numberOfFrames,buf=actx.createBuffer(ch,n,ad.sampleRate);"
 "for(let c=0;c<ch;c++){const tmp=new Float32Array(n);ad.copyTo(tmp,{planeIndex:c,format:'f32-planar'});buf.copyToChannel(tmp,c);}"
 "ad.close();const src=actx.createBufferSource();src.buffer=buf;src.connect(actx.destination);"
-"const now=actx.currentTime;if(nextPlayTime<now||nextPlayTime>now+0.15)nextPlayTime=now+0.02;"
+"const now=actx.currentTime;if(nextPlayTime<now||nextPlayTime>now+0.12)nextPlayTime=now+0.015;"
 "src.start(nextPlayTime);nextPlayTime+=buf.duration;},error:e=>console.error('adec',e)});"
 "adec.configure({codec:'opus',sampleRate:48000,numberOfChannels:2});}"
 "}"
@@ -237,7 +234,7 @@ static const char k_html_page[] =
 "if(!('VideoDecoder'in window)){statEl.textContent='WebCodecs not supported in this browser';return;}"
 "initDecoders();"
 "const proto=location.protocol==='https:'?'wss://':'ws://';"
-"ws=new WebSocket(proto+location.host+'/ws?code='+encodeURIComponent(codeEl.value.trim()));"
+"ws=new WebSocket(proto+location.host+'/ws'+(roomCode?'?code='+encodeURIComponent(roomCode):''));"
 "ws.binaryType='arraybuffer';"
 "ws.onopen=()=>{statEl.textContent='Connected (waiting frames...)';};"
 "ws.onclose=e=>{statEl.textContent='Disconnected ('+(e.reason||e.code)+')';};"
@@ -278,8 +275,8 @@ static const char k_html_page[] =
 "const [b,lx,ly,rx,ry]=readInput();"
 "const buf=new ArrayBuffer(13),dv=new DataView(buf);"
 "dv.setUint8(0,0x11);dv.setUint32(1,b>>>0,true);dv.setInt16(5,lx,true);dv.setInt16(7,ly,true);dv.setInt16(9,rx,true);dv.setInt16(11,ry,true);"
-"ws.send(buf);},16);"
-"if(codeEl.value)connect();"
+"ws.send(buf);},8);"
+"connect();"
 "</script></body></html>";
 
 static int recv_exact(SOCKET s, uint8_t *buf, size_t len) {
@@ -389,23 +386,27 @@ static void handle_http_conn(SOCKET s) {
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rcv_to, sizeof(rcv_to));
 
     if (strcasestr_ci(req, "Upgrade: websocket")) {
-        // Verify ?code=
-        char code_param[32] = {0};
-        const char *q = strstr(req, "code=");
-        if (q) {
-            q += 5;
-            size_t i = 0;
-            while (q[i] && q[i] != '&' && q[i] != ' ' && i < sizeof(code_param) - 1) {
-                code_param[i] = q[i];
-                i++;
+        // In Local Host mode, verify ?code=; in Cloudflare mode, the random tunnel URL itself is the secret token.
+        if (!g_use_cf && g_code[0]) {
+            char code_param[32] = {0};
+            const char *q = strstr(req, "code=");
+            if (q) {
+                q += 5;
+                size_t i = 0;
+                while (q[i] && q[i] != '&' && q[i] != ' ' && i < sizeof(code_param) - 1) {
+                    code_param[i] = q[i];
+                    i++;
+                }
+            }
+            if (_stricmp(code_param, g_code) != 0) {
+                const char *unauth = "HTTP/1.1 403 Forbidden\r\nContent-Length: 12\r\nConnection: close\r\n\r\nInvalid code";
+                send(s, unauth, (int)strlen(unauth), 0);
+                closesocket(s);
+                return;
             }
         }
-        if (g_code[0] && _stricmp(code_param, g_code) != 0) {
-            const char *unauth = "HTTP/1.1 403 Forbidden\r\nContent-Length: 12\r\nConnection: close\r\n\r\nInvalid code";
-            send(s, unauth, (int)strlen(unauth), 0);
-            closesocket(s);
-            return;
-        }
+        int nodelay = 1;
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
         const char *k = strcasestr_ci(req, "Sec-WebSocket-Key:");
         if (!k) { closesocket(s); return; }
         k += 18;
@@ -600,7 +601,7 @@ static DWORD WINAPI cf_reader_thread(LPVOID arg) {
                             memcpy(base, u, ulen);
                             base[ulen] = 0;
                             plat_mutex_lock(&g_lock);
-                            snprintf(g_public_url, sizeof(g_public_url), "%s/?code=%s", base, g_code);
+                            snprintf(g_public_url, sizeof(g_public_url), "%s", base);
                             g_state = STREAM_STATE_LIVE;
                             snprintf(g_status_msg, sizeof(g_status_msg), "Cloudflare tunnel online");
                             plat_mutex_unlock(&g_lock);
@@ -834,7 +835,7 @@ static void bgra_to_i420(const uint8_t *bgra, int stride, int w, int h, vpx_imag
         uint8_t *yr = Y + y * ys;
         for (int x = 0; x < w; x++) {
             int b = row[x * 4 + 0], g = row[x * 4 + 1], r = row[x * 4 + 2];
-            int yv = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            int yv = (77 * r + 150 * g + 29 * b + 128) >> 8;
             yr[x] = (uint8_t)(yv < 0 ? 0 : yv > 255 ? 255 : yv);
         }
         if ((y & 1) == 0 && y + 1 < h) {
@@ -845,8 +846,8 @@ static void bgra_to_i420(const uint8_t *bgra, int stride, int w, int h, vpx_imag
                 int b = (row[x * 4 + 0] + row[(x + 1) * 4 + 0] + row2[x * 4 + 0] + row2[(x + 1) * 4 + 0]) >> 2;
                 int g = (row[x * 4 + 1] + row[(x + 1) * 4 + 1] + row2[x * 4 + 1] + row2[(x + 1) * 4 + 1]) >> 2;
                 int r = (row[x * 4 + 2] + row[(x + 1) * 4 + 2] + row2[x * 4 + 2] + row2[(x + 1) * 4 + 2]) >> 2;
-                int uv = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                int vv = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                int uv = ((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128;
+                int vv = ((128 * r - 107 * g - 21 * b + 128) >> 8) + 128;
                 ur[x >> 1] = (uint8_t)(uv < 0 ? 0 : uv > 255 ? 255 : uv);
                 vr[x >> 1] = (uint8_t)(vv < 0 ? 0 : vv > 255 ? 255 : vv);
             }
@@ -857,7 +858,7 @@ static void bgra_to_i420(const uint8_t *bgra, int stride, int w, int h, vpx_imag
 void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride) {
     if (!g_running || !bgra || w <= 0 || h <= 0 || !any_client_connected()) return;
     uint64_t now = plat_now_ns();
-    if (now - g_last_vid_ns < 15000000ull) return; // cap at ~60 fps
+    if (now - g_last_vid_ns < 10000000ull) return;
     g_last_vid_ns = now;
 
     plat_mutex_lock(&g_enc_lock);
@@ -869,15 +870,18 @@ void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride) {
             cfg.g_h = (unsigned)h;
             cfg.g_timebase.num = 1;
             cfg.g_timebase.den = 60;
-            cfg.rc_target_bitrate = 3500;
+            cfg.rc_target_bitrate = 4000;
             cfg.rc_end_usage = VPX_CBR;
+            cfg.rc_buf_sz = 100;
+            cfg.rc_buf_initial_sz = 50;
+            cfg.rc_buf_optimal_sz = 50;
             cfg.g_lag_in_frames = 0;
             cfg.kf_mode = VPX_KF_AUTO;
             cfg.kf_max_dist = 60;
             cfg.g_threads = 4;
             if (vpx_codec_enc_init(&g_vpx, vpx_codec_vp8_cx(), &cfg, 0) == VPX_CODEC_OK &&
                 vpx_img_alloc(&g_vpx_img, VPX_IMG_FMT_I420, (unsigned)w, (unsigned)h, 1)) {
-                vpx_codec_control(&g_vpx, VP8E_SET_CPUUSED, -8);
+                vpx_codec_control(&g_vpx, VP8E_SET_CPUUSED, -10);
                 g_vpx_ok = 1;
                 g_vpx_w = w;
                 g_vpx_h = h;
