@@ -27,6 +27,7 @@ INCLUDE_FILES = [
     "LICENSE",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
+    "CMakeLists.txt",
     "config.example.toml",
 ]
 
@@ -80,7 +81,7 @@ def make_release(version: str, out_dir: Path) -> Path:
     zip_path = out_dir / f"mtf-recomp-{version}-src.zip"
     if zip_path.exists():
         zip_path.unlink()
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False) as zf:
         for p in sorted(stage.rglob("*")):
             if p.is_file():
                 zf.write(p, p.relative_to(out_dir))

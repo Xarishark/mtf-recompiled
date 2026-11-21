@@ -229,3 +229,12 @@
 - **Verification:**
   - Built `build/fork/bin/mtf-recomp.exe` cleanly via `ninja` (`0` errors).
   - 6s smoke test (`alive=True`) and `python tools/check_content.py` (`0` violations) passed.
+
+
+### 2026-11-21 — Merge Multiplayer (`feat/multiplayer-ldn`) + Release `v0.1.0`
+- **Changes:**
+  - Merged `feat/multiplayer-ldn` into `main` (`5846960`): multi-gamepad routing (`P1..P4`) & `F1` Controls UI, `nn::ngc::ProfanityFilter` vtable crash fix, split-screen DLAA aspect guard (`is_full_aspect`), and `F1 -> Multiplayer` browser streaming (`CloudFlare WebSocket`, `WebRTC UDP` via `libdatachannel` + `Mbed TLS`, and `Local Host` with Win32 clipboard copy and `cloudflared.exe` installer).
+  - Updated `tools/make_release.py` to include `CMakeLists.txt` in `INCLUDE_FILES`.
+- **Verification:**
+  - Audited all `1,956` git-tracked files (`Suspicious tracked files: []`) and ran `python tools/check_content.py` (`0` violations).
+  - Built `build/fork/bin/mtf-recomp.exe` on `main` cleanly via `ninja` (`0` errors) and packaged `build/release/mtf-recomp-0.1.0-src.zip`.
