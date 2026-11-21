@@ -2424,13 +2424,7 @@ static int workers_start(void) {
 void vk_pipeline_async_enable(void) {
     U.on = strcmp(cfg_value("MTF_PIPE_WAIT"), "draw") != 0;
     const char *e = cfg_get("MTF_PIPE_SYNC");
-    if (e && *e) {
-        if (strcmp(e, "0")) return;
-    } else if (vk_ctx()->props.vendorID == 0x10de && !P.gpl) {
-        // Background pipe_worker builds hit nvoglv64.dll+0x10ea90 (0x8 read) on NVIDIA 610.88 after several matches.
-        rt_log("vk_pipeline: synchronous pipeline builds on NVIDIA without GPL (MTF_PIPE_SYNC=0 overrides)");
-        return;
-    }
+    if (e && *e && strcmp(e, "0")) return;
     A.on = 1;
 }
 
@@ -2811,6 +2805,12 @@ void vk_pipeline_prewarm(void) {
 // are not built. Caller holds no lock.
 static void prebuild_start(void) {
     plat_mutex_lock(&P.lock);
+    const char *e = cfg_get("MTF_PIPE_SYNC");
+    if ((!e || !*e) && A.on && vk_ctx()->props.vendorID == 0x10de && !P.gpl) {
+        // Background pipe_worker builds hit nvoglv64.dll+0x10ea90 (0x8 read) on NVIDIA 610.88 after several matches.
+        A.on = 0;
+        rt_log("vk_pipeline: synchronous pipeline builds on NVIDIA without GPL (MTF_PIPE_SYNC=0 overrides)");
+    }
     if (K.file && !K.warm) {
         rt_log("vk_pipeline: prebuild off%s; %zu records not built",
                !cfg_bool("MTF_PIPE_PREBUILD") ? " (MTF_PIPE_PREBUILD=0)" : " (no boot prewarm)", K.file_n);
