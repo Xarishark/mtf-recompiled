@@ -634,23 +634,31 @@ static void tab_multiplayer(float scale) {
     StreamHostInfo info;
     stream_host_info(&info);
     static bool warn_open = false;
+    static bool reveal_link = false;
+    static uint64_t copied_until_ns = 0;
 
     ImGui::BeginChild("##mp_stream", ImVec2(0, -opt_bottom()), false);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Browser Streaming (TryCloudflare / WebCodecs)");
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Browser Streaming (Cloudflare / Local Host)");
     ImGui::TextWrapped("Hosts the game on this PC as Player 1 and streams video/audio to a browser link. "
                        "Remote players open the link in Chrome/Edge and automatically control Player 2-4.");
     ImGui::Spacing();
 
     if (info.state == STREAM_STATE_OFF) {
-        if (ImGui::Button("Start Streaming Server", ImVec2(240 * scale, 0))) {
-            if (info.cf_installed) stream_host_start();
-            else {
-                warn_open = true;
-                ImGui::OpenPopup("Privacy Warning##no_cf_warn");
-            }
+        reveal_link = false;
+        if (!info.cf_installed) ImGui::BeginDisabled();
+        if (ImGui::Button("CloudFlare (recommended)", ImVec2(240 * scale, 0))) stream_host_start_mode(1);
+        if (!info.cf_installed) ImGui::EndDisabled();
+
+        ImGui::SameLine(0, 12 * scale);
+        if (ImGui::Button("Local Host", ImVec2(160 * scale, 0))) {
+            warn_open = true;
+            ImGui::OpenPopup("Privacy Warning##no_cf_warn");
         }
     } else {
-        if (ImGui::Button("Stop Streaming Server", ImVec2(240 * scale, 0))) stream_host_stop();
+        if (ImGui::Button("Stop Streaming Server", ImVec2(240 * scale, 0))) {
+            stream_host_stop();
+            reveal_link = false;
+        }
     }
 
     ImGui::SameLine(0, 18 * scale);
@@ -667,23 +675,21 @@ static void tab_multiplayer(float scale) {
             if (ImGui::Button("Install Cloudflare", ImVec2(180 * scale, 0))) stream_host_install_cloudflared();
         }
     }
-    if (info.cf_install_msg[0]) {
-        ImGui::TextDisabled("%s", info.cf_install_msg);
-    }
+    if (info.cf_install_msg[0]) ImGui::TextDisabled("%s", info.cf_install_msg);
 
     if (ImGui::BeginPopupModal("Privacy Warning##no_cf_warn", &warn_open, ImGuiWindowFlags_AlwaysAutoResize)) {
         g_modal = true;
         ImGui::PushTextWrapPos(480 * scale);
-        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "Warning: cloudflared.exe is not installed.");
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "Warning: Local Host Mode");
         ImGui::Spacing();
-        ImGui::TextWrapped("If you share your stream without Cloudflare (direct connection / port forwarding), "
+        ImGui::TextWrapped("If you share your stream in Local Host mode (without Cloudflare), "
                            "your public IP address will be exposed to the connected players.\n\n"
-                           "Install Cloudflare first to hide your IP behind a trycloudflare.com tunnel, "
-                           "or click OK to start the local server anyway.");
+                           "Use CloudFlare (recommended) to hide your IP behind a trycloudflare.com tunnel, "
+                           "or click OK to start in Local Host mode anyway.");
         ImGui::PopTextWrapPos();
         ImGui::Spacing();
         if (ImGui::Button("OK", ImVec2(140 * scale, 0))) {
-            stream_host_start();
+            stream_host_start_mode(0);
             warn_open = false;
             ImGui::CloseCurrentPopup();
         }
@@ -702,28 +708,37 @@ static void tab_multiplayer(float scale) {
     const char *st = info.state == STREAM_STATE_OFF        ? "Offline"
                    : info.state == STREAM_STATE_STARTING   ? "Starting Cloudflare tunnel..."
                    : info.state == STREAM_STATE_LIVE       ? "Online (Cloudflare)"
-                   : info.state == STREAM_STATE_LOCAL_ONLY ? "Local Only (No Cloudflare)"
+                   : info.state == STREAM_STATE_LOCAL_ONLY ? "Online (Local Host)"
                                                            : "Error";
     ImGui::Text("Status: %s", st);
     if (info.state != STREAM_STATE_OFF) {
         ImGui::Text("Detail: %s", info.status_msg);
-        ImGui::Text("Room Code: %s   |   Browser Players Connected: %d", info.code, info.clients);
-        ImGui::Text("Frames sent: %llu   |   Data sent: %.2f MiB",
-                    (unsigned long long)info.frames_sent, (double)info.bytes_sent / (1024.0 * 1024.0));
+        ImGui::Text("Browser Players Connected: %d   |   Frames sent: %llu   |   Data sent: %.2f MiB",
+                    info.clients, (unsigned long long)info.frames_sent, (double)info.bytes_sent / (1024.0 * 1024.0));
         ImGui::Spacing();
-        if (info.public_url[0]) {
-            ImGui::Text("Cloudflare Link:");
-            ImGui::SetNextItemWidth(-160 * scale);
-            ImGui::InputText("##cf_url", info.public_url, sizeof(info.public_url), ImGuiInputTextFlags_ReadOnly);
+        // In Cloudflare mode, never show the local/IP link on screen; only show the active mode's link.
+        const char *active_url = info.use_cf ? info.public_url : info.local_url;
+        if (active_url && active_url[0]) {
+            ImGui::Text("%s (click field to %s):",
+                        info.use_cf ? "Cloudflare Link" : "Local Host Link",
+                        reveal_link ? "hide" : "reveal");
+            char shown[256];
+            if (reveal_link) {
+                snprintf(shown, sizeof(shown), "%s", active_url);
+            } else {
+                snprintf(shown, sizeof(shown), "%s", "**************************************** (hidden — click to reveal)");
+            }
+            ImGui::SetNextItemWidth(-180 * scale);
+            ImGui::InputText("##stream_url", shown, sizeof(shown), ImGuiInputTextFlags_ReadOnly);
+            if (ImGui::IsItemClicked()) reveal_link = !reveal_link;
             ImGui::SameLine();
-            if (ImGui::Button("Copy Link##cf", ImVec2(140 * scale, 0))) SDL_SetClipboardText(info.public_url);
-        }
-        if (info.local_url[0]) {
-            ImGui::Text("Local Link (exposes IP if shared directly):");
-            ImGui::SetNextItemWidth(-160 * scale);
-            ImGui::InputText("##loc_url", info.local_url, sizeof(info.local_url), ImGuiInputTextFlags_ReadOnly);
-            ImGui::SameLine();
-            if (ImGui::Button("Copy Link##loc", ImVec2(140 * scale, 0))) SDL_SetClipboardText(info.local_url);
+            uint64_t now = plat_now_ns();
+            const char *copy_lbl = now < copied_until_ns ? "Copied!" : "Copy Link";
+            if (ImGui::Button(copy_lbl, ImVec2(160 * scale, 0))) {
+                if (stream_copy_clipboard(active_url)) copied_until_ns = now + 2000000000ull;
+            }
+        } else if (info.use_cf) {
+            ImGui::TextDisabled("Waiting for trycloudflare.com tunnel URL...");
         }
     }
     ImGui::EndChild();

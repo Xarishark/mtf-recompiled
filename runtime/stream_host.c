@@ -37,6 +37,7 @@ static PlatMutex g_lock = PLAT_MUTEX_INIT;
 static PlatMutex g_send_lock = PLAT_MUTEX_INIT;
 static volatile int g_running = 0;
 static volatile int g_state = STREAM_STATE_OFF;
+static volatile int g_use_cf = 0;
 static SOCKET g_listen = INVALID_SOCKET;
 static int g_port = STREAM_PORT_DEFAULT;
 static char g_code[16];
@@ -646,7 +647,7 @@ static void start_cloudflared(int port) {
     g_cf_thread = CreateThread(NULL, 0, cf_reader_thread, NULL, 0, NULL);
 }
 
-int stream_host_start(void) {
+int stream_host_start_mode(int use_cloudflared) {
     plat_mutex_lock(&g_lock);
     if (g_running) { plat_mutex_unlock(&g_lock); return 1; }
     WSADATA wsa;
@@ -667,7 +668,7 @@ int stream_host_start(void) {
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_addr.s_addr = htonl(use_cloudflared ? INADDR_LOOPBACK : INADDR_ANY);
     sa.sin_port = htons(STREAM_PORT_DEFAULT);
     if (bind(ls, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         sa.sin_port = 0; // ephemeral fallback
@@ -693,8 +694,14 @@ int stream_host_start(void) {
 
     snprintf(g_local_url, sizeof(g_local_url), "http://127.0.0.1:%d/?code=%s", g_port, g_code);
     g_public_url[0] = 0;
-    snprintf(g_status_msg, sizeof(g_status_msg), "Starting Cloudflare tunnel...");
-    g_state = STREAM_STATE_STARTING;
+    g_use_cf = use_cloudflared ? 1 : 0;
+    if (use_cloudflared) {
+        snprintf(g_status_msg, sizeof(g_status_msg), "Starting Cloudflare tunnel...");
+        g_state = STREAM_STATE_STARTING;
+    } else {
+        snprintf(g_status_msg, sizeof(g_status_msg), "Local Host active");
+        g_state = STREAM_STATE_LOCAL_ONLY;
+    }
     g_frames_sent = 0;
     g_bytes_sent = 0;
     memset(g_clients, 0, sizeof(g_clients));
@@ -704,8 +711,26 @@ int stream_host_start(void) {
     plat_mutex_unlock(&g_lock);
 
     g_srv_thread = CreateThread(NULL, 0, server_thread_fn, NULL, 0, NULL);
-    start_cloudflared(g_port);
-    rt_log("stream: local server listening at %s", g_local_url);
+    if (use_cloudflared) start_cloudflared(g_port);
+    rt_log("stream: server listening on port %d (cf=%d)", g_port, use_cloudflared);
+    return 1;
+}
+
+int stream_host_start(void) { return stream_host_start_mode(1); }
+
+int stream_copy_clipboard(const char *text) {
+    if (!text || !*text) return 0;
+    size_t len = strlen(text) + 1;
+    if (!OpenClipboard(NULL)) return 0;
+    EmptyClipboard();
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (!hg) { CloseClipboard(); return 0; }
+    void *dst = GlobalLock(hg);
+    if (!dst) { GlobalFree(hg); CloseClipboard(); return 0; }
+    memcpy(dst, text, len);
+    GlobalUnlock(hg);
+    if (!SetClipboardData(CF_TEXT, hg)) { GlobalFree(hg); CloseClipboard(); return 0; }
+    CloseClipboard();
     return 1;
 }
 
@@ -758,6 +783,7 @@ void stream_host_info(StreamHostInfo *out) {
     plat_mutex_lock(&g_lock);
     out->state = g_state;
     out->port = g_port;
+    out->use_cf = g_use_cf;
     out->cf_installed = has_cf;
     out->cf_installing = g_cf_installing;
     int c = 0;

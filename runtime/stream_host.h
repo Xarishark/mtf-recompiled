@@ -19,6 +19,7 @@ typedef struct {
     int state;
     int clients;
     int port;
+    int use_cf;
     int cf_installed;
     int cf_installing;
     char code[16];
@@ -32,8 +33,10 @@ typedef struct {
 
 int stream_host_has_cloudflared(void);
 int stream_host_install_cloudflared(void);
+int stream_host_start_mode(int use_cloudflared);
 int stream_host_start(void);
 void stream_host_stop(void);
+int stream_copy_clipboard(const char *text);
 int stream_host_active(void);
 void stream_host_info(StreamHostInfo *out);
 
