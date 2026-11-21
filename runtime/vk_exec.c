@@ -1319,6 +1319,7 @@ static int par_take(VkExec *ex, const op_hdr *h, const void *a) {
         }
         PC.slice_draws++, PC.draws++;
         vk_exec_frame.draws_seen++;
+        vk_dlaa_draw(ex);
         break;
     default: return 0;
     }

@@ -224,3 +224,9 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Root Cause:** NVIDIA `610.88` driver crash when building graphics pipelines concurrently on background `pipe_worker` threads without GPL (`!P.gpl`).
 - **Fix:** Default `MTF_PIPE_SYNC=1` in `vk_pipeline_async_enable` when `vendorID == 0x10de && !P.gpl` (`MTF_PIPE_SYNC=0` overrides).
 - **Verification:** User verified 10 consecutive matches with distinct characters and rackets without crashing.
+
+## 29. Crash na seleção de personagens com `MTF_REPLAY_THREADS=6` (arrays `static` em `vk_exec_draw.c`)
+- **Symptom:** Ao entrar na tela de seleção de personagens (primeiro passe com `>= 256` draws), logo após `vk: 5 replay slice workers started` no `mtf.log`, o jogo fechava imediatamente.
+- **Root Cause:** Em `runtime/vk_exec_draw.c`, os arrays temporários `static RsRange tmp[MAX_DESC]` (`rs_list`), `static VkWriteDescriptorSet w[MAX_BINDINGS]`, `static VkDescSlot d[MAX_DESC]` e `static VkBufferView bv[MAX_DESC]` (`bind_resources`), além de `wait_frame`/`wait_left_ns` e chamadas de `vk_dlaa_draw` / `mvobj_draw`, eram compartilhados globalmente entre as 6 threads de fatias, causando corrupção concorrente de descritores.
+- **Fix:** Movidos `rs_tmp`, `bind_w`, `bind_d`, `bind_bv`, `wait_frame` e `wait_left_ns` para `DrawCtx` por thread; `vk_dlaa_draw` passou a rodar na coleta (`par_take`) em ordem de draw, e `vk_dlaa_draw`/`mvobj_draw` dentro de `prepare_draw`/`op_draw_idx` só rodam quando `!ex->draw`.
+- **Verification:** Rebuild limpo (`0` erros), smoke test de boot OK (`alive=True`), `python tools/check_content.py` (`0` violações); aguardando teste do usuário na seleção de personagens.

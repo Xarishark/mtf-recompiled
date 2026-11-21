@@ -217,6 +217,11 @@ typedef struct DrawCtx {
     VkExecFrame *frame;
     VkExecFrame helper_frame;
     int slice;
+    RsRange rs_tmp[MAX_DESC];
+    VkWriteDescriptorSet bind_w[MAX_BINDINGS];
+    VkDescSlot bind_d[MAX_DESC];
+    VkBufferView bind_bv[MAX_DESC];
+    uint64_t wait_frame, wait_left_ns;
 } DrawCtx;
 
 static DrawCtx draw_main;
@@ -1747,7 +1752,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
     if (!rs_lists.klen) nvn_hm_init(&rs_lists, sizeof info);
     RsList *l = nvn_hm_get(&rs_lists, &info);
     if (!l) {
-        static RsRange tmp[MAX_DESC];
+        RsRange *tmp = dc_cur()->rs_tmp;
         RsPtr ptr[RS_PTRS];
         uint32_t n = 0, nd = 0, np = 0;
         int sup = 0, c0 = 0, ok = 1;
@@ -1888,9 +1893,9 @@ static void write_set(const VkPipeInfo *info, uint32_t s, VkDescriptorSet set, c
 // The descriptors go into one packed array d, a VkDescSlot per descriptor in binding order, which a set's update
 // template reads directly (VkPipeInfo.tpl); write structs are filled only when a set has no template.
 static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
-    static VkWriteDescriptorSet w[MAX_BINDINGS];
-    static VkDescSlot d[MAX_DESC];
-    static VkBufferView bv[MAX_DESC];
+    VkWriteDescriptorSet *w = dc_cur()->bind_w;
+    VkDescSlot *d = dc_cur()->bind_d;
+    VkBufferView *bv = dc_cur()->bind_bv;
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
     bind_stats(info);
     int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -2512,8 +2517,9 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     static int shadow_wait = -1;
     if (shadow_wait < 0) shadow_wait = rt_knob("SHADOW_WAIT", "1");
     int depth_only = ex->pass_ncolor == 0 && ex->depth.image != 0;
-    static uint64_t wait_frame;
-    static uint64_t wait_left_ns;
+    uint64_t *wait_frame_p = &dc_cur()->wait_frame, *wait_left_p = &dc_cur()->wait_left_ns;
+    #define wait_frame (*wait_frame_p)
+    #define wait_left_ns (*wait_left_p)
     uint32_t wait_ms = 0;
     uint64_t t0 = 0;
     if (oneshot > 0) {
@@ -2614,9 +2620,11 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         B.st = s, B.st_valid = 1;
         if (ex->mark && FRAME->draws == ex->mark_draws0) ex->mark->first[0] = vs, ex->mark->first[1] = fs;
     }
-    vk_dlaa_draw(ex);
-    vk_mvsurvey_draw(ex);
-    vk_mvprev_draw(ex);
+    if (!ex->draw) {
+        vk_dlaa_draw(ex);
+        vk_mvsurvey_draw(ex);
+        vk_mvprev_draw(ex);
+    }
     record_fixed(ex);
     repeat_stats(ex, info);
     bind_resources(ex, info);
@@ -2626,6 +2634,8 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
     if (vk_hdr_track) vk_hdr_draw(ex, info, s.fs);
     vk_exec_oq_draw(ex);
+    #undef wait_frame
+    #undef wait_left_ns
     return 1;
 }
 
@@ -3593,7 +3603,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
     ex->recorded++;
-    if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
+    if (!ex->draw && d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
 }
 
 // DrawElementsIndirect: the arguments are read by the GPU from the pool buffer (they are often written by an earlier
