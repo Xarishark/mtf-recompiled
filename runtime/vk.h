@@ -266,6 +266,9 @@ void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size);
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
+void vk_usnap_quiet(int on);
+uint64_t vk_usnap_drops(void);
+void vk_usnap_view(uint64_t upto);
 const uint8_t *vk_usnap_map(void);   // a host copy of the current arena, at the offsets vk_usnap_find gives
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy of [addr, addr+n) as of the submit, NULL: none
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
@@ -278,6 +281,8 @@ uint64_t vk_dlaa_evals(void);   // DLSS evaluations so far: one a frame while DL
 void vk_mvprev_frame(void);   // each present, beside vk_dlaa_frame
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
+void vk_mem_count_quiet(int on);
+void vk_mem_threads(void);
 int vk_mem_mirror_pending(void);
 void vk_mem_mirror_prologue(VkCommandBuffer cb);
 // Shadow storage (vk_memory.c): vk_sync.c calls vk_mem_shadow_sync right before each submit; the replay notes every GPU

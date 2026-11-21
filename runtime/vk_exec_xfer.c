@@ -168,6 +168,7 @@ static int pending_find(uint64_t addr, int *unknown) {
 static VkQueryPool oq_pool;
 static int oq_state;                     // 0 not set up, 1 counting available, -1 unavailable
 static VkQueryControlFlags oq_flags;
+static int oq_inherit, oq_outside;
 static volatile uint8_t oq_busy[OQ_N];   // from begin until the completion thread read and reset the slot
 static uint32_t oq_next;                 // replay: next ring slot
 static int oq_counting;                  // replay: draws are counted (a reset since the last report, or oq_keep)
@@ -202,6 +203,7 @@ static int oq_ready(void) {
     }
     vkResetQueryPool(v->device, oq_pool, 0, OQ_N);
     oq_flags = f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
+    oq_inherit = f2.features.inheritedQueries != 0;
     oq_state = 1;
     return 1;
 }
@@ -242,7 +244,27 @@ void vk_exec_oq_draw(VkExec *ex) {
     oq_open = (int)q;
 }
 
-void vk_exec_oq_pass_end(VkExec *ex) { oq_close(ex); }
+void vk_exec_oq_pass_end(VkExec *ex) {
+    if (!oq_outside) oq_close(ex);
+}
+
+int vk_exec_oq_begin_outside(VkExec *ex, VkQueryControlFlags *flags, int *open) {
+    *open = 0;
+    if (!oq_counting) return 0;
+    if (!oq_inherit) return -1;
+    if (oq_open < 0) vk_exec_oq_draw(ex);
+    *flags = oq_flags, *open = oq_open >= 0;
+    oq_outside = oq_open >= 0;
+    return 1;
+}
+
+void vk_exec_oq_pass_ended(VkExec *ex) {
+    if (!oq_outside) return;
+    oq_outside = 0;
+    oq_close(ex);
+}
+
+int vk_exec_oq_sliceable(void) { return !oq_counting || oq_inherit; }
 
 static void oq_cb(void *arg) {
     OqSegment *s = arg;

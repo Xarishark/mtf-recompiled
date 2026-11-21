@@ -125,9 +125,55 @@ static void wait_space(uint64_t need) {
     while (Q.put_h + need - (Q.tail_seen = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE)) > RING_WORDS) _mm_pause();
 }
 
+// ---- capture (vk_exec.c: the end of a sliced pass whose slices are still being recorded)
+#define CAP_WORDS (1u << 15)
+static uint64_t cap[CAP_WORDS];
+static uint64_t cap_n;
+static int capturing;
+static void (*spill_fn)(void);
+
+void rec_capture_spill(void (*fn)(void)) { spill_fn = fn; }
+int rec_capture_room(uint32_t words) { return cap_n + words <= CAP_WORDS; }
+
+static void spill(void) {
+    if (!spill_fn) rt_fatal("vk_rec: a held-back pass end cannot be captured and nothing can spill it");
+    spill_fn();
+    if (capturing) rt_fatal("vk_rec: a spilled pass end is still captured");
+}
+
+uint32_t rec_capture_begin(void) {
+    capturing = 1;
+    return (uint32_t)cap_n;
+}
+uint32_t rec_capture_end(void) {
+    capturing = 0;
+    return (uint32_t)cap_n;
+}
+void rec_capture_reset(void) { cap_n = 0; }
+
+static void exec_cb(VkCommandBuffer cb, uint32_t op, void *p);
+
+void rec_capture_play(VkCommandBuffer cb, uint32_t lo, uint32_t hi) {
+    for (uint64_t t = lo; t < hi;) {
+        uint32_t op = (uint32_t)(cap[t] & 0xffff), n = (uint32_t)(cap[t] >> 32);
+        exec_cb(cb, op, &cap[t + 1]);
+        t += n;
+    }
+}
+
+int rec_owns(VkCommandBuffer cb) { return rec_live && cb == rec_cb; }
+
 // Room for a packet of bytes of arguments; the caller fills it and calls pub().
 static void *put(uint32_t op, size_t bytes) {
     uint64_t n = 1 + (bytes + 7) / 8, pos = Q.put_h % RING_WORDS;
+    if (capturing && cap_n + n > CAP_WORDS) spill();
+    if (capturing) {
+        cap[cap_n] = (uint64_t)op | n << 32;
+        if (rec_chk) memset(&cap[cap_n + 1], 0, (n - 1) * 8);
+        cap_n += n;
+        RS_.packets++, RS_.words += n;
+        return &cap[cap_n - n + 1];
+    }
     if (n > RING_WORDS / 4) rt_fatal("vk_rec: a packet of %llu bytes", (unsigned long long)bytes);
     if (pos + n > RING_WORDS) {
         uint64_t pad = RING_WORDS - pos;
@@ -157,6 +203,7 @@ static void pub_now(void) {
 }
 
 static void pub(void) {
+    if (capturing) return;
     if (Q.put_h - Q.pub_h >= Q.pub_words) pub_now();
 }
 
@@ -732,15 +779,7 @@ TARGET_CMD(rec_write_mask, R_WriteMask, PFN_vkCmdSetColorWriteMaskEXT, VkColorCo
 
 // ---- the recorder's side
 
-static void exec_packet(uint32_t op, void *p) {
-    if (op == R_BeginCb) {
-        A_BeginCb *a = p;
-        r_cb = a->cb;
-        if (a->begin) begin_now(r_cb, a->crumb, a->n);
-        return;
-    }
-    if (op == R_Submit) { submit_run(p); return; }
-    VkCommandBuffer cb = r_cb;
+static void exec_cb(VkCommandBuffer cb, uint32_t op, void *p) {
     switch (op) {
 #define F(name, ...) case R_##name: { A_##name *a = p; vkCmd##name(cb, __VA_ARGS__); break; }
     F(BeginQuery, a->p, a->q, a->f)
@@ -820,4 +859,15 @@ static void exec_packet(uint32_t op, void *p) {
     }
     default: rt_fatal("vk_rec: unknown packet %u", op);
     }
+}
+
+static void exec_packet(uint32_t op, void *p) {
+    if (op == R_BeginCb) {
+        A_BeginCb *a = p;
+        r_cb = a->cb;
+        if (a->begin) begin_now(r_cb, a->crumb, a->n);
+        return;
+    }
+    if (op == R_Submit) { submit_run(p); return; }
+    exec_cb(r_cb, op, p);
 }

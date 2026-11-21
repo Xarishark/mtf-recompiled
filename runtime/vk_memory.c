@@ -1703,18 +1703,36 @@ static void mirror_sync(PoolRec *r) {
     mrep.sync_t += qpc() - t0;
 }
 
+static int mem_workers;
+static PlatMutex mirror_lock = PLAT_MUTEX_INIT;
+void vk_mem_threads(void) { __atomic_store_n(&mem_workers, 1, __ATOMIC_RELEASE); }
+
 void vk_mem_use(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
-    if (r->mstate == MS_NONE) mirror_create(r);
-    if (r->mstate != MS_ON) return;
-    if (r->acc_sub != msub) mirror_sync(r);
+    int m = __atomic_load_n(&r->mstate, __ATOMIC_ACQUIRE);
+    uint32_t sub = __atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE);
+    if (m == MS_NONE || (m == MS_ON && sub != msub)) {
+        int lk = __atomic_load_n(&mem_workers, __ATOMIC_ACQUIRE);
+        if (lk) plat_mutex_lock(&mirror_lock);
+        if (r->mstate == MS_NONE) mirror_create(r);
+        if (r->mstate == MS_ON && r->acc_sub != msub) mirror_sync(r);
+        if (lk) plat_mutex_unlock(&mirror_lock);
+    }
+    if (__atomic_load_n(&r->mstate, __ATOMIC_ACQUIRE) != MS_ON) return;
     sp->buffer = r->mbuf;
 }
 
 void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
-    if (!r || r->mstate != MS_ON) return;
-    if (r->acc_sub != msub) mirror_sync(r);
+    if (!r) return;
+    int m = __atomic_load_n(&r->mstate, __ATOMIC_ACQUIRE);
+    if (m != MS_ON) return;
+    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) {
+        int lk = __atomic_load_n(&mem_workers, __ATOMIC_ACQUIRE);
+        if (lk) plat_mutex_lock(&mirror_lock);
+        if (r->mstate == MS_ON && r->acc_sub != msub) mirror_sync(r);
+        if (lk) plat_mutex_unlock(&mirror_lock);
+    }
     sp->buffer = r->mbuf;
 }
 
@@ -1967,6 +1985,41 @@ static void gpu_writes(const PoolRec *r, uint64_t off, uint64_t size) {
     if (frozen) mem_thaw(a, b - a), plat_inc64(&n_thaw_gpu);
 }
 
+static _Thread_local int count_quiet;
+void vk_mem_count_quiet(int on) { count_quiet = on; }
+
+typedef struct WbLocal { MRange *a; int n, cap; struct WbLocal *next; } WbLocal;
+static WbLocal *wb_locals;
+static _Thread_local WbLocal *wb_mine;
+static PlatMutex wb_local_lock = PLAT_MUTEX_INIT;
+
+static WbLocal *wb_local(void) {
+    if (!wb_mine) {
+        WbLocal *w = calloc(1, sizeof *w);
+        if (!w) rt_fatal("vk: out of memory");
+        plat_mutex_lock(&wb_local_lock);
+        w->next = wb_locals;
+        __atomic_store_n(&wb_locals, w, __ATOMIC_RELEASE);
+        plat_mutex_unlock(&wb_local_lock);
+        wb_mine = w;
+    }
+    return wb_mine;
+}
+
+static void wb_local_add(PoolRec *r, uint64_t off, uint64_t size) {
+    WbLocal *w = wb_local();
+    range_add(&w->a, &w->n, &w->cap, r, off, size);
+}
+
+static void wb_locals_take(void) {
+    plat_mutex_lock(&wb_local_lock);
+    for (WbLocal *w = wb_locals; w; w = w->next) {
+        for (int i = 0; i < w->n; i++) range_add(&wbl, &nwbl, &cwbl, w->a[i].r, w->a[i].off, w->a[i].size);
+        w->n = 0;
+    }
+    plat_mutex_unlock(&wb_local_lock);
+}
+
 static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
     PoolRec *r = sp->pool;
     if (r && size) gpu_writes(r, sp->offset, size);
@@ -1974,7 +2027,8 @@ static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
     // A binding to the end of its pool (no size) can span hundreds of MiB: those stay copies.
     if (shader && !(sp->offset & 3) && !(size & 3) && size <= MERGE_MAX && merging() && snap_add(r, sp->offset, size))
         return;
-    range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
+    if (count_quiet) wb_local_add(r, sp->offset, size);
+    else range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
 }
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) { gpu_wrote(sp, size, 0); }
 void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size) { gpu_wrote(sp, size, 1); }
@@ -2186,6 +2240,7 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
+    if (__atomic_load_n(&wb_locals, __ATOMIC_ACQUIRE)) wb_locals_take();
     if (nsnl) {
         // the merge reads the mirror the submission's shaders wrote and writes the imported buffers
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,

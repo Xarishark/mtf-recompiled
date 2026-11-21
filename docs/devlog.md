@@ -198,3 +198,16 @@
     - `vk: headroom: a 256 MiB block of memory type ... allocated ahead (6 so far; 13 allocations of 32 MiB or more on other threads)`
   - A/B boot check for `HEAP_LAZY`: `HEAP_LAZY=0` (`5072 MB` at 6s) vs `HEAP_LAZY=1` (`5079.3 MB` at 6s); commit savings take effect when guest expands heap via `svcSetHeapSize`.
   - Verified `python tools/check_content.py` (`0` violations).
+
+### 2026-11-21 — Tier 2 / Etapa 2.2: Replay Paralelo Multi-Thread (`MTF_REPLAY_THREADS`)
+- **Changes:**
+  - `runtime/vk_exec.c`, `runtime/vk_exec.h`, `runtime/cfg.c`: Ported parallel pass slicing (`MTF_REPLAY_THREADS`, default `6` on >=12 logical CPUs / `4` on >=8 CPUs / `0` on AMD) from `dkb-pc-recomp` (`4e7f9b2`, MIT). Large passes (`>= 256` draws) are sliced into secondary command buffers (`48..1024` draws) and recorded across worker threads in parallel, then executed via `vkCmdExecuteCommands`.
+  - `runtime/vk_exec_draw.c`: Isolated per-thread draw/memo/descriptor state into `DrawCtx` (`tls_dc` + `vk_exec_draw_slice_enter`, `vk_exec_draw_slices_begin`, `vk_exec_draw_slice_ctx`, `vk_exec_draw_slice_view`, `vk_exec_draw_slices_end`, `vk_exec_draw_rebase`) and `PlatOnce` for `dummies_init`, preserving all MTF-specific hooks (ACES HDR, DLAA, breadcrumbs, NVN2).
+  - `runtime/vk_exec_xfer.c`: Added occlusion-query inheritance support (`vk_exec_oq_sliceable`, `vk_exec_oq_begin_outside`, `vk_exec_oq_pass_ended`).
+  - `runtime/vk_usnap.c`, `runtime/vk_memory.c`: Added `vk_usnap_drops`/`vk_usnap_view`/`vk_usnap_quiet` and `vk_mem_threads`/`vk_mem_count_quiet`/`wb_locals` thread-local write-back lists so slice workers run lock-free in the common case.
+  - `runtime/vk_rec.{h,c}`: Added `rec_capture_*` and `rec_owns`.
+  - Evaluated `vk_spec.c` + `vk_exec_draw_helper.c` (`MTF_REPLAY_PAR`): deferred as optional since `MTF_REPLAY_THREADS=6` already parallelizes heavy render passes without duplicating `vk_exec_draw.c`.
+- **Verification:**
+  - Built `build/fork/bin/mtf-recomp.exe` cleanly via `ninja` (`0` errors).
+  - 6s smoke test (`alive=True`, 0 `FATAL`) confirmed in `build/fork/bin/logs/mtf.log`: `vk: passes of 256 or more draws are recorded in slices of up to 1024 draws into secondary command buffers (MTF_REPLAY_THREADS=6, the default: recorded by that many threads)`.
+  - Verified `python tools/check_content.py` (`0` violations).

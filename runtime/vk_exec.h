@@ -116,6 +116,7 @@ typedef struct VkExec {
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
+    void *draw;                          // DrawCtx * of the thread recording this VkExec (NULL: main)
 } VkExec;
 
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call
@@ -141,6 +142,14 @@ void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
+#define VK_EXEC_UPD_SNAPS 16
+struct DrawCtx;
+void vk_exec_draw_rebase(VkExec *ex);
+void vk_exec_draw_slices_begin(int threads, int snap);
+struct DrawCtx *vk_exec_draw_slice_ctx(int k);
+void vk_exec_draw_slice_view(struct DrawCtx *c, int snap);
+void vk_exec_draw_slices_end(int threads);
+struct DrawCtx *vk_exec_draw_slice_enter(struct DrawCtx *c);
 // vk_exec_draw.c: the vertex and fragment shader of the last draw recorded into this command buffer (NULL: none yet).
 void vk_exec_draw_shaders(const GfxShader **vs, const GfxShader **fs);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
@@ -218,3 +227,6 @@ void vk_contact_flush(VkExec *ex);
 void vk_exec_oq_dropped(VkExec *ex);   // a draw the replay left out while samples are counted (vk_exec_xfer.c)
 void vk_exec_oq_draw(VkExec *ex);
 void vk_exec_oq_pass_end(VkExec *ex);
+int vk_exec_oq_begin_outside(VkExec *ex, VkQueryControlFlags *flags, int *open);
+void vk_exec_oq_pass_ended(VkExec *ex);
+int vk_exec_oq_sliceable(void);

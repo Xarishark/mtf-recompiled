@@ -56,6 +56,7 @@ static struct {
     int nwr, cwr;
     // since the last summary
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
+    uint64_t dseq;              // drops made so far (vk_usnap_drops)
 } U;
 
 static Arena *free_arenas;
@@ -367,16 +368,24 @@ static int first_above(uint64_t a) {
     return lo;
 }
 
+static _Thread_local int find_quiet;
+static _Thread_local uint64_t find_upto;   // vk_usnap_view: only drops numbered below it count; 0 every drop
+
+void vk_usnap_quiet(int on) { find_quiet = on; }
+uint64_t vk_usnap_drops(void) { return __atomic_load_n(&U.dseq, __ATOMIC_ACQUIRE); }
+void vk_usnap_view(uint64_t upto) { find_upto = upto; }
+
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
     if (!U.on || !n) return 0;
     int i = first_above(addr);
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
-    if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
+    uint64_t d = (uint64_t)__atomic_load_n(&r->dropped, __ATOMIC_ACQUIRE);
+    if ((d && (!find_upto || d < find_upto)) || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
-    U.hits++;
+    if (!find_quiet) U.hits++;
     return 1;
 }
 
@@ -386,7 +395,11 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
     if (!U.on) return;
     for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-        if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
+        if (!__atomic_load_n(&U.reg[i].dropped, __ATOMIC_RELAXED)) {
+            uint64_t seq = ++U.dseq;
+            __atomic_store_n(&U.reg[i].dropped, (int)seq, __ATOMIC_RELEASE);
+            U.drops++, U.gen++;
+        }
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }

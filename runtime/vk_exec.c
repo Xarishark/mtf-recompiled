@@ -42,13 +42,120 @@ static VkExec X;
 static int x_ready;
 static _Thread_local int x_here;   // this thread is inside vk_exec_record (vk_exec_inline_begin)
 
+// Parallel passes (MTF_REPLAY_THREADS): state shared with pass handlers.
+#define PAR_MIN_DRAWS 256
+#define PAR_SLICE_DRAWS 1024
+#define PAR_SLICE_MIN 48
+#define PAR_EXPECT 1024
+#define PAR_HIST 256
+#define PAR_BAN_AFTER 8
+#define PAR_MAX_SLICES 1024
+#define PAR_MAX_OPS (1 << 20)
+
+typedef struct { uint64_t sig; uint32_t draws; uint8_t banned; } ParHist;
+static ParHist par_hist[PAR_HIST];
+static int par_mode = -1;
+static volatile uint8_t pdone[PAR_MAX_SLICES];
+static uint64_t par_usd[VK_EXEC_UPD_SNAPS];
+static uint64_t par_t0, par_pass_seq;
+static uint64_t par_t_collect, par_t_own, par_t_wait, par_t_exec, par_wait_max, par_wait_long;
+static volatile int64_t par_rec[2][3], par_slow[2], par_slow_ns, par_slow_draws;
+static uint64_t par_restarts, par_passes, par_slices, par_sliced_draws, par_skipped_oq, par_no[5];
+static _Thread_local int par_slice, par_hazard;
+static int par_restart, pass_secondary, pass_tried, pass_sliced;
+static uint32_t pass_draws;
+
+static struct {
+    int on;
+    uint64_t sig;
+    const op_hdr **ops;
+    int nops;
+    VkExec *snap;
+    int start[PAR_MAX_SLICES], end[PAR_MAX_SLICES];
+    int nslices, s0, upd;
+    uint8_t soq[PAR_MAX_SLICES], supd[PAR_MAX_SLICES];
+    VkQueryControlFlags soqf[PAR_MAX_SLICES];
+    int draws, slice_draws, slice_size, expect, oq;
+    VkQueryControlFlags oq_flags;
+} PC;
+
+typedef struct {
+    VkCommandPool pool;
+    PlatMutex lock;
+    VkCommandBuffer *free;
+    int nfree, cfree;
+} ParPool;
+typedef struct { ParPool *pp; VkCommandBuffer cb; } ParCb;
+typedef struct { int n; ParCb cb[]; } ParDone;
+
+static void *par_grow(void *p, int *cap, size_t size) {
+    int c = *cap ? *cap * 2 : 64;
+    void *q = realloc(p, (size_t)c * size);
+    if (!q) rt_fatal("vk: out of memory");
+    *cap = c;
+    return q;
+}
+
+static uint64_t par_sig(const VkExec *ex) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < 9; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        uint64_t v[2] = {0, 0};
+        if ((i == 8 || i < ex->pass_ncolor) && t->image)
+            v[0] = (uint64_t)(uintptr_t)t->image, v[1] = (uint64_t)t->level << 40 | (uint64_t)t->base_layer << 20 | t->layers;
+        h = (h ^ v[0]) * 0x100000001b3ull;
+        h = (h ^ v[1]) * 0x100000001b3ull;
+    }
+    return h | 1;
+}
+
+static uint32_t par_hist_slot(uint64_t sig) { return (uint32_t)((sig ^ sig >> 29) * 0x9E3779B97F4A7C15ull >> 56) % PAR_HIST; }
+
+static struct { uint64_t key; uint32_t draws; } par_exp[PAR_EXPECT];
+static struct { uint64_t sig; uint32_t n; } par_piece[64];
+static int npiece;
+
+static uint64_t par_piece_key(uint64_t sig, int next) {
+    int i = 0;
+    while (i < npiece && par_piece[i].sig != sig) i++;
+    if (i == npiece) {
+        if (npiece == 64) return sig;
+        par_piece[npiece++] = (typeof(par_piece[0])){sig, 0};
+    }
+    uint64_t key = (sig ^ (uint64_t)par_piece[i].n * 0x9E3779B97F4A7C15ull) | 1;
+    if (next) par_piece[i].n++;
+    return key;
+}
+
+static uint32_t *par_expect(uint64_t key, int add) {
+    typeof(par_exp[0]) *x = &par_exp[(key * 0x9E3779B97F4A7C15ull) >> 54];
+    if (x->key != key) {
+        if (!add) return NULL;
+        x->key = key, x->draws = 0;
+    }
+    return &x->draws;
+}
+
+static ParHist *par_find(uint64_t sig, int add) {
+    uint32_t i0 = par_hist_slot(sig);
+    ParHist *low = NULL;
+    for (uint32_t k = 0; k < 4; k++) {
+        ParHist *e = &par_hist[(i0 + k) % PAR_HIST];
+        if (e->sig == sig) return e;
+        if (!low || (!e->sig && low->sig) || (e->sig && low->sig && e->draws < low->draws)) low = e;
+    }
+    if (!add) return NULL;
+    *low = (ParHist){sig, 0, 0};
+    return low;
+}
+
 // ---- MTF_TRACE=gfx frame counters
 
 VkExecFrame vk_exec_frame;
 static struct { const uint8_t *mem; uint32_t w, h, fmt, n; } fw[64];   // textures written this frame
 static int nfw;
 
-uint64_t vk_exec_recording_fence(void) { return x_here ? X.fence : 0; }
+uint64_t vk_exec_recording_fence(void) { return x_here || par_slice ? X.fence : 0; }
 
 void vk_exec_frame_written(const tex_t *t) {
     if (!(rt_trace & RT_TRACE_GFX) || !t) return;
@@ -583,9 +690,13 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
     ex->barrier_at = ++ex->recorded;
 }
 
-void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
+void vk_exec_barrier(VkExec *ex) {
+    if (par_slice) { if (!par_hazard) par_hazard = 1; return; }
+    barrier_to(ex, NULL, NULL, 0);
+}
 
 void vk_exec_pass_begin(VkExec *ex) {
+    if (par_slice) { if (!par_hazard) par_hazard = 1; return; }
     if (ex->in_pass) return;
     resolve_rt(ex);
     vk_contact_pass_begin(ex);
@@ -638,7 +749,9 @@ void vk_exec_pass_begin(VkExec *ex) {
         vk_exec_draw_shaders(&m->first[0], &m->first[1]);
         ex->mark_draws0 = vk_exec_frame.draws;
     }
-    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {ex->pass_w, ex->pass_h}},
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                          .flags = pass_secondary ? VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT : 0,
+                          .renderArea = {{0, 0}, {ex->pass_w, ex->pass_h}},
                           .layerCount = ex->pass_layers, .colorAttachmentCount = ex->pass_ncolor,
                           .pColorAttachments = ca,
                           .pDepthAttachment = ex->pass_depth ? &da : NULL,
@@ -647,14 +760,26 @@ void vk_exec_pass_begin(VkExec *ex) {
     vk_exec_frame.passes++;
     ex->recorded++;
     ex->in_pass = 1;
+    pass_tried = 0, pass_sliced = pass_secondary, pass_draws = 0;
 }
 
 void vk_exec_pass_end(VkExec *ex) {
+    if (par_slice) { if (!par_hazard) par_hazard = 1; return; }
     if (!ex->in_pass) return;
     vk_exec_oq_pass_end(ex);
     vkCmdEndRendering(ex->cb);
+    vk_exec_oq_pass_ended(ex);
     ex->recorded++;
     ex->in_pass = 0;
+    if (!par_restart && ex == &X && pass_draws) {
+        uint64_t sig = par_sig(ex);
+        if (pass_draws >= PAR_MIN_DRAWS) {
+            ParHist *e = par_find(sig, 1);
+            if (pass_draws > e->draws) e->draws = pass_draws;
+        }
+        uint32_t *xp = par_expect(par_piece_key(sig, 1), 1);
+        if (xp) *xp = pass_draws;
+    }
     if (ex->mark) {
         // vk_exec_frame_log resets the frame counters at a present (MTF_TRACE=gfx): then only the draws since it count
         uint64_t d = vk_exec_frame.draws, d0 = ex->mark_draws0;
@@ -854,11 +979,433 @@ static void maybe_split(VkExec *ex) {
     n_parts++;
 }
 
+static void state_op(VkExec *ex, uint32_t op, const void *a) {
+    switch (op) {
+    case OP_VIEWPORTS: {
+        const p_viewports *v = a;
+        for (int i = 0; i < v->n && v->first + i < 16; i++)
+            if (v->first + i >= 0) {
+                memcpy(ex->vp[v->first + i], v->v[i], sizeof ex->vp[0]);
+                if ((uint32_t)(v->first + i) >= ex->vp_n) ex->vp_n = (uint32_t)(v->first + i) + 1;
+            }
+        ex->has_vp = 1;
+        ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
+        break;
+    }
+    case OP_SCISSOR: {
+        const p_scissor *s = a;
+        if (!s->index) ex->scissor = *s, ex->has_scissor = 1;
+        else if (s->index > 0 && s->index < 16) ex->scissor_n[s->index] = *s, ex->scissor_mask |= 1u << s->index;
+        ex->dirty |= VK_EXEC_DIRTY_SCISSOR;
+        break;
+    }
+    case OP_DEPTH_RANGE: {
+        const p_depth_range *r = a;
+        ex->depth_range[0] = r->n, ex->depth_range[1] = r->f;
+        ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
+        break;
+    }
+    case OP_STENCIL: {
+        const p_stencil *s = a;
+        for (int f = 0; f < 2; f++) {
+            if (!(s->face & (1 << f))) continue;
+            if (s->which == 0) ex->st_vmask[f] = (uint32_t)s->value_mask;
+            else if (s->which == 1) ex->st_wmask[f] = (uint32_t)s->mask;
+            else ex->st_ref[f] = (uint32_t)s->ref;
+        }
+        ex->dirty |= VK_EXEC_DIRTY_STENCIL;
+        break;
+    }
+    case OP_POLY_OFFSET:
+        ex->poly_offset = *(const p_poly_offset *)a;
+        ex->dirty |= VK_EXEC_DIRTY_DEPTH_BIAS;
+        break;
+    case OP_BLEND_COLOR:
+        memcpy(ex->blend_color, ((const p_blend_color *)a)->rgba, sizeof ex->blend_color);
+        ex->dirty |= VK_EXEC_DIRTY_BLEND_CONST;
+        break;
+    case OP_DEPTH_CLAMP: ex->pipe.depth_clamp = ((const p_flag *)a)->value != 0; break;
+    case OP_RASTER_DISCARD: ex->pipe.raster_discard = ((const p_flag *)a)->value != 0; break;
+    case OP_PRIM_RESTART: ex->prim_restart = *(const p_prim_restart *)a; break;
+    case OP_PATCH_SIZE: ex->patch_size = ((const p_flag *)a)->value; break;
+    case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; break;
+    case OP_COPY_IMAGE_STRIDE: ex->copy_image_stride = ((const p_copy_stride *)a)->stride; break;
+    case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
+    case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
+    }
+}
+
+static void par_done(void *arg) {
+    ParDone *d = arg;
+    for (int i = 0; i < d->n; i++) {
+        ParPool *pp = d->cb[i].pp;
+        plat_mutex_lock(&pp->lock);
+        if (pp->nfree == pp->cfree) pp->free = par_grow(pp->free, &pp->cfree, sizeof *pp->free);
+        pp->free[pp->nfree++] = d->cb[i].cb;
+        plat_mutex_unlock(&pp->lock);
+    }
+    free(d);
+}
+
+static VkCommandBuffer par_secondary(ParPool *pp) {
+    VkCtx *c = vk_ctx();
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    plat_mutex_lock(&pp->lock);
+    if (pp->nfree) cb = pp->free[--pp->nfree];
+    plat_mutex_unlock(&pp->lock);
+    if (cb) {
+        vkResetCommandBuffer(cb, 0);
+        return cb;
+    }
+    if (!pp->pool) {
+        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                      .queueFamilyIndex = c->gfx_family};
+        if (vkCreateCommandPool(c->device, &pi, NULL, &pp->pool) != VK_SUCCESS) rt_fatal("vk: secondary command pool failed");
+    }
+    VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pp->pool,
+                                      .level = VK_COMMAND_BUFFER_LEVEL_SECONDARY, .commandBufferCount = 1};
+    if (vkAllocateCommandBuffers(c->device, &ai, &cb) != VK_SUCCESS) rt_fatal("vk: secondary command buffer failed");
+    return cb;
+}
+
+static void par_begin_secondary(const VkExec *ex, VkCommandBuffer cb, int oq, VkQueryControlFlags oq_flags) {
+    VkFormat color[8];
+    for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++) color[i] = ex->color[i].image ? ex->pass_color[i] : VK_FORMAT_UNDEFINED;
+    const VkExecTarget *d = &ex->depth;
+    VkCommandBufferInheritanceRenderingInfo ir = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO,
+        .colorAttachmentCount = ex->pass_ncolor, .pColorAttachmentFormats = color,
+        .depthAttachmentFormat = d->image && (d->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? ex->pass_depth : VK_FORMAT_UNDEFINED,
+        .stencilAttachmentFormat = d->image && (d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? ex->pass_stencil : VK_FORMAT_UNDEFINED,
+        .rasterizationSamples = (VkSampleCountFlagBits)(ex->pass_samples ? ex->pass_samples : 1)};
+    VkCommandBufferInheritanceInfo ii = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, .pNext = &ir,
+                                         .occlusionQueryEnable = oq ? VK_TRUE : VK_FALSE,
+                                         .queryFlags = oq ? oq_flags : 0};
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT |
+                                            VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT,
+                                   .pInheritanceInfo = &ii};
+    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) rt_fatal("vk: secondary command buffer begin failed");
+}
+
+#define PAR_MAX_WORKERS 15
+typedef struct {
+    PlatThread *t;
+    int k;
+    ParPool pp;
+    VkExec w;
+} ParWorker;
+static ParWorker *par_workers[PAR_MAX_WORKERS];
+static int par_nworkers;
+
+static PlatMutex pw_lock = PLAT_MUTEX_INIT;
+static PlatCond pw_go, pw_idle;
+static int pw_conds, pw_pub, pw_next;
+static volatile int pw_active;
+static ParPool par_main_pool = {.lock = PLAT_MUTEX_INIT};
+static VkExec par_main_w;
+
+typedef struct {
+    ParCb cb;
+    uint32_t fb_dirty;
+    int recorded, hazard;
+    ViewEnt *views;
+    int nviews;
+} ParOut;
+static ParOut par_out[PAR_MAX_SLICES];
+
+static void par_op(VkExec *ex, uint32_t op, const void *a) {
+    switch (op) {
+    case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL: case OP_POLY_OFFSET:
+    case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
+    case OP_PATCH_SIZE: case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
+        state_op(ex, op, a);
+        break;
+    default: vk_exec_op_draw(ex, op, a); break;
+    }
+}
+
+static void par_rec_note(int worker, int i, uint64_t ns) {
+    int end = PC.end[i], draws = 0;
+    for (int k = PC.start[i]; k < end; k++) draws += PC.ops[k]->op == OP_DRAW || PC.ops[k]->op == OP_DRAW_IDX;
+    plat_add64(&par_rec[worker][0], 1), plat_add64(&par_rec[worker][1], draws), plat_add64(&par_rec[worker][2], (int64_t)ns);
+    if (ns > 1000000) {
+        plat_add64(&par_slow[worker], 1);
+        int64_t m = __atomic_load_n(&par_slow_ns, __ATOMIC_RELAXED);
+        while ((int64_t)ns > m && !__atomic_compare_exchange_n(&par_slow_ns, &m, (int64_t)ns, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        if ((int64_t)ns >= m) __atomic_store_n(&par_slow_draws, draws, __ATOMIC_RELAXED);
+    }
+}
+
+static void par_record(int i, ParPool *pp, VkExec *w, struct DrawCtx *dc) {
+    VkCommandBuffer cb = par_secondary(pp);
+    par_begin_secondary(&PC.snap[i], cb, PC.soq[i], PC.soqf[i]);
+    *w = PC.snap[i];
+    w->draw = dc;
+    w->cb = cb, w->recorded = 0, w->dirty = VK_EXEC_DIRTY_ALL;
+    w->fb_dirty = 0x1ff;
+    w->views = NULL, w->nviews = 0, w->cap_views = 0;
+    struct DrawCtx *prev_dc = vk_exec_draw_slice_enter(dc);
+    vk_exec_draw_rebase(w);
+    vk_exec_draw_slice_view(dc, PC.supd[i]);
+    vk_usnap_view(par_usd[PC.supd[i]] + 1);
+    par_slice = 1, par_hazard = 0;
+    vk_mem_count_quiet(1), vk_usnap_quiet(1);
+    for (int k = PC.start[i], end = PC.end[i]; k < end; k++) par_op(w, PC.ops[k]->op, nvn_op_payload(PC.ops[k]));
+    par_slice = 0;
+    vk_mem_count_quiet(0), vk_usnap_quiet(0), vk_usnap_view(0);
+    vk_exec_draw_slice_enter(prev_dc);
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) rt_fatal("vk: secondary command buffer end failed");
+    par_out[i] = (ParOut){{pp, cb}, w->fb_dirty, w->recorded, par_hazard, w->views, w->nviews};
+}
+
+static void par_publish(void) {
+    plat_mutex_lock(&pw_lock);
+    PC.end[PC.nslices - 1] = PC.nops;
+    pw_pub = PC.nslices;
+    if (par_nworkers) plat_cond_broadcast(&pw_go);
+    plat_mutex_unlock(&pw_lock);
+}
+
+static void par_wake_workers(void) {
+    if (!par_nworkers) return;
+    plat_mutex_lock(&pw_lock);
+    __atomic_store_n(&pw_active, 1, __ATOMIC_RELEASE);
+    plat_cond_broadcast(&pw_go);
+    plat_mutex_unlock(&pw_lock);
+}
+
+static void par_worker(void *arg) {
+    ParWorker *pw = arg;
+    struct DrawCtx *dc = vk_exec_draw_slice_ctx(pw->k);
+    plat_mutex_lock(&pw_lock);
+    for (;;) {
+        while (pw_next >= pw_pub) {
+            if (!__atomic_load_n(&pw_active, __ATOMIC_ACQUIRE)) {
+                plat_cond_wait(&pw_go, &pw_lock);
+                continue;
+            }
+            plat_mutex_unlock(&pw_lock);
+            while (__atomic_load_n(&pw_active, __ATOMIC_ACQUIRE) &&
+                   __atomic_load_n(&pw_next, __ATOMIC_RELAXED) >= __atomic_load_n(&pw_pub, __ATOMIC_RELAXED))
+                plat_pause();
+            plat_mutex_lock(&pw_lock);
+        }
+        int i = pw_next++;
+        plat_mutex_unlock(&pw_lock);
+        uint64_t t = kern_now_ns();
+        par_record(i, &pw->pp, &pw->w, dc);
+        par_rec_note(1, i, kern_now_ns() - t);
+        plat_mutex_lock(&pw_lock);
+        __atomic_store_n(&pdone[i], 1, __ATOMIC_RELEASE);
+        plat_cond_broadcast(&pw_idle);
+    }
+}
+
+static void par_start_workers(void) {
+    int want = par_mode - 1;
+    if (want > PAR_MAX_WORKERS) want = PAR_MAX_WORKERS;
+    if (par_nworkers >= want) return;
+    if (!pw_conds) plat_cond_init(&pw_go), plat_cond_init(&pw_idle), pw_conds = 1;
+    while (par_nworkers < want) {
+        ParWorker *pw = calloc(1, sizeof *pw);
+        if (!pw) rt_fatal("vk: out of memory");
+        pw->k = par_nworkers + 1;
+        plat_mutex_init(&pw->pp.lock);
+        vk_exec_draw_slices_begin(pw->k + 1, -1);
+        vk_mem_threads();
+        if (!(pw->t = plat_thread_new_ex(par_worker, pw, "replay slices", 0))) {
+            rt_log("vk: a replay slice worker could not start: %d of %d run", par_nworkers, want);
+            free(pw);
+            par_mode = par_nworkers + 1;
+            return;
+        }
+        par_workers[par_nworkers++] = pw;
+    }
+    rt_log("vk: %d replay slice workers started", par_nworkers);
+}
+
+static int par_threads(void) {
+    if (par_mode < 0) {
+        const char *e = cfg_get("MTF_REPLAY_THREADS");
+        uint32_t cpus = plat_cpu_usable();
+        par_mode = e && *e ? atoi(e) : vk_caps.amd ? 0 : cpus >= 12 ? 6 : cpus >= 8 ? 4 : 0;
+        if (par_mode < 0) par_mode = 0;
+        if (par_mode)
+            rt_log("vk: passes of %d or more draws are recorded in slices of up to %d draws into secondary command buffers "
+                   "(MTF_REPLAY_THREADS=%d%s: recorded by that many threads)", PAR_MIN_DRAWS, PAR_SLICE_DRAWS, par_mode,
+                   e && *e ? "" : ", the default");
+    }
+    return par_mode;
+}
+
+static int par_size(void) {
+    if (par_mode <= 1) return PAR_SLICE_DRAWS;
+    int size = (PC.expect - PC.draws) / par_mode;
+    return size < PAR_SLICE_MIN ? PAR_SLICE_MIN : size > PAR_SLICE_DRAWS ? PAR_SLICE_DRAWS : size;
+}
+
+static int par_start(VkExec *ex) {
+    par_threads();
+    if (!par_mode || ex != &X || (ex->in_pass && pass_tried)) return 0;
+    pass_tried = 1;
+    if (vk_dump_armed) return 0;
+    resolve_rt(ex);
+    uint64_t sig = par_sig(ex);
+    ParHist *e = par_find(sig, 0);
+    if (!e || e->draws < PAR_MIN_DRAWS || e->banned >= PAR_BAN_AFTER || ex->pass_noatt) return 0;
+    if (!vk_exec_oq_sliceable()) { par_skipped_oq++; return 0; }
+    if (ex->in_pass) {
+        par_restart = 1;
+        vk_exec_pass_end(ex);
+        par_restart = 0;
+        par_restarts++;
+    }
+    VkQueryControlFlags qf = 0;
+    int qopen = 0, q = vk_exec_oq_begin_outside(ex, &qf, &qopen);
+    if (q < 0) { par_skipped_oq++; return 0; }
+    pass_secondary = 1;
+    vk_exec_pass_begin(ex);
+    pass_secondary = 0;
+    pass_tried = 1;
+    if (!ex->in_pass) { par_no[4]++; vk_exec_oq_pass_ended(ex); return 0; }
+    PC.oq = qopen, PC.oq_flags = qf;
+    if (!PC.ops) {
+        PC.ops = malloc(sizeof *PC.ops * PAR_MAX_OPS);
+        PC.snap = malloc(sizeof *PC.snap * PAR_MAX_SLICES);
+        if (!PC.ops || !PC.snap) rt_fatal("vk: out of memory");
+    }
+    if (par_mode > 1) par_start_workers();
+    plat_mutex_lock(&pw_lock);
+    pw_pub = pw_next = 0;
+    plat_mutex_unlock(&pw_lock);
+    PC.nslices = PC.nops = PC.s0 = 0;
+    PC.upd = (int)(par_pass_seq++ % VK_EXEC_UPD_SNAPS);
+    par_usd[PC.upd] = vk_usnap_drops();
+    vk_exec_draw_slices_begin(par_nworkers + 1, PC.upd);
+    uint32_t *x = par_expect(par_piece_key(sig, 0), 0);
+    PC.expect = (int)(x && *x ? *x : e->draws);
+    PC.on = 1, PC.sig = sig, PC.draws = 0;
+    PC.slice_size = PC.slice_draws = par_size();
+    par_t0 = kern_now_ns();
+    par_wake_workers();
+    return 1;
+}
+
+static int par_take(VkExec *ex, const op_hdr *h, const void *a) {
+    if (PC.nops == PAR_MAX_OPS || vk_dump_armed) return 0;
+    switch (h->op) {
+    case OP_SET_RT: return !memcmp(&ex->rt, a, sizeof ex->rt);
+    case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL: case OP_POLY_OFFSET:
+    case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
+    case OP_PATCH_SIZE: case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
+        state_op(ex, h->op, a);
+        break;
+    case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+    case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG:
+        vk_exec_op_draw(ex, h->op, a);
+        break;
+    case OP_DRAW: case OP_DRAW_IDX:
+        if (PC.slice_draws >= PC.slice_size && PC.nslices < PAR_MAX_SLICES) {
+            if (PC.nslices > PC.s0) par_publish();
+            int i = PC.nslices++;
+            PC.snap[i] = *ex;
+            PC.start[i] = PC.nops;
+            PC.soq[i] = (uint8_t)PC.oq, PC.soqf[i] = PC.oq_flags, PC.supd[i] = (uint8_t)PC.upd;
+            __atomic_store_n(&pdone[i], 0, __ATOMIC_RELAXED);
+            PC.slice_draws = 0;
+            PC.slice_size = par_size();
+        }
+        PC.slice_draws++, PC.draws++;
+        vk_exec_frame.draws_seen++;
+        break;
+    default: return 0;
+    }
+    PC.ops[PC.nops++] = h;
+    return 1;
+}
+
+static void par_flush(VkExec *ex) {
+    if (!PC.on) return;
+    PC.on = 0;
+    par_passes++, par_slices += (uint64_t)PC.nslices, par_sliced_draws += (uint64_t)PC.draws;
+    uint64_t t1 = kern_now_ns();
+    par_t_collect += t1 - par_t0;
+    if (PC.nslices) par_publish();
+    plat_mutex_lock(&pw_lock);
+    while (pw_next < PC.nslices) {
+        int i = pw_next++;
+        plat_mutex_unlock(&pw_lock);
+        uint64_t t = kern_now_ns();
+        par_record(i, &par_main_pool, &par_main_w, vk_exec_draw_slice_ctx(0));
+        par_rec_note(0, i, kern_now_ns() - t);
+        plat_mutex_lock(&pw_lock);
+        __atomic_store_n(&pdone[i], 1, __ATOMIC_RELEASE);
+    }
+    uint64_t t2 = kern_now_ns();
+    for (int i = PC.s0; i < PC.nslices; i++)
+        while (!__atomic_load_n(&pdone[i], __ATOMIC_ACQUIRE)) plat_cond_wait(&pw_idle, &pw_lock);
+    uint64_t t3 = kern_now_ns();
+    par_t_own += t2 - t1, par_t_wait += t3 - t2;
+    if (t3 - t2 > par_wait_max) par_wait_max = t3 - t2;
+    par_wait_long += t3 - t2 > 200000;
+    __atomic_store_n(&pw_active, 0, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&pw_lock);
+
+    vk_exec_draw_slices_end(par_nworkers + 1);
+    int n = PC.nslices - PC.s0;
+    ParDone *done = malloc(sizeof *done + sizeof(ParCb) * (size_t)(n ? n : 1));
+    VkCommandBuffer *cbs = malloc(sizeof *cbs * (size_t)(n ? n : 1));
+    if (!done || !cbs) rt_fatal("vk: out of memory");
+    done->n = 0;
+    int hazard = 0;
+    for (int i = PC.s0; i < PC.nslices; i++) {
+        ParOut *o = &par_out[i];
+        done->cb[done->n++] = o->cb;
+        cbs[i - PC.s0] = o->cb.cb;
+        ex->fb_dirty |= o->fb_dirty;
+        ex->recorded += o->recorded;
+        if (o->hazard > hazard) hazard = o->hazard;
+        for (int k = 0; k < o->nviews; k++) {
+            if (ex->nviews == ex->cap_views) ex->views = par_grow(ex->views, &ex->cap_views, sizeof(ViewEnt));
+            ((ViewEnt *)ex->views)[ex->nviews++] = o->views[k];
+        }
+        free(o->views);
+    }
+    uint64_t te = kern_now_ns();
+    rec_drain();
+#ifdef vkCmdExecuteCommands
+#undef vkCmdExecuteCommands
+#endif
+    if (n > 0) vkCmdExecuteCommands(ex->cb, (uint32_t)n, cbs);
+    free(cbs);
+    ex->recorded++;
+    vk_completion_add(ex->fence, par_done, done);
+    par_t_exec += kern_now_ns() - te;
+    vk_exec_draw_new_cb();
+    ex->dirty = VK_EXEC_DIRTY_ALL;
+    pass_draws = (uint32_t)PC.draws;
+    vk_exec_pass_end(ex);
+    split_draws += PC.draws;
+    if (hazard) {
+        ParHist *e = par_find(PC.sig, 1);
+        par_no[3]++;
+        if (e->banned < 255 && ++e->banned == PAR_BAN_AFTER)
+            rt_log("vk: a sliced pass needed a pass or barrier change inside a slice %d times: those targets are not sliced again",
+                   PAR_BAN_AFTER);
+    }
+}
+
 static void walk(VkExec *ex, const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
+        if (PC.on) {
+            if (par_take(ex, h, a)) { h = nvn_op_next(h); continue; }
+            par_flush(ex);
+        }
         switch (h->op) {
         case OP_END: return;
         case OP_BEGIN: break;
@@ -870,59 +1417,21 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_SET_RT: set_rt(ex, a); break;
         case OP_CLEAR_COLOR: clear_color(ex, a); break;
         case OP_CLEAR_DS: clear_ds(ex, a); break;
-        case OP_VIEWPORTS: {
-            const p_viewports *v = a;
-            for (int i = 0; i < v->n && v->first + i < 16; i++)
-                if (v->first + i >= 0) {
-                    memcpy(ex->vp[v->first + i], v->v[i], sizeof ex->vp[0]);
-                    if ((uint32_t)(v->first + i) >= ex->vp_n) ex->vp_n = (uint32_t)(v->first + i) + 1;
-                }
-            ex->has_vp = 1;
-            ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
+        case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL: case OP_POLY_OFFSET:
+        case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
+        case OP_PATCH_SIZE: case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
+            state_op(ex, h->op, a);
             break;
-        }
-        case OP_SCISSOR: {
-            const p_scissor *s = a;
-            if (!s->index) ex->scissor = *s, ex->has_scissor = 1;
-            else if (s->index > 0 && s->index < 16) ex->scissor_n[s->index] = *s, ex->scissor_mask |= 1u << s->index;
-            ex->dirty |= VK_EXEC_DIRTY_SCISSOR;
-            break;
-        }
-        case OP_DEPTH_RANGE: {
-            const p_depth_range *r = a;
-            ex->depth_range[0] = r->n, ex->depth_range[1] = r->f;
-            ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
-            break;
-        }
-        case OP_STENCIL: {
-            const p_stencil *s = a;
-            for (int f = 0; f < 2; f++) {
-                if (!(s->face & (1 << f))) continue;
-                if (s->which == 0) ex->st_vmask[f] = (uint32_t)s->value_mask;
-                else if (s->which == 1) ex->st_wmask[f] = (uint32_t)s->mask;
-                else ex->st_ref[f] = (uint32_t)s->ref;
-            }
-            ex->dirty |= VK_EXEC_DIRTY_STENCIL;
-            break;
-        }
-        case OP_POLY_OFFSET:
-            ex->poly_offset = *(const p_poly_offset *)a;
-            ex->dirty |= VK_EXEC_DIRTY_DEPTH_BIAS;
-            break;
-        case OP_BLEND_COLOR:
-            memcpy(ex->blend_color, ((const p_blend_color *)a)->rgba, sizeof ex->blend_color);
-            ex->dirty |= VK_EXEC_DIRTY_BLEND_CONST;
-            break;
-        case OP_DEPTH_CLAMP: ex->pipe.depth_clamp = ((const p_flag *)a)->value != 0; break;
-        case OP_RASTER_DISCARD: ex->pipe.raster_discard = ((const p_flag *)a)->value != 0; break;
-        case OP_PRIM_RESTART: ex->prim_restart = *(const p_prim_restart *)a; break;
-        case OP_PATCH_SIZE: ex->patch_size = ((const p_flag *)a)->value; break;
-        case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; break;
-        case OP_COPY_IMAGE_STRIDE: ex->copy_image_stride = ((const p_copy_stride *)a)->stride; break;
-        case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
-        case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
         case OP_BARRIER: vk_exec_barrier(ex); break;
-        case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
+        case OP_DRAW: case OP_DRAW_IDX:
+            if (ex == &X && (!ex->in_pass || !pass_tried) && par_start(ex)) {
+                par_take(ex, h, a);
+                h = nvn_op_next(h);
+                continue;
+            }
+            pass_draws++;
+            // fall through
+        case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
         case OP_DRAW_IND_MULTI:
             if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || h->op == OP_DRAW_IND_MULTI)
                 vk_exec_frame.draws_seen++, split_draws++;
@@ -973,6 +1482,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
         walk(ex, nvn_op_first(handles[i]), 0);
     }
+    par_flush(ex);
     vk_exec_pass_end(ex);
     if (n) vk_dlaa_submission_end(ex);
     x_here = 0;
@@ -991,6 +1501,16 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     if (n && (rt_trace & RT_TRACE_PERF)) vk_exec_ub_perf();
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
         rt_log("perf: replay command buffer parts per submission %.2f", (double)(n_subs + n_parts) / (double)n_subs);
+        if (par_mode > 0) {
+            rt_log("perf: parallel passes %llu (restarts %llu), slices %llu, sliced draws %llu, skipped oq %llu; collect %.2f ms, "
+                   "own %.2f ms, wait %.2f ms (max %.2f ms, >200us %llu), exec %.2f ms",
+                   (unsigned long long)par_passes, (unsigned long long)par_restarts, (unsigned long long)par_slices,
+                   (unsigned long long)par_sliced_draws, (unsigned long long)par_skipped_oq, par_t_collect / 1e6,
+                   par_t_own / 1e6, par_t_wait / 1e6, par_wait_max / 1e6, (unsigned long long)par_wait_long,
+                   par_t_exec / 1e6);
+            par_passes = par_restarts = par_slices = par_sliced_draws = par_skipped_oq = 0;
+            par_t_collect = par_t_own = par_t_wait = par_t_exec = par_wait_max = par_wait_long = 0;
+        }
         n_subs = n_parts = 0;
     }
     return ex->recorded - part_start;   // what the last part holds

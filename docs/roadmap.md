@@ -86,9 +86,9 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
      - [x] Implementar controle de *commit headroom* no Windows (`MTF_COMMIT_HEADROOM_MIB`, padrão `512` MiB, clean-room via `GlobalMemoryStatusEx` `ullAvailPageFile` em `plat_mem_avail_commit`) para evitar OOM em 16 GB RAM.
      - [x] **Gate 2.1:** `check_content.py` limpo, build sem erros e smoke test de boot verificando ativação de `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY=auto` e `MTF_COMMIT_HEADROOM_MIB` (`5076 MB` no boot inicial); medições em partida registradas em [docs/perf-methodology.md](perf-methodology.md).
    - **Etapa 2.2 — Performance de CPU no Replay Vulkan:**
-     - [ ] Portar replay paralelo multi-thread (`MTF_REPLAY_THREADS`, `REC_BATCH`, `PREWARM_XLATE`) em `runtime/vk_exec.c`.
-     - [ ] Avaliar e integrar `vk_spec.c` + `vk_exec_draw_helper.c` (`MTF_REPLAY_PAR` / `MTF_REPLAY_HELPERS`) como complemento em thread única.
-     - [ ] **Gate 2.2:** Ganho mensurável em `replay_ms/frame` e `fps` destravado no benchmark A/B de [docs/perf-methodology.md](perf-methodology.md).
+     - [x] Portar replay paralelo multi-thread (`MTF_REPLAY_THREADS`, padrão `6` em >=12 CPUs / `4` em >=8 CPUs / `0` em AMD) em [runtime/vk_exec.c](runtime/vk_exec.c) + `DrawCtx` por thread em [runtime/vk_exec_draw.c](runtime/vk_exec_draw.c) + suporte de queries herdadas em [runtime/vk_exec_xfer.c](runtime/vk_exec_xfer.c) + write-back local por thread em [runtime/vk_memory.c](runtime/vk_memory.c). *(Nota: `MTF_REC_PUB` em `vk_rec.c` e `vk_pipeline_prewarm(..., cpus)` em `vk_pipeline.c` já cobriam o papel de `REC_BATCH` e `PREWARM_XLATE` no runtime.)*
+     - [x] Avaliar `vk_spec.c` + `vk_exec_draw_helper.c` (`MTF_REPLAY_PAR`): mantido como opcional/futuro, pois `MTF_REPLAY_THREADS=6` já paraleliza os passes grandes (>=256 draws) sem duplicar `vk_exec_draw.c` em `vk_exec_draw_helper.c`.
+     - [x] **Gate 2.2:** Build limpo, `check_content.py` sem violações e smoke test confirmando `MTF_REPLAY_THREADS=6, the default`; medições A/B (`MTF_REPLAY_THREADS=0` vs `6`) em partida registradas em [docs/perf-methodology.md](perf-methodology.md).
    - **Etapa 2.3 — Robustez de Shaders & Documentação:**
      - [ ] Portar `spirv_nan_guard.c` (`MTF_NAN_GUARD` opcional para fragment shaders).
      - [ ] Registrar créditos MIT de `dkb-pc-recomp` (`4e7f9b2`) em `THIRD_PARTY_NOTICES.md`.

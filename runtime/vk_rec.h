@@ -27,6 +27,13 @@ int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n);
 VkResult rec_submit(const VkSubmitInfo2 *si);
 void rec_drain(void);                 // waits until the recorder made every call queued so far
 void rec_stats_log(void);             // MTF_TRACE=perf: packets, bytes, drains and waits since the last call
+void rec_capture_spill(void (*fn)(void));
+int rec_capture_room(uint32_t words);
+uint32_t rec_capture_begin(void);
+uint32_t rec_capture_end(void);
+void rec_capture_reset(void);
+void rec_capture_play(VkCommandBuffer cb, uint32_t lo, uint32_t hi);
+int rec_owns(VkCommandBuffer cb);
 // MTF_REC_CHECK=1 (debug, recorder on): vk_memory.c reports each object it defers (destroy 0, stamped tl) or destroys
 // (destroy 1) with the value the GPU reached (gpu); a packet of the part being recorded that still names it is logged
 // as a hazard when the object can go before the part ran. rec_check_log: the counts by kind and packet, at exit.
