@@ -11,7 +11,20 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
 uint64_t input_idle_ns(void);   // since a button was last held or a stick last pushed
 enum { INPUT_DEV_KEYBOARD, INPUT_DEV_NINTENDO, INPUT_DEV_XBOX, INPUT_DEV_PLAYSTATION };
 int input_last_device(void);    // last active input device (keyboard or connected gamepad type)
-enum { B_A, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN };
+#include "input_map.h"
+#ifndef B_LS
+#define B_LS B_STICK_L
+#define B_RS B_STICK_R
+#endif
+enum { INPUT_CAPTURE_NONE, INPUT_CAPTURE_KEY, INPUT_CAPTURE_PAD };
+enum { PAD_LABEL_NONE, PAD_LABEL_A, PAD_LABEL_B, PAD_LABEL_X, PAD_LABEL_Y,
+       PAD_LABEL_CROSS, PAD_LABEL_CIRCLE, PAD_LABEL_SQUARE, PAD_LABEL_TRIANGLE };
+typedef struct { int type; char name[128]; } InputPadInfo;
+int input_capture(int reset, int *id_out);
+uint32_t input_key_char(int key);
+int input_pad_label(int pad);
+int input_pad_layout(void);
+int input_pad_info(InputPadInfo *out);
 // The controller as the menu reads it (gamepad and keyboard, no script): 1 when a gamepad is connected.
 int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly);
 // The shake key (Space) is held: ov_hid.c adds the side-to-side swing the six-axis sensor reports for it.

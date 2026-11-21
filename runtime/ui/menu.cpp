@@ -21,6 +21,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"   // the popup stack, closed when the menu closes
 #include "backends/imgui_impl_vulkan.h"
+#include "ui/binds_page.h"
 #include "ui/option_rows.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -561,18 +562,35 @@ static void tab_sound(float scale) {
 static bool g_modal;
 
 static void tab_controls(float scale) {
-    opt_begin("##controls", scale);
-    static const UiTextId layout[] = {UI_MENU_PAD_LAYOUT_AUTO, UI_MENU_PAD_LAYOUT_POSITIONAL};
-    opt_choice("MTF_PAD_LAYOUT", UI_MENU_PAD_LAYOUT, layout, 2, UI_MENU_PAD_LAYOUT_DESC);
-    static const UiTextId icons[] = {UI_MENU_BUTTON_ICONS_AUTO, UI_MENU_BUTTON_ICONS_NINTENDO, UI_MENU_BUTTON_ICONS_XBOX,
-                                     UI_MENU_BUTTON_ICONS_PS, UI_MENU_BUTTON_ICONS_KB};
-    opt_choice("MTF_BUTTON_ICONS", UI_MENU_BUTTON_ICONS, icons, 5, UI_MENU_BUTTON_ICONS_DESC);
-    opt_toggle("MTF_MOTION", UI_MENU_MOTION, UI_MENU_MOTION_DESC);
-    opt_slider("MTF_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 300, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");
-    opt_slider("MTF_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");
-    opt_group(UI_MENU_GROUP_STICKS);
-    opt_slider("MTF_STICK_DEADZONE", UI_MENU_STICK_DEADZONE, 0, 50, UI_MENU_STICK_DEADZONE_DESC, 1, "%.0f %%");
-    opt_end();
+    if (ImGui::BeginTabBar("##controls_sub", ImGuiTabBarFlags_NoTabListScrollingButtons)) {
+        char controller[64], keyboard[64];
+        snprintf(controller, sizeof controller, "  %s  ###ctrl_pad", menu_text(UI_MENU_CONTROLLER));
+        snprintf(keyboard, sizeof keyboard, "  %s  ###ctrl_kb", menu_text(UI_MENU_KEYBOARD));
+        if (ImGui::BeginTabItem(controller)) {
+            opt_begin("##controls_pad", scale);
+            static const UiTextId layout[] = {UI_MENU_PAD_LAYOUT_AUTO, UI_MENU_PAD_LAYOUT_POSITIONAL};
+            opt_choice("MTF_PAD_LAYOUT", UI_MENU_PAD_LAYOUT, layout, 2, UI_MENU_PAD_LAYOUT_DESC);
+            static const UiTextId icons[] = {UI_MENU_BUTTON_ICONS_AUTO, UI_MENU_BUTTON_ICONS_NINTENDO,
+                                             UI_MENU_BUTTON_ICONS_XBOX, UI_MENU_BUTTON_ICONS_PS, UI_MENU_BUTTON_ICONS_KB};
+            opt_choice("MTF_BUTTON_ICONS", UI_MENU_BUTTON_ICONS, icons, 5, UI_MENU_BUTTON_ICONS_DESC);
+            opt_toggle("MTF_MOTION", UI_MENU_MOTION, UI_MENU_MOTION_DESC);
+            opt_slider("MTF_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 300, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");
+            opt_slider("MTF_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");
+            opt_group(UI_MENU_GROUP_STICKS);
+            opt_slider("MTF_STICK_DEADZONE", UI_MENU_STICK_DEADZONE, 0, 50, UI_MENU_STICK_DEADZONE_DESC, 1, "%.0f %%");
+            binds_rows(scale, true);
+            opt_end();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(keyboard)) {
+            opt_begin("##controls_kb", scale);
+            binds_rows(scale, false);
+            opt_end();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    binds_after_page();
 }
 
 static void tab_menu(float scale) {
@@ -679,6 +697,11 @@ static void tab_advanced(float scale) {
     static const UiTextId preempt[] = {UI_MENU_PREEMPT_OFF, UI_MENU_PREEMPT_ON, UI_MENU_PREEMPT_INHERIT};   // 0|1|2
     opt_choice("MTF_ASYNC_PREEMPT", UI_MENU_ASYNC_PREEMPT, preempt, 3, UI_MENU_ASYNC_PREEMPT_DESC);
     opt_toggle("MTF_REPLAY_ASYNC", UI_MENU_REPLAY_ASYNC, UI_MENU_REPLAY_ASYNC_DESC);
+    {
+        const char *rt_vals[] = {"", "0", "2", "4", "6", "8"};
+        const char *rt_names[] = {menu_text(UI_MENU_AUTO), menu_text(UI_MENU_OFF), "2", "4", "6", "8"};
+        opt_choice_list("MTF_REPLAY_THREADS", UI_MENU_REPLAY_THREADS, rt_vals, rt_names, 6, UI_MENU_REPLAY_THREADS_DESC);
+    }
     opt_toggle("MTF_TIMER_1MS", UI_MENU_TIMER_1MS, UI_MENU_TIMER_1MS_DESC);
 
     opt_group(UI_MENU_GROUP_SHADERS);
@@ -693,6 +716,10 @@ static void tab_advanced(float scale) {
     static const UiTextId mem[] = {UI_MENU_MEMORY_AUTO, UI_MENU_MEMORY_IMPORT, UI_MENU_MEMORY_MIRROR,
                                    UI_MENU_MEMORY_VERIFY};
     opt_choice("MTF_MEMORY", UI_MENU_MEMORY, mem, 4, UI_MENU_MEMORY_DESC);
+    opt_toggle("MTF_VRAM_HEADROOM", UI_MENU_VRAM_HEADROOM, UI_MENU_VRAM_HEADROOM_DESC);
+    opt_toggle("MTF_HEAP_LAZY", UI_MENU_HEAP_LAZY, UI_MENU_HEAP_LAZY_DESC);
+    static const UiTextId sparse[] = {UI_MENU_AUTO, UI_MENU_OFF, UI_MENU_ON};
+    opt_choice("MTF_SPARSE_MIRROR_COPY", UI_MENU_SPARSE_MIRROR, sparse, 3, UI_MENU_SPARSE_MIRROR_DESC);
     opt_toggle("MTF_TEX_ALIAS", UI_MENU_TEX_ALIAS, UI_MENU_TEX_ALIAS_DESC);
     opt_slider("MTF_TEX_VRAM_PRESSURE", UI_MENU_TEX_VRAM_PRESSURE, 0, 100, UI_MENU_TEX_VRAM_PRESSURE_DESC, 1, "%.0f%%");
     static const UiTextId astc_bc[] = {UI_MENU_AUTO, UI_MENU_OFF, UI_MENU_ON};   // unset, 0, 1
@@ -716,6 +743,8 @@ static void tab_advanced(float scale) {
     opt_choice("MTF_VK_DYN_VERTEX", UI_MENU_VK_DYN_VERTEX, dyn, 3, UI_MENU_VK_DYN_VERTEX_DESC);
     opt_choice("MTF_VK_DYN_A2C", UI_MENU_VK_DYN_A2C, dyn, 3, UI_MENU_VK_DYN_A2C_DESC);
     opt_toggle("MTF_VK_SUBGROUP_PIN", UI_MENU_VK_SUBGROUP_PIN, UI_MENU_VK_SUBGROUP_PIN_DESC);
+    static const UiTextId nan_guard[] = {UI_MENU_OFF, UI_MENU_NAN_ZERO, UI_MENU_NAN_MARK};
+    opt_choice("MTF_NAN_GUARD", UI_MENU_NAN_GUARD, nan_guard, 3, UI_MENU_NAN_GUARD_DESC);
 
     opt_group(UI_MENU_GROUP_DIAG);
     row_set_or_not("MTF_TRACE", UI_MENU_TRACE, UI_MENU_TRACE_DESC, "perf");
@@ -798,13 +827,13 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
     ImGui::TextDisabled("%s", version);
 
-    int step = g_modal                                                                                  ? 0
+    int step = g_modal || binds_modal()                                                                 ? 0
              : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
              : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
                                                                                                         : 0;
     if (step) g_tab_request = (g_tab + step + TAB_COUNT) % TAB_COUNT;
     if (g_tab_request >= 0) g_focus_page = g_tab_request;   // the new page's first row takes the cursor
-    bool was_modal = g_modal;
+    bool was_modal = g_modal || binds_modal();
     g_modal = false;
 
     const ImGuiStyle &st = ImGui::GetStyle();

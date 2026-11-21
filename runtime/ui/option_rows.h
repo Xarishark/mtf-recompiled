@@ -65,6 +65,9 @@ void opt_text_str(const char *text, bool warn = false);
 // the "default" mark from the fallback's default, and a step onto the fallback's value unsets key again.
 bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId desc, float step = 1,
                 const char *fmt = "%g", const char *note = nullptr, const char *fallback = nullptr);
+void opt_bind_key_header(void);
+int opt_bind_row(const char *key, const char *label, UiTextId desc, const char *const cells[3], const bool enabled[3],
+                 bool controller, const char *note);
 
 // mtf.ini is written a moment after the last change (a held slider would rewrite it every frame) and when the menu
 // closes. opt_save_tick: on every frame the menu lays out; force: write now if anything is pending. 1 while a write is

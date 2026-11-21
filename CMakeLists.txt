@@ -76,6 +76,7 @@ set(MTF_RUNTIME_SOURCES
     runtime/glyph_draw.c
     runtime/hostfn.c
     runtime/input.c
+    runtime/input_map.c
     runtime/ipc.c
     runtime/kernel.c
     runtime/loader.c
@@ -137,6 +138,7 @@ set(MTF_RUNTIME_SOURCES
     runtime/platform/win32.c
     # the in-game settings menu (Minus+Plus, F1, Esc) on Dear ImGui
     runtime/ui/menu.cpp
+    runtime/ui/binds_page.cpp
     runtime/ui/menu_win.cpp
     runtime/ui/option_rows.cpp
     runtime/ui_text.c

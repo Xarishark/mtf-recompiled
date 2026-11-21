@@ -38,14 +38,31 @@ static uint64_t pad_buttons;
 static int32_t pad_axes[4];
 
 // ---- keyboard
-typedef struct { int vk; uint64_t button; } KeyButton;
-static const KeyButton keymap[] = {
-    {'K', BIT(B_A)}, {'J', BIT(B_B)}, {'I', BIT(B_X)}, {'U', BIT(B_Y)},
-    {'Q', BIT(B_L)}, {'E', BIT(B_R)}, {'Z', BIT(B_ZL)}, {'C', BIT(B_ZR)},
-    {VK_RETURN, BIT(B_PLUS)}, {VK_BACK, BIT(B_MINUS)},
-    {'F', BIT(B_LS)}, {'H', BIT(B_RS)},
-    {'1', BIT(B_LEFT)}, {'2', BIT(B_UP)}, {'3', BIT(B_RIGHT)}, {'4', BIT(B_DOWN)},
+static const struct { uint8_t key; uint8_t vk; } key_vks[] = {
+    {KEY_SPACE, VK_SPACE}, {KEY_TAB, VK_TAB}, {KEY_LSHIFT, VK_LSHIFT}, {KEY_LCTRL, VK_LCONTROL},
+    {KEY_UP, VK_UP}, {KEY_DOWN, VK_DOWN}, {KEY_LEFT, VK_LEFT}, {KEY_RIGHT, VK_RIGHT},
+    {KEY_MOUSE_L, VK_LBUTTON}, {KEY_MOUSE_R, VK_RBUTTON}, {KEY_MOUSE_M, VK_MBUTTON},
+    {KEY_MOUSE_X1, VK_XBUTTON1}, {KEY_MOUSE_X2, VK_XBUTTON2},
+    {KEY_ENTER, VK_RETURN}, {KEY_BACKSPACE, VK_BACK}, {KEY_RSHIFT, VK_RSHIFT}, {KEY_RCTRL, VK_RCONTROL},
+    {KEY_LALT, VK_LMENU}, {KEY_CAPSLOCK, VK_CAPITAL}, {KEY_INSERT, VK_INSERT}, {KEY_DELETE, VK_DELETE},
+    {KEY_HOME, VK_HOME}, {KEY_END, VK_END}, {KEY_PAGEUP, VK_PRIOR}, {KEY_PAGEDOWN, VK_NEXT},
+    {KEY_F2, VK_F2}, {KEY_F3, VK_F3}, {KEY_F4, VK_F4}, {KEY_F5, VK_F5},
+    {KEY_F6, VK_F6}, {KEY_F7, VK_F7}, {KEY_F9, VK_F9}, {KEY_F12, VK_F12},
+    {KEY_NUM_ADD, VK_ADD}, {KEY_NUM_SUB, VK_SUBTRACT}, {KEY_NUM_MUL, VK_MULTIPLY},
+    {KEY_NUM_DIV, VK_DIVIDE}, {KEY_NUM_DECIMAL, VK_DECIMAL},
+    {KEY_MINUS, VK_OEM_MINUS}, {KEY_EQUALS, VK_OEM_PLUS}, {KEY_LBRACKET, VK_OEM_4}, {KEY_RBRACKET, VK_OEM_6},
+    {KEY_SEMICOLON, VK_OEM_1}, {KEY_APOSTROPHE, VK_OEM_7}, {KEY_COMMA, VK_OEM_COMMA}, {KEY_PERIOD, VK_OEM_PERIOD},
+    {KEY_SLASH, VK_OEM_2}, {KEY_BACKSLASH, VK_OEM_5}, {KEY_GRAVE, VK_OEM_3},
 };
+
+static int key_to_vk(int k) {
+    if (k >= KEY_A && k <= KEY_Z) return 'A' + (k - KEY_A);
+    if (k >= KEY_0 && k <= KEY_9) return '0' + (k - KEY_0);
+    if (k >= KEY_NUM0 && k <= KEY_NUM9) return VK_NUMPAD0 + (k - KEY_NUM0);
+    for (size_t i = 0; i < sizeof key_vks / sizeof *key_vks; i++)
+        if (key_vks[i].key == k) return key_vks[i].vk;
+    return 0;
+}
 
 static int window_in_front(void) {
     HWND w = GetForegroundWindow();
@@ -56,18 +73,33 @@ static int window_in_front(void) {
 
 static int key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-static void keyboard_read(uint64_t *buttons, int32_t axes[4]) {
+static void read_key_down(uint8_t down[KEY_COUNT]) {
+    memset(down, 0, KEY_COUNT);
     if (!window_in_front()) return;
-    for (size_t i = 0; i < sizeof keymap / sizeof *keymap; i++)
-        if (key(keymap[i].vk)) *buttons |= keymap[i].button;
-    int lx = key('D') - key('A'), ly = key('W') - key('S'), rx = key(VK_RIGHT) - key(VK_LEFT), ry = key(VK_UP) - key(VK_DOWN);
-    if (lx) axes[0] = lx * STICK_MAX;
-    if (ly) axes[1] = ly * STICK_MAX;
-    if (rx) axes[2] = rx * STICK_MAX;
-    if (ry) axes[3] = ry * STICK_MAX;
+    for (int k = KEY_A; k < KEY_COUNT; k++) {
+        int vk = key_to_vk(k);
+        if (vk && key(vk)) down[k] = 1;
+    }
 }
 
-int input_shake_held(void) { return window_in_front() && key(VK_SPACE); }
+static void keyboard_read(uint64_t *buttons, int32_t axes[4]) {
+    uint8_t down[KEY_COUNT];
+    read_key_down(down);
+    *buttons |= input_map_buttons(down);
+    int32_t ls[2] = {0}, rs[2] = {0};
+    input_map_stick(down, 0, ls);
+    input_map_stick(down, 1, rs);
+    if (ls[0]) axes[0] = ls[0];
+    if (ls[1]) axes[1] = ls[1];
+    if (rs[0]) axes[2] = rs[0];
+    if (rs[1]) axes[3] = rs[1];
+}
+
+int input_shake_held(void) {
+    uint8_t down[KEY_COUNT];
+    read_key_down(down);
+    return input_map_shake(down);
+}
 
 // ---- gamepad (under lock)
 static int pad_dev_type = INPUT_DEV_XBOX;
@@ -132,30 +164,42 @@ static void stick(int16_t sx, int16_t sy, int32_t *ox, int32_t *oy) {
     *oy = (int32_t)fmax(-STICK_MAX, fmin(STICK_MAX, lround(y * k)));
 }
 
+static uint8_t pad_down_live[PAD_COUNT];
+static int pad_layout_now = -1;
+
+static void read_pad_down(uint8_t pdown[PAD_COUNT]) {
+    memset(pdown, 0, PAD_COUNT);
+    if (!pad) return;
+    static const struct { SDL_GamepadButton sdl; uint8_t p; } btns[] = {
+        {SDL_GAMEPAD_BUTTON_SOUTH, PAD_SOUTH}, {SDL_GAMEPAD_BUTTON_EAST, PAD_EAST},
+        {SDL_GAMEPAD_BUTTON_WEST, PAD_WEST}, {SDL_GAMEPAD_BUTTON_NORTH, PAD_NORTH},
+        {SDL_GAMEPAD_BUTTON_LEFT_STICK, PAD_LSTICK}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, PAD_RSTICK},
+        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, PAD_L}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_R},
+        {SDL_GAMEPAD_BUTTON_START, PAD_START}, {SDL_GAMEPAD_BUTTON_BACK, PAD_BACK},
+        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, PAD_DPAD_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_UP, PAD_DPAD_UP},
+        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_DPAD_RIGHT}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, PAD_DPAD_DOWN},
+        {SDL_GAMEPAD_BUTTON_LEFT_PADDLE1, PAD_LPADDLE1}, {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1, PAD_RPADDLE1},
+        {SDL_GAMEPAD_BUTTON_LEFT_PADDLE2, PAD_LPADDLE2}, {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2, PAD_RPADDLE2},
+    };
+    for (size_t i = 0; i < sizeof btns / sizeof *btns; i++)
+        if (SDL_GetGamepadButton(pad, btns[i].sdl)) pdown[btns[i].p] = 1;
+    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON) pdown[PAD_ZL] = 1;
+    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON) pdown[PAD_ZR] = 1;
+}
+
 static void pad_read(void) {
     uint64_t b = 0;
     int32_t a[4] = {0};
     if (pad) {
         int nin = nintendo_layout();
-        static const struct { SDL_GamepadButton sdl; int sw; } common[] = {
-            {SDL_GAMEPAD_BUTTON_LEFT_STICK, B_LS}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, B_RS},
-            {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, B_L}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, B_R},
-            {SDL_GAMEPAD_BUTTON_START, B_PLUS}, {SDL_GAMEPAD_BUTTON_BACK, B_MINUS},
-            {SDL_GAMEPAD_BUTTON_DPAD_LEFT, B_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_UP, B_UP},
-            {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, B_RIGHT}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, B_DOWN},
-        };
-        for (size_t i = 0; i < sizeof common / sizeof *common; i++)
-            if (SDL_GetGamepadButton(pad, common[i].sdl)) b |= BIT(common[i].sw);
-        // south, east, west, north
-        static const int xbox[4] = {B_A, B_B, B_X, B_Y}, nintendo[4] = {B_B, B_A, B_Y, B_X};
-        static const SDL_GamepadButton face[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
-                                                  SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH};
-        for (int i = 0; i < 4; i++)
-            if (SDL_GetGamepadButton(pad, face[i])) b |= BIT(nin ? nintendo[i] : xbox[i]);
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON) b |= BIT(B_ZL);
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON) b |= BIT(B_ZR);
+        pad_layout_now = nin ? PAD_LAYOUT_NINTENDO : PAD_LAYOUT_XBOX;
+        read_pad_down(pad_down_live);
+        b = input_map_pad_buttons(pad_down_live, pad_layout_now);
         stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY), &a[0], &a[1]);
         stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY), &a[2], &a[3]);
+    } else {
+        memset(pad_down_live, 0, sizeof pad_down_live);
+        pad_layout_now = -1;
     }
     pad_buttons = b;
     memcpy(pad_axes, a, sizeof a);
@@ -193,7 +237,13 @@ static void input_main(void *arg) {
     for (int tick = 0;; tick++) {
         float a[3], g[3];
         int have = 0;
-        plat_mutex_lock(&lock);
+        static unsigned map_ver = ~0u;
+    unsigned ver = cfg_version();
+    if (map_ver != ver) {
+        map_ver = ver;
+        input_map_configure();
+    }
+    plat_mutex_lock(&lock);
         SDL_PumpEvents();   // hot-plug
         SDL_UpdateGamepads();
         if (tick % 50 == 0) open_pad();
@@ -411,6 +461,12 @@ static uint64_t last_active_ns;
 uint64_t input_idle_ns(void) { return plat_now_ns() - __atomic_load_n(&last_active_ns, __ATOMIC_RELAXED); }
 
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
+    static unsigned map_ver = ~0u;
+    unsigned ver = cfg_version();
+    if (map_ver != ver) {
+        map_ver = ver;
+        input_map_configure();
+    }
     plat_mutex_lock(&lock);
     start();
     uint64_t b = pad_buttons;
@@ -470,6 +526,12 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
 }
 
 int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly) {
+    static unsigned map_ver = ~0u;
+    unsigned ver = cfg_version();
+    if (map_ver != ver) {
+        map_ver = ver;
+        input_map_configure();
+    }
     plat_mutex_lock(&lock);
     start();
     uint64_t b = pad_buttons;
@@ -496,6 +558,12 @@ int input_rumble(float low, float high, uint32_t ms) {
     if (curve < 0.2 || curve > 1.5) curve = 1;
     low = rumble_shape(low, curve, gain);
     high = rumble_shape(high, curve, gain);
+    static unsigned map_ver = ~0u;
+    unsigned ver = cfg_version();
+    if (map_ver != ver) {
+        map_ver = ver;
+        input_map_configure();
+    }
     plat_mutex_lock(&lock);
     int ok = pad && SDL_RumbleGamepad(pad, (Uint16)(low * 65535.0f), (Uint16)(high * 65535.0f), ms);
     plat_mutex_unlock(&lock);
@@ -510,3 +578,83 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     return 0;
 }
 void input_cursor_suspend(int on) { (void)on; }
+
+uint32_t input_key_char(int k) {
+    if (k < KEY_MINUS || k > KEY_GRAVE) return 0;
+    int vk = key_to_vk(k);
+    if (!vk) return 0;
+    UINT sc = MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
+    BYTE ks[256] = {0};
+    WCHAR out[4] = {0};
+    if (ToUnicode((UINT)vk, sc, ks, out, 4, 0) == 1 && out[0] >= 0x21 && out[0] != 0x7f) return out[0];
+    return 0;
+}
+
+int input_pad_layout(void) { return pad_layout_now; }
+
+int input_pad_info(InputPadInfo *out) {
+    plat_mutex_lock(&lock);
+    int ok = pad != NULL;
+    if (ok && out) {
+        out->type = (int)SDL_GetGamepadType(pad);
+        const char *nm = SDL_GetGamepadName(pad);
+        snprintf(out->name, sizeof out->name, "%s", nm ? nm : "");
+    }
+    plat_mutex_unlock(&lock);
+    return ok;
+}
+
+int input_pad_label(int p) {
+    if (p < PAD_SOUTH || p > PAD_NORTH) return PAD_LABEL_NONE;
+    plat_mutex_lock(&lock);
+    int lbl = PAD_LABEL_NONE;
+    if (pad) {
+        static const SDL_GamepadButton b[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
+                                               SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH};
+        SDL_GamepadButtonLabel sl = SDL_GetGamepadButtonLabel(pad, b[p - PAD_SOUTH]);
+        switch (sl) {
+        case SDL_GAMEPAD_BUTTON_LABEL_A: lbl = PAD_LABEL_A; break;
+        case SDL_GAMEPAD_BUTTON_LABEL_B: lbl = PAD_LABEL_B; break;
+        case SDL_GAMEPAD_BUTTON_LABEL_X: lbl = PAD_LABEL_X; break;
+        case SDL_GAMEPAD_BUTTON_LABEL_Y: lbl = PAD_LABEL_Y; break;
+        case SDL_GAMEPAD_BUTTON_LABEL_CROSS: lbl = PAD_LABEL_CROSS; break;
+        case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: lbl = PAD_LABEL_CIRCLE; break;
+        case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: lbl = PAD_LABEL_SQUARE; break;
+        case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: lbl = PAD_LABEL_TRIANGLE; break;
+        default: break;
+        }
+    }
+    plat_mutex_unlock(&lock);
+    return lbl;
+}
+
+int input_capture(int reset, int *id_out) {
+    static uint8_t prev_k[KEY_COUNT], prev_p[PAD_COUNT];
+    uint8_t cur_k[KEY_COUNT], cur_p[PAD_COUNT];
+    read_key_down(cur_k);
+    plat_mutex_lock(&lock);
+    memcpy(cur_p, pad_down_live, sizeof cur_p);
+    plat_mutex_unlock(&lock);
+    if (reset) {
+        memcpy(prev_k, cur_k, sizeof prev_k);
+        memcpy(prev_p, cur_p, sizeof prev_p);
+        return INPUT_CAPTURE_NONE;
+    }
+    for (int k = KEY_A; k < KEY_COUNT; k++) {
+        if (cur_k[k] && !prev_k[k]) {
+            memcpy(prev_k, cur_k, sizeof prev_k);
+            if (id_out) *id_out = k;
+            return INPUT_CAPTURE_KEY;
+        }
+    }
+    for (int p = PAD_SOUTH; p < PAD_COUNT; p++) {
+        if (cur_p[p] && !prev_p[p]) {
+            memcpy(prev_p, cur_p, sizeof prev_p);
+            if (id_out) *id_out = p;
+            return INPUT_CAPTURE_PAD;
+        }
+    }
+    memcpy(prev_k, cur_k, sizeof prev_k);
+    memcpy(prev_p, cur_p, sizeof prev_p);
+    return INPUT_CAPTURE_NONE;
+}

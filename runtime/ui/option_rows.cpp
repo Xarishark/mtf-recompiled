@@ -394,3 +394,98 @@ bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId de
     apply(key, fallback && fabs(n - cfg_double(fallback)) < step * 0.01 ? "" : out);
     return true;
 }
+
+static void fit_text(ImDrawList *dl, float x0, float x1, float y, float h, ImU32 col, const char *t, bool centred) {
+    ImFont *font = ImGui::GetFont();
+    float fs = ImGui::GetFontSize(), room = x1 - x0;
+    if (room <= 0 || !t || !*t) return;
+    float tw = font->CalcTextSizeA(fs, FLT_MAX, 0, t).x;
+    if (tw > room) {
+        fs = floorf(fs * (room / tw));
+        if (fs < 10.0f) fs = 10.0f;
+        tw = font->CalcTextSizeA(fs, FLT_MAX, 0, t).x;
+    }
+    float x = centred && tw < room ? x0 + (room - tw) * 0.5f : x0;
+    ImVec4 clip(x0, y, x1, y + h);
+    dl->AddText(font, fs, ImVec2(x, y + (h - fs) * 0.5f), col, t, NULL, 0, &clip);
+}
+
+static void bind_columns(float x, float w, int count, float cx[2], float *cw) {
+    float lw = floorf(w * 0.42f), gap = floorf(8 * g_scale);
+    *cw = floorf((w - lw - gap * count) / count);
+    for (int c = 0; c < count; c++) cx[c] = x + lw + gap + c * (*cw + gap);
+}
+
+void opt_bind_key_header(void) {
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x, cx[2], cw, fs = ImGui::GetFontSize() * 0.8f;
+    bind_columns(p.x, w, 2, cx, &cw);
+    const UiTextId cols[] = {UI_BINDS_COL_KEY1, UI_BINDS_COL_KEY2};
+    ImFont *font = ImGui::GetFont();
+    for (int c = 0; c < 2; c++) {
+        const char *t = menu_text(cols[c]);
+        float tw = font->CalcTextSizeA(fs, FLT_MAX, 0, t).x;
+        ImGui::GetWindowDrawList()->AddText(font, fs, ImVec2(cx[c] + (cw - tw) * 0.5f, p.y), kDim, t);
+    }
+    ImGui::Dummy(ImVec2(w, fs * 1.2f));
+}
+
+int opt_bind_row(const char *key, const char *label, UiTextId desc, const char *const cells[3], const bool enabled[3],
+                 bool controller, const char *note) {
+    ImGui::PushID(key);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float fs = ImGui::GetFontSize(), w = ImGui::GetContentRegionAvail().x, h = floorf(fs * 1.9f), cx[2], cw;
+    int count = controller ? 1 : 2;
+    bind_columns(p.x, w, count, cx, &cw);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float r = 6 * g_scale, pad = 6 * g_scale;
+    fit_text(dl, p.x + 16 * g_scale, cx[0] - fs * 0.3f, p.y, h, IM_COL32(235, 235, 228, 255), label, false);
+    int result = -1;
+    bool row_foc = false, row_hov = false;
+    for (int column = 0; column < count; column++) {
+        int c = controller ? 2 : column;
+        ImVec2 a(cx[column], p.y), b(cx[column] + cw, p.y + h);
+        const char *t = cells[c] && cells[c][0] ? cells[c] : "-";
+        if (!enabled[c]) {
+            dl->AddRect(a, b, IM_COL32(255, 255, 255, 22), r);
+            fit_text(dl, a.x + pad, b.x - pad, a.y, h, kGrey, t, true);
+            continue;
+        }
+        ImGui::SetCursorScreenPos(a);
+        ImGui::PushID(c);
+        ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));
+        bool clicked = ImGui::InvisibleButton("##cell", ImVec2(cw, h), ImGuiButtonFlags_EnableNav);
+        ImGui::PopStyleColor();
+        char id[80];
+        snprintf(id, sizeof id, "%s#%d", key, c);
+        bool to_key = g_focus_key[0] && !strcmp(id, g_focus_key);
+        if (g_take_first || to_key) {
+            ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
+            ImGui::SetNavCursorVisible(true);
+            if (g_take_first) ImGui::SetScrollY(0);
+            else ImGui::ScrollToItem(ImGuiScrollFlags_KeepVisibleEdgeY);
+            g_take_first = false;
+            if (to_key) g_focus_key[0] = 0;
+        }
+        bool hov = ImGui::IsItemHovered(), foc = ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible;
+        row_foc |= foc;
+        row_hov |= hov;
+        if (clicked) result = c;
+        if (foc && (ImGui::IsKeyPressed(ImGuiKey_Delete, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
+                    ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false)))
+            result = 10 + c;
+        dl->AddRectFilled(a, b, hov || foc ? IM_COL32(255, 255, 255, 28) : IM_COL32(255, 255, 255, 10), r);
+        dl->AddRect(a, b, hov || foc ? kGold : IM_COL32(255, 255, 255, 38), r, 0, hov || foc ? 2.0f : 1.0f);
+        fit_text(dl, a.x + pad, b.x - pad, a.y, h, IM_COL32(240, 240, 232, 255), t, true);
+        ImGui::PopID();
+    }
+    char k[64];
+    snprintf(k, sizeof k, "MTF_%s", key);
+    if (row_foc) desc_set(g_focus, menu_text(desc), k, NULL, note);
+    if (row_hov) desc_set(g_hover, menu_text(desc), k, NULL, note);
+    if (!g_first.text[0]) desc_set(g_first, menu_text(desc), k, NULL, note);
+    ImGui::SetCursorScreenPos(p);
+    ImGui::Dummy(ImVec2(w, h));
+    ImGui::PopID();
+    return result;
+}

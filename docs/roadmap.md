@@ -92,6 +92,13 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
    - **Etapa 2.3 — Robustez de Shaders & Documentação:**
      - [x] Portar `spirv_nan_guard.c` (`MTF_NAN_GUARD` opcional para fragment shaders: `0|zero|mark`).
      - [x] Registrar créditos MIT de `dkb-pc-recomp` (`4e7f9b2`) em `THIRD_PARTY_NOTICES.md`.
-5. **Diagnóstico, Mods & Pipeline de Build**
+5. **Menu de Configurações (`F1`) & Remapeamento de Controles**
+   - [x] Portar remapeamento completo de teclado (2 slots + `SHAKE` + analógicos) e gamepad (`binds_page.cpp` + `input_map.{c,h}` + `input_capture` + `MTF_BIND_*`) na aba Controles do menu `F1` (sub-abas **Controle** e **Teclado**, salvamento imediato em `mtf.ini` e aplicação ao vivo).
+   - [x] Complementar a aba Avançado do menu `F1` com as opções da Tier 2 (`MTF_REPLAY_THREADS`, `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, `MTF_NAN_GUARD`).
+6. **Multiplayer Online / Link Play (Prioridade Máxima após Menu de Configurações)**
+   - [ ] Mapear os serviços de rede/sessão local do Switch 2 usados por *Mario Tennis Fever* (`nn::ldn`, `nn::socket` / `bsd:u`, `nn::nifm`, `nn::friends`) via `bindb.sqlite` e traces de execução.
+   - [ ] Implementar camada HLE de **Link Play** (`nn::ldn` / `nn::socket`) sobre rede PC (UDP P2P / servidor relay ou salas por código, sem depender de ferramentas externas como Nextendo, inspirado na arquitetura de sala/transporte do `Recompia` em implementação *clean-room* MIT).
+   - [ ] Validar conexão, descoberta de sala, sincronização de partida e estabilidade entre dois clientes Windows em rede local e internet.
+7. **Diagnóstico, Mods & Pipeline de Build**
    - [ ] Portar `flight.c` (`FLIGHT`), `vk_crumbs.c`, `prof_win.c`/`perf.c`, `rdoc.c`, `mods_scan.h` (`ROMFS_MODS`/`ROMFS_PATCHES`), `MOUSE_CAMERA` e `RUMBLE_TRIGGERS`.
    - [ ] Manter `tools/build_fork.py` + `tools/mtf_launcher.py` alinhados à build limpa do fork.

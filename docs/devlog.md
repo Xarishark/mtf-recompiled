@@ -220,3 +220,12 @@
   - Built `build/fork/bin/mtf-recomp.exe` cleanly via `ninja` (`0` errors).
   - 6s smoke test with `MTF_NAN_GUARD=zero` (`alive=True`, 0 `FATAL`) confirmed `[host] vk: NaN guard on fragment outputs: zero (MTF_NAN_GUARD)`.
   - Verified `python tools/check_content.py` (`0` violations).
+
+### 2026-11-21 — Menu `F1`: Remapeamento de Controles (Teclado & Gamepad) + Opções Tier 2
+- **Changes:**
+  - `runtime/input_map.{c,h}`, `runtime/input.{c,h}`, `runtime/cfg.c`: Ported full action-to-key/gamepad mapping tables (`MTF_BIND_A..SHAKE`, 2 keyboard slots + gamepad button per action, live reload on `cfg_version()` change) and `input_capture()` / `input_key_char()` / `input_pad_label()`.
+  - `runtime/ui/binds_page.{cpp,h}`, `runtime/ui/option_rows.{cpp,h}`, `runtime/ui/menu.cpp`, `runtime/ui_text.{h,c}`, `CMakeLists.txt`: Added **Controller** and **Keyboard** sub-tabs under **Controls** with interactive 5s modal capture, clear (`Delete`/`Backspace`/`Y`), auto-swap notifications, and "Reset button bindings" in EN + PT-BR; exposed `MTF_REPLAY_THREADS`, `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, and `MTF_NAN_GUARD` in **Advanced**.
+  - `docs/roadmap.md`: Added **Multiplayer Online / Link Play** (`nn::ldn` / `nn::socket` HLE) as the next top priority.
+- **Verification:**
+  - Built `build/fork/bin/mtf-recomp.exe` cleanly via `ninja` (`0` errors).
+  - 6s smoke test (`alive=True`) and `python tools/check_content.py` (`0` violations) passed.
