@@ -363,12 +363,32 @@ static DWORD WINAPI ws_client_thread(LPVOID param) {
     return 0;
 }
 
+static const char *strcasestr_ci(const char *hay, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (!nlen) return hay;
+    for (; *hay; hay++) {
+        if (_strnicmp(hay, needle, nlen) == 0) return hay;
+    }
+    return NULL;
+}
+
 static void handle_http_conn(SOCKET s) {
-    char req[2048];
-    int n = recv(s, req, sizeof(req) - 1, 0);
-    if (n <= 0) { closesocket(s); return; }
-    req[n] = 0;
-    if (strstr(req, "Upgrade: websocket") || strstr(req, "Upgrade: Websocket") || strstr(req, "upgrade: websocket")) {
+    DWORD rcv_to = 2000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rcv_to, sizeof(rcv_to));
+    char req[4096];
+    int total = 0;
+    while (total < (int)sizeof(req) - 1) {
+        int n = recv(s, req + total, (int)sizeof(req) - 1 - total, 0);
+        if (n <= 0) break;
+        total += n;
+        req[total] = 0;
+        if (strstr(req, "\r\n\r\n")) break;
+    }
+    if (total <= 0) { closesocket(s); return; }
+    rcv_to = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rcv_to, sizeof(rcv_to));
+
+    if (strcasestr_ci(req, "Upgrade: websocket")) {
         // Verify ?code=
         char code_param[32] = {0};
         const char *q = strstr(req, "code=");
@@ -386,8 +406,7 @@ static void handle_http_conn(SOCKET s) {
             closesocket(s);
             return;
         }
-        const char *k = strstr(req, "Sec-WebSocket-Key:");
-        if (!k) k = strstr(req, "sec-websocket-key:");
+        const char *k = strcasestr_ci(req, "Sec-WebSocket-Key:");
         if (!k) { closesocket(s); return; }
         k += 18;
         while (*k == ' ' || *k == '\t') k++;
