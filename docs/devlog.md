@@ -211,3 +211,12 @@
   - Built `build/fork/bin/mtf-recomp.exe` cleanly via `ninja` (`0` errors).
   - 6s smoke test (`alive=True`, 0 `FATAL`) confirmed in `build/fork/bin/logs/mtf.log`: `vk: passes of 256 or more draws are recorded in slices of up to 1024 draws into secondary command buffers (MTF_REPLAY_THREADS=6, the default: recorded by that many threads)`.
   - Verified `python tools/check_content.py` (`0` violations).
+
+### 2026-11-21 — Tier 2 / Etapa 2.3: Fragment NaN Guard (`MTF_NAN_GUARD`) & Créditos MIT
+- **Changes:**
+  - `runtime/spirv_nan_guard.{c,h}`, `CMakeLists.txt`, `runtime/vk_pipeline.c`, `runtime/cfg.c`: Ported `spirv_nan_guard` (`MTF_NAN_GUARD`, `0|zero|mark`, default `0`) from `dkb-pc-recomp` (`4e7f9b2`, MIT) into `make_module()` to sanitize NaN fragment shader color outputs when enabled.
+  - `THIRD_PARTY_NOTICES.md`, `docs/roadmap.md`, `docs/perf-methodology.md`: Consolidated all Tier 2 MIT attributions for `dkb-pc-recomp` (`4e7f9b2`).
+- **Verification:**
+  - Built `build/fork/bin/mtf-recomp.exe` cleanly via `ninja` (`0` errors).
+  - 6s smoke test with `MTF_NAN_GUARD=zero` (`alive=True`, 0 `FATAL`) confirmed `[host] vk: NaN guard on fragment outputs: zero (MTF_NAN_GUARD)`.
+  - Verified `python tools/check_content.py` (`0` violations).

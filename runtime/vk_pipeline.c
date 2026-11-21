@@ -43,6 +43,7 @@
 #include "host.h"
 #include "nvn_hmap.h"
 #include "platform/platform.h"
+#include "spirv_nan_guard.h"
 #include "tex.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
@@ -1124,12 +1125,48 @@ static uint32_t *viewport_relative_layer(const uint32_t *w, uint64_t n, uint64_t
     return o;
 }
 
+static uint32_t *nan_guard(const uint32_t *w, uint64_t words, uint64_t *out_n) {
+    static int mode_set = -1;
+    static volatile int32_t logged;
+    int mode = __atomic_load_n(&mode_set, __ATOMIC_RELAXED);
+    if (mode < 0) {
+        const char *e = cfg_get("MTF_NAN_GUARD");
+        int m = !e || !*e || !strcmp(e, "0") ? 0 : !strcmp(e, "mark") ? 2 : 1;
+        if (!plat_xchg32(&logged, 1)) {
+            if (e && *e && strcmp(e, "0") && strcmp(e, "1") && strcmp(e, "zero") && strcmp(e, "mark"))
+                rt_log("vk: MTF_NAN_GUARD=%s ignored, using zero (use 0, zero or mark)", e);
+            rt_log("vk: NaN guard on fragment outputs: %s (MTF_NAN_GUARD)", m == 2 ? "mark" : m ? "zero" : "off");
+        }
+        __atomic_store_n(&mode_set, m, __ATOMIC_RELAXED);
+        mode = m;
+    }
+    if (!mode) return NULL;
+    static const float level[4] = {0.0f, 1.0f, 4.0f, 16.0f};
+    uint64_t h = 0xcbf29ce484222325ull;
+    if (mode == 2) {
+        for (uint64_t i = 0; i < words; i++) h = (h ^ w[i]) * 0x100000001b3ull;
+    }
+    float marker[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (mode == 2) {
+        marker[0] = level[h & 3], marker[1] = level[h >> 2 & 3], marker[2] = level[h >> 4 & 3], marker[3] = 1.0f;
+        if (!(h & 0x3f)) marker[0] = 16.0f;
+    }
+    unsigned stores = 0;
+    uint32_t *o = spirv_nan_guard(w, words, marker, out_n, &stores);
+    if (o && mode == 2)
+        rt_log("vk: fs %016llx: NaN marked as %g %g %g (%u stores)", (unsigned long long)h, marker[0], marker[1],
+               marker[2], stores);
+    return o;
+}
+
 static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
-    uint64_t fixed_n = 0, layer_n = 0;
+    uint64_t fixed_n = 0, layer_n = 0, nan_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
     uint32_t *layer = vk_ctx()->has_viewport_array2 ? viewport_relative_layer(w, words, &layer_n) : NULL;
     if (layer) free(fixed), fixed = layer, w = layer, words = layer_n;
+    uint32_t *nan = nan_guard(w, words, &nan_n);
+    if (nan) free(fixed), fixed = nan, w = nan, words = nan_n;
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);

@@ -90,8 +90,8 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
      - [x] Avaliar `vk_spec.c` + `vk_exec_draw_helper.c` (`MTF_REPLAY_PAR`): mantido como opcional/futuro, pois `MTF_REPLAY_THREADS=6` já paraleliza os passes grandes (>=256 draws) sem duplicar `vk_exec_draw.c` em `vk_exec_draw_helper.c`.
      - [x] **Gate 2.2:** Build limpo, `check_content.py` sem violações e smoke test confirmando `MTF_REPLAY_THREADS=6, the default`; medições A/B (`MTF_REPLAY_THREADS=0` vs `6`) em partida registradas em [docs/perf-methodology.md](perf-methodology.md).
    - **Etapa 2.3 — Robustez de Shaders & Documentação:**
-     - [ ] Portar `spirv_nan_guard.c` (`MTF_NAN_GUARD` opcional para fragment shaders).
-     - [ ] Registrar créditos MIT de `dkb-pc-recomp` (`4e7f9b2`) em `THIRD_PARTY_NOTICES.md`.
+     - [x] Portar `spirv_nan_guard.c` (`MTF_NAN_GUARD` opcional para fragment shaders: `0|zero|mark`).
+     - [x] Registrar créditos MIT de `dkb-pc-recomp` (`4e7f9b2`) em `THIRD_PARTY_NOTICES.md`.
 5. **Diagnóstico, Mods & Pipeline de Build**
    - [ ] Portar `flight.c` (`FLIGHT`), `vk_crumbs.c`, `prof_win.c`/`perf.c`, `rdoc.c`, `mods_scan.h` (`ROMFS_MODS`/`ROMFS_PATCHES`), `MOUSE_CAMERA` e `RUMBLE_TRIGGERS`.
    - [ ] Manter `tools/build_fork.py` + `tools/mtf_launcher.py` alinhados à build limpa do fork.

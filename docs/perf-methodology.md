@@ -37,5 +37,5 @@ Extraídas diretamente de [perfmon.c](../runtime/perfmon.c), [vk_memory.c](../ru
 |---|---|---|---|---|---|---|---|
 | **Baseline (pré-Tier 2)** | `a94cb62` | ~7.575–8.024 MB *(observado em logs anteriores)* | `350 pools / 732.9 MiB` *(frame 1800)* | *a medir* | *a medir* | *a medir* | `MTF_PIPE_SYNC=1` padrão em NVIDIA |
 | **Etapa 2.1 (`vk_headroom` + `HEAP_LAZY` + `SPARSE_MIRROR_COPY` + commit)** | `debb4e7` | `5.076 MB` *(boot 6s)* | `83 mirrors 436.8 MiB` + `1157 import 1592.4 MiB` *(frame 1800, user test; GPU ~4.7 GB VRAM incl. headroom)* | *a medir* | *a medir* | *a medir* | `budget 0` refusals; 7 blocos 256 MiB pré-alocados |
-| **Etapa 2.2 (`MTF_REPLAY_THREADS` + `DrawCtx`)** | *este commit* | — | — | *a medir (`REPLAY_THREADS=0` vs `6`)* | *a medir* | *a medir* | `MTF_REPLAY_THREADS=6` ativo por padrão em passes >=256 draws |
-| **Etapa 2.3 (`spirv_nan_guard`)** | *pendente* | — | — | — | — | — | — |
+| **Etapa 2.2 (`MTF_REPLAY_THREADS` + `DrawCtx`)** | `7210cac` | — | — | *a medir (`REPLAY_THREADS=0` vs `6`)* | *a medir* | *a medir* | `MTF_REPLAY_THREADS=6` ativo; partida completa validada pelo usuário |
+| **Etapa 2.3 (`spirv_nan_guard`)** | *este commit* | — | — | — | — | — | `MTF_NAN_GUARD=0\|zero\|mark` disponível (`0` por padrão) |

@@ -160,6 +160,7 @@ static CfgMeta metas[] = {
     {"VK_VALIDATION", "0", "0|1", RESTART}, {"VK_DYN_VERTEX", "", "0|1", RESTART}, {"VK_DYN_A2C", "", "0|1", RESTART},
     {"VK_SUBGROUP_PIN", NULL, "0|1", RESTART}, {"VRAM_HEADROOM", "1", "0|1", RESTART}, {"HEAP_LAZY", "1", "0|1", RESTART},
     {"REPLAY_THREADS", "", "0..16", RESTART},
+    {"NAN_GUARD", "0", "0|zero|mark", RESTART},
     // diagnostics
     {"TRACE", "", NULL, RESTART},
 };

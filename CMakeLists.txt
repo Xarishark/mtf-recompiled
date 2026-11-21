@@ -126,6 +126,7 @@ set(MTF_RUNTIME_SOURCES
     runtime/vk_formats.c
     runtime/vk_memory.c
     runtime/vk_pipeline.c
+    runtime/spirv_nan_guard.c
     runtime/vk_rec.c
     runtime/vk_sync.c
     runtime/vk_texture.c
