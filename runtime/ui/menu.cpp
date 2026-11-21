@@ -23,6 +23,7 @@
 #include "backends/imgui_impl_vulkan.h"
 #include "ui/binds_page.h"
 #include "ui/option_rows.h"
+#include "stream_host.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
@@ -285,7 +286,7 @@ extern "C" void menu_vk_release(void) {
 // working directory) as menu-test-<frame>-<page>.png; after the last tab the menu closes.
 // MTF_MENU_TEST_SET=<frame>:<key>=<value>[,<key>=<value>...][;<frame>:...]: cfg_set of each key (MTF_ prefix optional)
 // at that presented frame, menu open or not. mtf.ini is written only by the pseudo-key SAVE=1.
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_MENU, TAB_ADVANCED, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_MULTIPLAYER, TAB_MENU, TAB_ADVANCED, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -629,6 +630,58 @@ static void tab_controls(float scale) {
     binds_after_page();
 }
 
+static void tab_multiplayer(float scale) {
+    (void)scale;
+    StreamHostInfo info;
+    stream_host_info(&info);
+    ImGui::BeginChild("##mp_stream", ImVec2(0, -opt_bottom()), false);
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Browser Streaming (TryCloudflare / WebCodecs)");
+    ImGui::TextWrapped("Hosts the game on this PC as Player 1 and streams video/audio to a browser link. "
+                       "Remote players open the link in Chrome/Edge and automatically control Player 2-4.");
+    ImGui::Spacing();
+    if (info.state == STREAM_STATE_OFF) {
+        if (ImGui::Button("Start Streaming Server (Cloudflare)", ImVec2(320 * scale, 0))) stream_host_start();
+    } else {
+        if (ImGui::Button("Stop Streaming Server", ImVec2(240 * scale, 0))) stream_host_stop();
+    }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    const char *st = info.state == STREAM_STATE_OFF        ? "Offline"
+                   : info.state == STREAM_STATE_STARTING   ? "Starting Cloudflare tunnel..."
+                   : info.state == STREAM_STATE_LIVE       ? "Online (Cloudflare)"
+                   : info.state == STREAM_STATE_LOCAL_ONLY ? "Local Only (cloudflared.exe not found)"
+                                                           : "Error";
+    ImGui::Text("Status: %s", st);
+    if (info.state != STREAM_STATE_OFF) {
+        ImGui::Text("Detail: %s", info.status_msg);
+        ImGui::Text("Room Code: %s   |   Browser Players Connected: %d", info.code, info.clients);
+        ImGui::Text("Frames sent: %llu   |   Data sent: %.2f MiB",
+                    (unsigned long long)info.frames_sent, (double)info.bytes_sent / (1024.0 * 1024.0));
+        ImGui::Spacing();
+        if (info.public_url[0]) {
+            ImGui::Text("Cloudflare Link:");
+            ImGui::SetNextItemWidth(-160 * scale);
+            ImGui::InputText("##cf_url", info.public_url, sizeof(info.public_url), ImGuiInputTextFlags_ReadOnly);
+            ImGui::SameLine();
+            if (ImGui::Button("Copy Link##cf", ImVec2(140 * scale, 0))) SDL_SetClipboardText(info.public_url);
+        }
+        if (info.local_url[0]) {
+            ImGui::Text("Local Link (same PC / LAN test):");
+            ImGui::SetNextItemWidth(-160 * scale);
+            ImGui::InputText("##loc_url", info.local_url, sizeof(info.local_url), ImGuiInputTextFlags_ReadOnly);
+            ImGui::SameLine();
+            if (ImGui::Button("Copy Link##loc", ImVec2(140 * scale, 0))) SDL_SetClipboardText(info.local_url);
+        }
+        ImGui::Spacing();
+        if (info.state == STREAM_STATE_LOCAL_ONLY) {
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1),
+                               "Tip: Place cloudflared.exe next to mtf-recomp.exe or in PATH to generate public trycloudflare links.");
+        }
+    }
+    ImGui::EndChild();
+}
+
 static void tab_menu(float scale) {
     opt_begin("##menu", scale);
     static const UiTextId langs[] = {UI_MENU_MENU_LANG_AUTO, UI_MENU_LANGNAME_EN, UI_MENU_LANGNAME_PT_BR};
@@ -843,7 +896,7 @@ static void restart_confirm(void) {
 }
 
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN,   UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MENU, UI_MENU_TAB_ADVANCED};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MULTIPLAYER, UI_MENU_TAB_MENU, UI_MENU_TAB_ADVANCED};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // the page whose first row takes the cursor at its next layout
@@ -891,6 +944,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_GAME: tab_game(scale); break;
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_MULTIPLAYER: tab_multiplayer(scale); break;
             case TAB_MENU: tab_menu(scale); break;
             case TAB_ADVANCED: tab_advanced(scale); break;
             }

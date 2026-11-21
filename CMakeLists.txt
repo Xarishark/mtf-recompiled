@@ -106,6 +106,7 @@ set(MTF_RUNTIME_SOURCES
     runtime/ro.c
     runtime/romfs.c
     runtime/sha256.c
+    runtime/stream_host.c
     runtime/stubs.c
     runtime/svc.c
     runtime/tex_astc.c

@@ -24,6 +24,7 @@
 #include "host.h"
 #include "input.h"
 #include "platform/platform.h"
+#include "stream_host.h"
 #include "ui/menu.h"
 
 #define BIT(b) (1ull << (b))
@@ -590,6 +591,7 @@ void input_list_pads(InputPadList *out) {
 
 int input_player_connected(int player) {
     if (player < 0 || player >= INPUT_MAX_PLAYERS) return 0;
+    if (stream_host_remote_connected(player)) return 1;
     if (!cfg_bool("MTF_MULTIPLAYER_INPUT")) return player == 0;
     const char *src = cfg_get(player_cfg_key(player));
     if (!src || !*src) return player == 0;
@@ -608,7 +610,6 @@ int input_player_connected(int player) {
 }
 
 int input_connected_count(void) {
-    if (!cfg_bool("MTF_MULTIPLAYER_INPUT")) return 1;
     int count = 0;
     for (int i = 0; i < INPUT_MAX_PLAYERS; i++)
         if (input_player_connected(i)) count++;
@@ -616,6 +617,10 @@ int input_connected_count(void) {
 }
 
 void input_poll_player(int player, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
+    if (stream_host_remote_poll(player, buttons, lx, ly, rx, ry)) {
+        if (menu_is_open()) { *buttons = 0; *lx = *ly = *rx = *ry = 0; }
+        return;
+    }
     if (!cfg_bool("MTF_MULTIPLAYER_INPUT")) {
         if (player == 0) input_poll(buttons, lx, ly, rx, ry);
         else { *buttons = 0; *lx = *ly = *rx = *ry = 0; }

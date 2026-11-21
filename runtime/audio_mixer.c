@@ -18,6 +18,7 @@
 // device's request).
 #include <math.h>
 #include <stdatomic.h>
+#include "stream_host.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -201,6 +202,7 @@ static void SDLCALL sdl_pull(void *user, SDL_AudioStream *stream, int additional
         if (!frames) break;
         if (frames > 1024) frames = 1024;
         ring_pull(m, tmp, frames);
+        if (stream_host_active()) stream_host_push_audio(tmp, frames, (int)m->channels, (int)m->rate);
         if (!SDL_PutAudioStreamData(stream, tmp, (int)(frames * frame_bytes))) break;
         additional -= (int)(frames * frame_bytes);
     }

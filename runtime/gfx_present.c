@@ -22,6 +22,7 @@
 #include "input.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
+#include "stream_host.h"
 #include "ui/menu.h"
 #include "vk.h"
 
@@ -526,6 +527,82 @@ static void record_thumb(VkCommandBuffer cb, VkImage dst, unsigned fence_slot) {
     g_th_frame = 0;
 }
 
+// ---- Browser stream readback (960x540 BGRA8 async ring per fence slot, allocated only while streaming)
+#define ST_W 960
+#define ST_H 540
+#define ST_BYTES ((VkDeviceSize)ST_W * ST_H * 4)
+static VkImage g_st_img;
+static VmaAllocation g_st_img_alloc;
+static VkBuffer g_st_buf;
+static VmaAllocation g_st_alloc;
+static uint8_t *g_st_ptr;
+static uint8_t g_st_pending[FRAMES];
+static int g_st_failed;
+
+static void free_stream_cap(void) {
+    VkCtx *c = vk_ctx();
+    if (g_st_img && c) vmaDestroyImage(c->vma, g_st_img, g_st_img_alloc);
+    if (g_st_buf && c) vmaDestroyBuffer(c->vma, g_st_buf, g_st_alloc);
+    g_st_img = VK_NULL_HANDLE; g_st_buf = VK_NULL_HANDLE; g_st_ptr = NULL;
+    memset(g_st_pending, 0, sizeof g_st_pending);
+}
+
+static int ensure_stream_cap(void) {
+    if (!stream_host_active() || g_st_failed) return 0;
+    VkCtx *c = vk_ctx();
+    if (!c) return 0;
+    if (!g_st_buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = ST_BYTES * FRAMES,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info = {0};
+        if (vmaCreateBuffer(c->vma, &bi, &ai, &g_st_buf, &g_st_alloc, &info) != VK_SUCCESS || !info.pMappedData) {
+            if (g_st_buf) vmaDestroyBuffer(c->vma, g_st_buf, g_st_alloc);
+            g_st_buf = VK_NULL_HANDLE;
+            g_st_failed = 1;
+            return 0;
+        }
+        g_st_ptr = info.pMappedData;
+    }
+    if (!g_st_img) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_B8G8R8A8_UNORM, .extent = {ST_W, ST_H, 1}, .mipLevels = 1,
+                                .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(c->vma, &ci, &ai, &g_st_img, &g_st_img_alloc, NULL) != VK_SUCCESS) {
+            g_st_img = VK_NULL_HANDLE;
+            g_st_failed = 1;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void record_stream_cap(VkCommandBuffer cb, VkImage dst, unsigned fence_slot) {
+    sync_barrier(cb, g_st_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageBlit region = {
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int)g_sc_ext.width, (int)g_sc_ext.height, 1}},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {ST_W, ST_H, 1}}};
+    vkCmdBlitImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_st_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                   VK_FILTER_LINEAR);
+    sync_barrier(cb, g_st_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferImageCopy bc = {.bufferOffset = ST_BYTES * fence_slot, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                            .imageExtent = {ST_W, ST_H, 1}};
+    vkCmdCopyImageToBuffer(cb, g_st_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_st_buf, 1, &bc);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &d);
+    g_st_pending[fence_slot] = 1;
+}
+
 // A shot asked for by another thread (gfx_shot_request), taken at the next present.
 #define MAX_SHOT_PATH 260
 static char g_shot_req[MAX_SHOT_PATH];
@@ -619,6 +696,13 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         g_th_tag[g_th_pending[slot] % (uint64_t)g_th_n] = g_th_pending[slot];
         g_th_pending[slot] = 0;
     }
+    if (g_st_pending[slot]) {
+        g_st_pending[slot] = 0;
+        if (g_st_ptr && stream_host_active()) {
+            vmaInvalidateAllocation(c->vma, g_st_alloc, ST_BYTES * slot, ST_BYTES);
+            stream_host_push_video(g_st_ptr + ST_BYTES * slot, ST_W, ST_H, ST_W * 4);
+        }
+    }
 
     int cx = 0, cy = 0, cw = w, ch = h;
     if (crop && crop[2] > 0 && crop[3] > 0) { cx = crop[0]; cy = crop[1]; cw = crop[2]; ch = crop[3]; }
@@ -666,6 +750,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     int cap = (g_capture || menu_shot) && ensure_capture_buffer();
     int thumb = g_th_n && ensure_thumbs();
+    int stream_cap = ensure_stream_cap();
 
     VkCommandBuffer cb = g_cb[slot];
     vkResetCommandBuffer(cb, 0);
@@ -762,6 +847,15 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         last_write = 0;
         record_thumb(cb, dst, slot);
     }
+    if (stream_cap) {
+        if (last != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, last_stage, last_write,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        last = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        last_write = 0;
+        record_stream_cap(cb, dst, slot);
+    }
     sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
     vkEndCommandBuffer(cb);
@@ -841,6 +935,7 @@ void gfx_window_release_vk(void) {
         vk_contact_release();
         free_capture();
         free_thumbs();
+        free_stream_cap();
         for (int i = 0; i < FRAMES; i++) {
             vkDestroySemaphore(c->device, g_acquire[i], NULL);
             vkDestroyFence(c->device, g_fence[i], NULL);
