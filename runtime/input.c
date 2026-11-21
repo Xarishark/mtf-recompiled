@@ -24,6 +24,7 @@
 #include "host.h"
 #include "input.h"
 #include "platform/platform.h"
+#include "stream_host.h"
 #include "ui/menu.h"
 
 #define BIT(b) (1ull << (b))
@@ -31,11 +32,16 @@
 #define STICK_MAX 32767
 
 static PlatMutex lock = PLAT_MUTEX_INIT;
-static SDL_Gamepad *pad;
+static SDL_Gamepad *pads[INPUT_MAX_PADS];
+#define pad (pads[0])
+static SDL_JoystickID pad_ids[INPUT_MAX_PADS];
+static char pad_names[INPUT_MAX_PADS][96];
 static int started, sdl_ok, sensors_on;
 static SDL_JoystickID sensor_pad;
 static uint64_t pad_buttons;
 static int32_t pad_axes[4];
+static uint64_t pad_buttons_arr[INPUT_MAX_PADS];
+static int32_t pad_axes_arr[INPUT_MAX_PADS][4];
 
 // ---- keyboard
 static const struct { uint8_t key; uint8_t vk; } key_vks[] = {
@@ -106,40 +112,67 @@ static int pad_dev_type = INPUT_DEV_XBOX;
 static int last_dev = INPUT_DEV_KEYBOARD;
 int input_last_device(void) { return __atomic_load_n(&last_dev, __ATOMIC_RELAXED); }
 
+static int pad_type_of(SDL_Gamepad *gp) {
+    SDL_GamepadType gt = SDL_GetGamepadType(gp);
+    return gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
+                   gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT ||
+                   gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR
+               ? INPUT_DEV_NINTENDO
+           : gt == SDL_GAMEPAD_TYPE_PS3 || gt == SDL_GAMEPAD_TYPE_PS4 || gt == SDL_GAMEPAD_TYPE_PS5
+               ? INPUT_DEV_PLAYSTATION
+               : INPUT_DEV_XBOX;
+}
+
 static void open_pad(void) {
-    if (pad && SDL_GamepadConnected(pad)) return;
-    if (pad) {
-        rt_log("input: gamepad disconnected");
-        SDL_CloseGamepad(pad);
-        pad = NULL;
-        sensors_on = 0;
-        sensor_pad = 0;
+    for (int i = 0; i < INPUT_MAX_PADS; i++) {
+        if (pads[i] && !SDL_GamepadConnected(pads[i])) {
+            rt_log("input: gamepad %d disconnected", i + 1);
+            SDL_CloseGamepad(pads[i]);
+            pads[i] = NULL;
+            pad_ids[i] = 0;
+            pad_names[i][0] = 0;
+            if (i == 0) {
+                sensors_on = 0;
+                sensor_pad = 0;
+            }
+        }
     }
     int n = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
     if (ids && n > 0) {
-        pad = SDL_OpenGamepad(ids[0]);
-        if (pad) {
-            SDL_GamepadType gt = SDL_GetGamepadType(pad);
-            int dt = gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
-                             gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT ||
-                             gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR
-                         ? INPUT_DEV_NINTENDO
-                     : gt == SDL_GAMEPAD_TYPE_PS3 || gt == SDL_GAMEPAD_TYPE_PS4 || gt == SDL_GAMEPAD_TYPE_PS5
-                         ? INPUT_DEV_PLAYSTATION
-                         : INPUT_DEV_XBOX;
-            pad_dev_type = dt;
-            __atomic_store_n(&last_dev, dt, __ATOMIC_RELAXED);
-            rt_log("input: gamepad \"%s\"", SDL_GetGamepadName(pad));
+        for (int j = 0; j < n; j++) {
+            int already = 0;
+            for (int i = 0; i < INPUT_MAX_PADS; i++) {
+                if (pads[i] && pad_ids[i] == ids[j]) { already = 1; break; }
+            }
+            if (already) continue;
+            int slot = -1;
+            for (int i = 0; i < INPUT_MAX_PADS; i++) {
+                if (!pads[i]) { slot = i; break; }
+            }
+            if (slot < 0) break;
+            SDL_Gamepad *gp = SDL_OpenGamepad(ids[j]);
+            if (gp) {
+                pads[slot] = gp;
+                pad_ids[slot] = ids[j];
+                const char *nm = SDL_GetGamepadName(gp);
+                snprintf(pad_names[slot], sizeof pad_names[slot], "%s", nm && *nm ? nm : "Controller");
+                int dt = pad_type_of(gp);
+                if (slot == 0) {
+                    pad_dev_type = dt;
+                    __atomic_store_n(&last_dev, dt, __ATOMIC_RELAXED);
+                }
+                rt_log("input: gamepad %d \"%s\"", slot + 1, pad_names[slot]);
+            }
         }
     }
     SDL_free(ids);
 }
 
-static int nintendo_layout(void) {
+static int nintendo_layout_dev(SDL_Gamepad *gp) {
     const char *e = cfg_get("MTF_PAD_LAYOUT");
     if (e && !strcmp(e, "positional")) return 1;
-    return SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_SOUTH) == SDL_GAMEPAD_BUTTON_LABEL_B;
+    return SDL_GetGamepadButtonLabel(gp, SDL_GAMEPAD_BUTTON_SOUTH) == SDL_GAMEPAD_BUTTON_LABEL_B;
 }
 
 // One stick, SDL axes to Switch axes (SDL: +y down; Switch: +y up), through a radial dead zone of MTF_STICK_DEADZONE
@@ -167,9 +200,9 @@ static void stick(int16_t sx, int16_t sy, int32_t *ox, int32_t *oy) {
 static uint8_t pad_down_live[PAD_COUNT];
 static int pad_layout_now = -1;
 
-static void read_pad_down(uint8_t pdown[PAD_COUNT]) {
+static void read_pad_down_dev(SDL_Gamepad *gp, uint8_t pdown[PAD_COUNT]) {
     memset(pdown, 0, PAD_COUNT);
-    if (!pad) return;
+    if (!gp) return;
     static const struct { SDL_GamepadButton sdl; uint8_t p; } btns[] = {
         {SDL_GAMEPAD_BUTTON_SOUTH, PAD_SOUTH}, {SDL_GAMEPAD_BUTTON_EAST, PAD_EAST},
         {SDL_GAMEPAD_BUTTON_WEST, PAD_WEST}, {SDL_GAMEPAD_BUTTON_NORTH, PAD_NORTH},
@@ -182,27 +215,36 @@ static void read_pad_down(uint8_t pdown[PAD_COUNT]) {
         {SDL_GAMEPAD_BUTTON_LEFT_PADDLE2, PAD_LPADDLE2}, {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2, PAD_RPADDLE2},
     };
     for (size_t i = 0; i < sizeof btns / sizeof *btns; i++)
-        if (SDL_GetGamepadButton(pad, btns[i].sdl)) pdown[btns[i].p] = 1;
-    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON) pdown[PAD_ZL] = 1;
-    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON) pdown[PAD_ZR] = 1;
+        if (SDL_GetGamepadButton(gp, btns[i].sdl)) pdown[btns[i].p] = 1;
+    if (SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON) pdown[PAD_ZL] = 1;
+    if (SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON) pdown[PAD_ZR] = 1;
 }
 
 static void pad_read(void) {
-    uint64_t b = 0;
-    int32_t a[4] = {0};
-    if (pad) {
-        int nin = nintendo_layout();
-        pad_layout_now = nin ? PAD_LAYOUT_NINTENDO : PAD_LAYOUT_XBOX;
-        read_pad_down(pad_down_live);
-        b = input_map_pad_buttons(pad_down_live, pad_layout_now);
-        stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY), &a[0], &a[1]);
-        stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY), &a[2], &a[3]);
-    } else {
-        memset(pad_down_live, 0, sizeof pad_down_live);
-        pad_layout_now = -1;
+    for (int i = 0; i < INPUT_MAX_PADS; i++) {
+        uint64_t b = 0;
+        int32_t a[4] = {0};
+        if (pads[i]) {
+            uint8_t pdown[PAD_COUNT];
+            int nin = nintendo_layout_dev(pads[i]);
+            int layout = nin ? PAD_LAYOUT_NINTENDO : PAD_LAYOUT_XBOX;
+            read_pad_down_dev(pads[i], pdown);
+            b = input_map_pad_buttons(pdown, layout);
+            stick(SDL_GetGamepadAxis(pads[i], SDL_GAMEPAD_AXIS_LEFTX), SDL_GetGamepadAxis(pads[i], SDL_GAMEPAD_AXIS_LEFTY), &a[0], &a[1]);
+            stick(SDL_GetGamepadAxis(pads[i], SDL_GAMEPAD_AXIS_RIGHTX), SDL_GetGamepadAxis(pads[i], SDL_GAMEPAD_AXIS_RIGHTY), &a[2], &a[3]);
+            if (i == 0) {
+                memcpy(pad_down_live, pdown, sizeof pad_down_live);
+                pad_layout_now = layout;
+            }
+        } else if (i == 0) {
+            memset(pad_down_live, 0, sizeof pad_down_live);
+            pad_layout_now = -1;
+        }
+        pad_buttons_arr[i] = b;
+        memcpy(pad_axes_arr[i], a, sizeof a);
     }
-    pad_buttons = b;
-    memcpy(pad_axes, a, sizeof a);
+    pad_buttons = pad_buttons_arr[0];
+    memcpy(pad_axes, pad_axes_arr[0], sizeof pad_axes);
 }
 
 // The SDL accelerometer reads the push against gravity in m/s^2 (lying flat: y = +9.81) and the gyro rad/s; Switch
@@ -521,6 +563,95 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
     for (int i = 0; i < 4; i++) moved |= a[i] > STICK_ACTIVE || a[i] < -STICK_ACTIVE;
     if (moved) __atomic_store_n(&last_active_ns, plat_now_ns(), __ATOMIC_RELAXED);
     if (open || held_off) b = 0, memset(a, 0, sizeof a);
+    *buttons = b;
+    *lx = a[0], *ly = a[1], *rx = a[2], *ry = a[3];
+}
+
+static const char *player_cfg_key(int player) {
+    static const char *const keys[INPUT_MAX_PLAYERS] = {
+        "MTF_P1_INPUT", "MTF_P2_INPUT", "MTF_P3_INPUT", "MTF_P4_INPUT",
+    };
+    return (player >= 0 && player < INPUT_MAX_PLAYERS) ? keys[player] : NULL;
+}
+
+void input_list_pads(InputPadList *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    plat_mutex_lock(&lock);
+    start();
+    for (int i = 0; i < INPUT_MAX_PADS; i++) {
+        if (pads[i]) {
+            out->connected[i] = 1;
+            out->count++;
+            snprintf(out->names[i], sizeof out->names[i], "%s", pad_names[i]);
+        }
+    }
+    plat_mutex_unlock(&lock);
+}
+
+int input_player_connected(int player) {
+    if (player < 0 || player >= INPUT_MAX_PLAYERS) return 0;
+    if (stream_host_remote_connected(player)) return 1;
+    if (!cfg_bool("MTF_MULTIPLAYER_INPUT")) return player == 0;
+    const char *src = cfg_get(player_cfg_key(player));
+    if (!src || !*src) return player == 0;
+    if (!strcmp(src, "none")) return 0;
+    if (!strcmp(src, "auto") || !strcmp(src, "keyboard")) return 1;
+    if (!strncmp(src, "pad:", 4)) {
+        int idx = atoi(src + 4);
+        if (idx < 0 || idx >= INPUT_MAX_PADS) return 0;
+        plat_mutex_lock(&lock);
+        start();
+        int conn = pads[idx] != NULL;
+        plat_mutex_unlock(&lock);
+        return conn;
+    }
+    return 0;
+}
+
+int input_connected_count(void) {
+    int count = 0;
+    for (int i = 0; i < INPUT_MAX_PLAYERS; i++)
+        if (input_player_connected(i)) count++;
+    return count > 0 ? count : 1;
+}
+
+void input_poll_player(int player, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
+    if (stream_host_remote_poll(player, buttons, lx, ly, rx, ry)) {
+        if (menu_is_open()) { *buttons = 0; *lx = *ly = *rx = *ry = 0; }
+        return;
+    }
+    if (!cfg_bool("MTF_MULTIPLAYER_INPUT")) {
+        if (player == 0) input_poll(buttons, lx, ly, rx, ry);
+        else { *buttons = 0; *lx = *ly = *rx = *ry = 0; }
+        return;
+    }
+    const char *src = player_cfg_key(player) ? cfg_get(player_cfg_key(player)) : "none";
+    if (!src || !*src) src = player == 0 ? "auto" : "none";
+    if (!strcmp(src, "auto") && player == 0) {
+        input_poll(buttons, lx, ly, rx, ry);
+        return;
+    }
+    uint64_t b = 0;
+    int32_t a[4] = {0};
+    if (!strcmp(src, "keyboard")) {
+        keyboard_read(&b, a);
+    } else if (!strncmp(src, "pad:", 4)) {
+        int idx = atoi(src + 4);
+        if (idx >= 0 && idx < INPUT_MAX_PADS) {
+            plat_mutex_lock(&lock);
+            start();
+            if (pads[idx]) {
+                b = pad_buttons_arr[idx];
+                memcpy(a, pad_axes_arr[idx], sizeof a);
+            }
+            plat_mutex_unlock(&lock);
+        }
+    }
+    if (menu_is_open()) {
+        b = 0;
+        memset(a, 0, sizeof a);
+    }
     *buttons = b;
     *lx = a[0], *ly = a[1], *rx = a[2], *ry = a[3];
 }

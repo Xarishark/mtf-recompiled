@@ -57,3 +57,5 @@ thread and the depth twins of `vk_exec_draw.c`.
 | LLVM-MinGW 20261104 | https://github.com/mstorsjo/llvm-mingw | Apache-2.0 with LLVM exception and the licences of its parts | compiles the game on the player's PC |
 | CMake, Ninja | https://cmake.org, https://ninja-build.org | BSD-3-Clause, Apache-2.0 | build the game on the player's PC |
 | .NET runtime | https://dotnet.microsoft.com | MIT | runs the shader translator |
+| libdatachannel (`v0.22.5`) | https://github.com/paullouisageneau/libdatachannel | MPL-2.0 | WebRTC DataChannel transport (`runtime/stream_webrtc.cpp`) |
+| Mbed TLS (`v3.6.2`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 | DTLS/TLS crypto backend for `libdatachannel` |

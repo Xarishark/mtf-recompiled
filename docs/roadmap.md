@@ -95,10 +95,12 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
 5. **Menu de Configurações (`F1`) & Remapeamento de Controles**
    - [x] Portar remapeamento completo de teclado (2 slots + `SHAKE` + analógicos) e gamepad (`binds_page.cpp` + `input_map.{c,h}` + `input_capture` + `MTF_BIND_*`) na aba Controles do menu `F1` (sub-abas **Controle** e **Teclado**, salvamento imediato em `mtf.ini` e aplicação ao vivo).
    - [x] Complementar a aba Avançado do menu `F1` com as opções da Tier 2 (`MTF_REPLAY_THREADS`, `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, `MTF_NAN_GUARD`).
-6. **Multiplayer Online / Link Play (Prioridade Máxima após Menu de Configurações)**
-   - [ ] Mapear os serviços de rede/sessão local do Switch 2 usados por *Mario Tennis Fever* (`nn::ldn`, `nn::socket` / `bsd:u`, `nn::nifm`, `nn::friends`) via `bindb.sqlite` e traces de execução.
-   - [ ] Implementar camada HLE de **Link Play** (`nn::ldn` / `nn::socket`) sobre rede PC (UDP P2P / servidor relay ou salas por código, sem depender de ferramentas externas como Nextendo, inspirado na arquitetura de sala/transporte do `Recompia` em implementação *clean-room* MIT).
-   - [ ] Validar conexão, descoberta de sala, sincronização de partida e estabilidade entre dois clientes Windows em rede local e internet.
+6. **Multiplayer Online (Prioridade Máxima — Branch `feat/multiplayer-ldn`)**
+   Roadmap completo e backlog detalhado em [docs/multiplayer-roadmap.md](multiplayer-roadmap.md).
+   - [x] Seleção de inputs Multiplayer (`P1..P4`) no menu `F1` (`runtime/input.c`, `runtime/ov_hid.c`), correção de crash (`ProfanityFilter`) e correção do *split-screen* (`vk_dlaa.c`).
+   - [ ] **Fase 1:** MVP de **Sala P2P no Menu `F1`** (Criar Sala / Entrar por Código, Host = P1, Convidado = P2 via UDP em *Free Play* e modos locais).
+   - [ ] **Fase 2:** Stream de vídeo/áudio (`libvpx`/`opus`) do Host para os Convidados (`P2..P4`) em tempo real.
+   - [ ] **Fase 3:** Servidor Gateway/Relay leve (oculta IP do Host + salas públicas/privadas) e tela **Online Room** no `F1`.
 7. **Diagnóstico, Mods & Pipeline de Build**
    - [ ] Portar `flight.c` (`FLIGHT`), `vk_crumbs.c`, `prof_win.c`/`perf.c`, `rdoc.c`, `mods_scan.h` (`ROMFS_MODS`/`ROMFS_PATCHES`), `MOUSE_CAMERA` e `RUMBLE_TRIGGERS`.
    - [ ] Manter `tools/build_fork.py` + `tools/mtf_launcher.py` alinhados à build limpa do fork.

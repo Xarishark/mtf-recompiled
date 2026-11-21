@@ -8,6 +8,16 @@
 // While the in-game menu is open (ui/menu.h) the game gets a released controller; Minus and Plus held together (Enter
 // and Backspace on the keyboard) open and close it, and the buttons of that press reach the game only once released.
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
+enum { INPUT_MAX_PADS = 4, INPUT_MAX_PLAYERS = 4 };
+typedef struct {
+    int count;
+    int connected[INPUT_MAX_PADS];
+    char names[INPUT_MAX_PADS][96];
+} InputPadList;
+void input_list_pads(InputPadList *out);
+int input_player_connected(int player);
+int input_connected_count(void);
+void input_poll_player(int player, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
 uint64_t input_idle_ns(void);   // since a button was last held or a stick last pushed
 enum { INPUT_DEV_KEYBOARD, INPUT_DEV_NINTENDO, INPUT_DEV_XBOX, INPUT_DEV_PLAYSTATION };
 int input_last_device(void);    // last active input device (keyboard or connected gamepad type)
