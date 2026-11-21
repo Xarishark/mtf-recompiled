@@ -2463,7 +2463,12 @@ static int workers_start(void) {
 void vk_pipeline_async_enable(void) {
     U.on = strcmp(cfg_value("MTF_PIPE_WAIT"), "draw") != 0;
     const char *e = cfg_get("MTF_PIPE_SYNC");
-    if (e && *e && strcmp(e, "0")) return;
+    if (e && *e) {
+        if (strcmp(e, "0") != 0) return;
+    } else {
+        VkCtx *vc = vk_ctx();
+        if (vc && vc->props.vendorID == 0x10de && !P.gpl) return;
+    }
     A.on = 1;
 }
 
