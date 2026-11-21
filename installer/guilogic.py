@@ -138,7 +138,10 @@ class Form:
         return found
 
     def command(self, python, root=None, temp=None):
-        cmd = [str(python), '-m', 'installer']
+        if getattr(sys, 'frozen', False):
+            cmd = [sys.executable, '--cli']
+        else:
+            cmd = [str(python), '-m', 'installer']
         game = self.game.strip()
         if game:
             cmd += ['--content' if Path(game).is_dir() else '--nup', game]

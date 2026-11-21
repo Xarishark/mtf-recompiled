@@ -13,6 +13,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import urllib.request
+import webbrowser
 from pathlib import Path
 
 from . import dpi
@@ -110,8 +113,46 @@ class App:
         self.ui_box = ttk.Combobox(bar, values=labels, state='readonly', width=max(map(len, labels)) + 1)
         self.ui_box.set(UI_LANGUAGE_LABELS[self.cat.lang])
         self.ui_box.bind('<<ComboboxSelected>>', self.pick_language)
-        self.ui_box.pack(side='right', padx=PAD)
+        self.ui_box.pack(side='right', padx=(dpi.px(6), PAD))
+        self.update_btn = self.button(bar, 'ui.check_updates', self.check_updates)
+        self.update_btn.pack(side='right', padx=(PAD, 0))
         tk.Frame(root, background=FLAME, height=dpi.px(3)).pack(fill='x')
+
+    def check_updates(self):
+        self.update_btn.configure(state='disabled', text=self.cat('ui.update_checking'))
+
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    'https://api.github.com/repos/rafael-fj/mtf-recompiled/releases/latest',
+                    headers={'User-Agent': 'MTF-Recomp-Setup'},
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                latest = str(data.get('tag_name', '')).strip()
+                url = str(data.get('html_url', 'https://github.com/rafael-fj/mtf-recompiled/releases')).strip()
+                err = None
+            except Exception as exc:
+                latest, url, err = '', '', str(exc)
+
+            def finish():
+                self.update_btn.configure(state='normal', text=self.cat('ui.check_updates'))
+                if err:
+                    messagebox.showwarning(self.cat('ui.title'), self.cat('ui.update_error', detail=err))
+                    return
+                cur = self.layout.release.split('-')[0].lstrip('v')
+                lat = latest.lstrip('v')
+                if lat and lat != cur:
+                    if messagebox.askyesno(self.cat('ui.title'),
+                                           self.cat('ui.update_available', latest=latest, current=self.layout.release)):
+                        webbrowser.open(url)
+                else:
+                    messagebox.showinfo(self.cat('ui.title'),
+                                        self.cat('ui.update_latest', version=latest or self.layout.release))
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---- text -----------------------------------------------------------------------------------------------------
 

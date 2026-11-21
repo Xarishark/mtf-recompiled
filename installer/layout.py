@@ -61,7 +61,8 @@ def release_layout(root):
 def dev_layout(root):
     commit = subprocess.run(['git', '-C', str(root), 'rev-parse', '--short', 'HEAD'], capture_output=True,
                             text=True).stdout.strip()
-    semver = (root / 'VERSION').read_text(encoding='utf-8').strip()
+    vf = root / 'VERSION'
+    semver = vf.read_text(encoding='utf-8').strip() if vf.is_file() else '0.1.0'
     toolchain = root / 'build' / 'toolchain'
     manifest = toolchain / 'toolchain-manifest.json'
     tools = json.loads(manifest.read_text(encoding='utf-8-sig')) if manifest.is_file() else {}
@@ -80,6 +81,12 @@ def is_release(root):
 
 
 def find(root=None):
-    """The layout of root (default: the folder above this package)."""
-    root = Path(root or Path(__file__).resolve().parent.parent).resolve()
-    return release_layout(root) if is_release(root) else dev_layout(root)
+    """The layout of root (default: the folder above this package, or near the frozen executable)."""
+    if root:
+        r = Path(root).resolve()
+    elif getattr(sys, 'frozen', False):
+        exe_dir = Path(sys.executable).resolve().parent
+        r = next((d for d in (exe_dir, exe_dir.parent, exe_dir.parent.parent) if (d / 'CMakeLists.txt').is_file()), exe_dir)
+    else:
+        r = Path(__file__).resolve().parent.parent.resolve()
+    return release_layout(r) if is_release(r) else dev_layout(r)

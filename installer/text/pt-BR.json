@@ -124,5 +124,10 @@
   "ui.need_keys": "Para ler o firmware é preciso o prod.keys dele: escolha o arquivo ou deixe o firmware em branco.",
   "ui.missing_firmware": "A pasta do firmware não existe.",
   "ui.bad_firmware": "Essa pasta não tem arquivos de firmware nem fontes do sistema.",
-  "ui.missing_keys": "O arquivo de chaves não existe."
+  "ui.missing_keys": "O arquivo de chaves não existe.",
+  "ui.check_updates": "Verificar atualizações",
+  "ui.update_checking": "Verificando...",
+  "ui.update_latest": "Você já está na versão mais recente ({version}).",
+  "ui.update_available": "Uma nova versão ({latest}) está disponível (atual: {current}). Deseja abrir a página de Releases no GitHub?",
+  "ui.update_error": "Não foi possível verificar atualizações: {detail}"
 }

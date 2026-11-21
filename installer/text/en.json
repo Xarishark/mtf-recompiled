@@ -124,5 +124,10 @@
   "ui.need_keys": "Reading the firmware takes its prod.keys: choose the file, or leave the firmware empty.",
   "ui.missing_firmware": "The firmware folder does not exist.",
   "ui.bad_firmware": "That folder has no firmware files or system fonts.",
-  "ui.missing_keys": "The keys file does not exist."
+  "ui.missing_keys": "The keys file does not exist.",
+  "ui.check_updates": "Check updates",
+  "ui.update_checking": "Checking...",
+  "ui.update_latest": "You are on the latest release ({version}).",
+  "ui.update_available": "A new version ({latest}) is available (current: {current}). Open the GitHub Releases page to download it?",
+  "ui.update_error": "Could not check for updates: {detail}"
 }
