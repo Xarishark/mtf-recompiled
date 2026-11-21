@@ -368,6 +368,16 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_NAN_GUARD_DESC] = "Replaces NaN fragment color outputs with 0 (Zero) or a debug color (Mark) to prevent bloom artifacts.",
     [UI_MENU_NAN_ZERO] = "Zero",
     [UI_MENU_NAN_MARK] = "Mark (debug)",
+    [UI_MENU_MP_INPUT] = "Multiplayer",
+    [UI_MENU_MP_INPUT_DESC] = "Assigns separate input devices (Keyboard or detected controllers) to Players 1-4.",
+    [UI_MENU_MP_P1] = "Player 1 input",
+    [UI_MENU_MP_P2] = "Player 2 input",
+    [UI_MENU_MP_P3] = "Player 3 input",
+    [UI_MENU_MP_P4] = "Player 4 input",
+    [UI_MENU_MP_PLAYER_DESC] = "Input device assigned to this player (Keyboard or a connected controller).",
+    [UI_MENU_MP_AUTO] = "Auto (Pad 1 + Keyboard)",
+    [UI_MENU_MP_NONE] = "None",
+    [UI_MENU_MP_KEYBOARD] = "Keyboard",
 };
 
 static const char *const text_pt_br[UI_TEXT_COUNT] = {
@@ -735,6 +745,16 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_NAN_GUARD_DESC] = "Substitui saídas NaN de fragment shaders por 0 (Zero) ou cor de depuração (Mark) para evitar artefatos de bloom.",
     [UI_MENU_NAN_ZERO] = "Zero",
     [UI_MENU_NAN_MARK] = "Marcar (debug)",
+    [UI_MENU_MP_INPUT] = "Multiplayer",
+    [UI_MENU_MP_INPUT_DESC] = "Permite atribuir dispositivos de entrada separados (Teclado ou controles detectados) para os Jogadores 1-4.",
+    [UI_MENU_MP_P1] = "Input do Player 1",
+    [UI_MENU_MP_P2] = "Input do Player 2",
+    [UI_MENU_MP_P3] = "Input do Player 3",
+    [UI_MENU_MP_P4] = "Input do Player 4",
+    [UI_MENU_MP_PLAYER_DESC] = "Dispositivo de entrada atribuído a este jogador (Teclado ou um controle conectado).",
+    [UI_MENU_MP_AUTO] = "Automático (Controle 1 + Teclado)",
+    [UI_MENU_MP_NONE] = "Nenhum",
+    [UI_MENU_MP_KEYBOARD] = "Teclado",
 };
 
 // The system's UI language as a catalog language: Portuguese (any region) gets pt-BR, the only Portuguese catalog.

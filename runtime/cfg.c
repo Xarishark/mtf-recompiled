@@ -68,6 +68,11 @@ static const struct { const char *key, *def; } defaults[] = {
     {"FRAME_QUEUE", "0"},
     {"PAD_LAYOUT", "auto"},
     {"STICK_DEADZONE", "8"},
+    {"MULTIPLAYER_INPUT", "0"},     // input.c, ov_hid.c: 1 enables per-player input routing (P1..P4)
+    {"P1_INPUT", "auto"},           // input.c: auto | none | keyboard | pad:0..pad:3
+    {"P2_INPUT", "none"},
+    {"P3_INPUT", "none"},
+    {"P4_INPUT", "none"},
     // vk_exec.c: a masked stencil clear (the game clears bits 0xf0 every frame) clears every bit. A stopgap until the
     // masked clear is replayed as a draw: skipped, the sky stayed dark (open: the low bits are lost)
     {"STENCIL_MASK_FULL", "1"},
@@ -142,6 +147,9 @@ static CfgMeta metas[] = {
     // Sound, Controls, Menu
     {"VOLUME", NULL, "0..100", LIVE}, {"AUDIO_CHANNELS", NULL, "auto|stereo|5.1", RESTART},
     {"PAD_LAYOUT", NULL, "auto|positional", LIVE}, {"BUTTON_ICONS", "auto", "auto|nintendo|xbox|playstation|keyboard", LIVE},
+    {"MULTIPLAYER_INPUT", NULL, "0|1", LIVE},
+    {"P1_INPUT", NULL, NULL, LIVE}, {"P2_INPUT", NULL, NULL, LIVE},
+    {"P3_INPUT", NULL, NULL, LIVE}, {"P4_INPUT", NULL, NULL, LIVE},
     {"BIND_A", "", NULL, LIVE}, {"BIND_B", "", NULL, LIVE}, {"BIND_X", "", NULL, LIVE}, {"BIND_Y", "", NULL, LIVE},
     {"BIND_LCLICK", "", NULL, LIVE}, {"BIND_RCLICK", "", NULL, LIVE}, {"BIND_L", "", NULL, LIVE}, {"BIND_R", "", NULL, LIVE},
     {"BIND_ZL", "", NULL, LIVE}, {"BIND_ZR", "", NULL, LIVE}, {"BIND_PLUS", "", NULL, LIVE}, {"BIND_MINUS", "", NULL, LIVE},

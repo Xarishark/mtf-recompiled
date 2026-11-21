@@ -561,6 +561,31 @@ static void tab_sound(float scale) {
 // A confirmation is open (restart, reset): B and Esc close it, not the menu; L / R stay on the page.
 static bool g_modal;
 
+static void row_mp_player(int player, const char *key, UiTextId label, const InputPadList &pads) {
+    const char *vals[2 + INPUT_MAX_PADS + 1];
+    const char *names[2 + INPUT_MAX_PADS + 1];
+    char pad_vals[INPUT_MAX_PADS][16];
+    char pad_labels[INPUT_MAX_PADS][128];
+    int n = 0;
+    if (player == 0) {
+        vals[n] = "auto";
+        names[n++] = menu_text(UI_MENU_MP_AUTO);
+    } else {
+        vals[n] = "none";
+        names[n++] = menu_text(UI_MENU_MP_NONE);
+    }
+    vals[n] = "keyboard";
+    names[n++] = menu_text(UI_MENU_MP_KEYBOARD);
+    for (int i = 0; i < INPUT_MAX_PADS; i++) {
+        if (!pads.connected[i]) continue;
+        snprintf(pad_vals[i], sizeof pad_vals[i], "pad:%d", i);
+        snprintf(pad_labels[i], sizeof pad_labels[i], "%d: %s", i + 1, pads.names[i]);
+        vals[n] = pad_vals[i];
+        names[n++] = pad_labels[i];
+    }
+    opt_choice_list(key, label, vals, names, n, UI_MENU_MP_PLAYER_DESC, -1);
+}
+
 static void tab_controls(float scale) {
     if (ImGui::BeginTabBar("##controls_sub", ImGuiTabBarFlags_NoTabListScrollingButtons)) {
         char controller[64], keyboard[64];
@@ -568,6 +593,17 @@ static void tab_controls(float scale) {
         snprintf(keyboard, sizeof keyboard, "  %s  ###ctrl_kb", menu_text(UI_MENU_KEYBOARD));
         if (ImGui::BeginTabItem(controller)) {
             opt_begin("##controls_pad", scale);
+            opt_group(UI_MENU_MP_INPUT);
+            opt_toggle("MTF_MULTIPLAYER_INPUT", UI_MENU_MP_INPUT, UI_MENU_MP_INPUT_DESC);
+            if (cfg_bool("MTF_MULTIPLAYER_INPUT")) {
+                InputPadList pads;
+                input_list_pads(&pads);
+                row_mp_player(0, "MTF_P1_INPUT", UI_MENU_MP_P1, pads);
+                row_mp_player(1, "MTF_P2_INPUT", UI_MENU_MP_P2, pads);
+                row_mp_player(2, "MTF_P3_INPUT", UI_MENU_MP_P3, pads);
+                row_mp_player(3, "MTF_P4_INPUT", UI_MENU_MP_P4, pads);
+            }
+            opt_group(UI_MENU_CONTROLLER);
             static const UiTextId layout[] = {UI_MENU_PAD_LAYOUT_AUTO, UI_MENU_PAD_LAYOUT_POSITIONAL};
             opt_choice("MTF_PAD_LAYOUT", UI_MENU_PAD_LAYOUT, layout, 2, UI_MENU_PAD_LAYOUT_DESC);
             static const UiTextId icons[] = {UI_MENU_BUTTON_ICONS_AUTO, UI_MENU_BUTTON_ICONS_NINTENDO,

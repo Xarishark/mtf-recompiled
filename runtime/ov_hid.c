@@ -35,16 +35,18 @@ static volatile uint64_t shake_t0;
 
 static uint32_t connected_id(void) { return ov_handheld() ? NPAD_HANDHELD : NPAD_NO1; }
 static uint32_t style_of(uint32_t id) {
-    if (id != connected_id()) return 0;
-    return id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY;
+    if (ov_handheld()) return id == NPAD_HANDHELD ? STYLE_HANDHELD : 0;
+    if (id < INPUT_MAX_PLAYERS && input_player_connected((int)id)) return STYLE_FULLKEY;
+    return 0;
 }
 
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     memset(s, 0, sizeof *s);
     s->sampling = __atomic_add_fetch(&sampling, 1, __ATOMIC_RELAXED);
     if (!(style_of(id) & style)) return;   // no controller of this id and style: attributes 0
-    uint64_t b;
-    input_poll(&b, &s->lx, &s->ly, &s->rx, &s->ry);
+    uint64_t b = 0;
+    int player = (id < INPUT_MAX_PLAYERS) ? (int)id : 0;
+    input_poll_player(player, &b, &s->lx, &s->ly, &s->rx, &s->ry);
     b &= 0xffffull;
     if (s->lx < -STICK_THRESH) b |= 1u << 16;
     if (s->ly > STICK_THRESH) b |= 1u << 17;
@@ -89,8 +91,9 @@ static void joy_single_out(Cpu *c) { ret_x(c, 0); }
 static void controller_support(Cpu *c) {
     int32_t *info = arg_p(c, 0);
     const int8_t *arg = arg_p(c, 1);
-    int count = 1, canceled = arg && arg[0] > count;
-    if (arg) rt_log("hid: controller applet wants %d to %d players, 1 connected%s", arg[0], arg[1],
+    int count = input_connected_count();
+    int canceled = arg && arg[0] > count;
+    if (arg) rt_log("hid: controller applet wants %d to %d players, %d connected%s", arg[0], arg[1], count,
                     canceled ? ": too few, closed as canceled" : "");
     if (info) {
         info[0] = count;
