@@ -2104,7 +2104,9 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
                                            .layout = l->layout};
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
+        plat_mutex_lock(&cache_lock);
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        plat_mutex_unlock(&cache_lock);
         double ms = ms_since(t1);   // the link alone: library builds are counted apart
         if (build) plat_mutex_lock(&P.lock);
         P.g.link_ms += ms;
@@ -2992,7 +2994,7 @@ static void dyn_vals(const VkPipeState *s, DynVals *o) {
 // What the replay's command buffer holds, as vk_pipeline_set_dynamic_delta last recorded it (the replay thread only):
 // the values, the inputs of the vertex input and the vertex bindings it reads. Invariant while the caller passes
 // valid 1: cb holds DC.v for every dynamic state of P.dyn, colour attachments [0, DC.v.n) included.
-static struct {
+static _Thread_local struct {
     DynVals v;
     const GfxShader *vs;
     uint32_t vattr[16];

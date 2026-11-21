@@ -230,7 +230,7 @@ void vk_exec_oq_dropped(VkExec *ex) {
 }
 
 void vk_exec_oq_draw(VkExec *ex) {
-    if (!oq_counting || oq_open >= 0) return;
+    if (!oq_counting || oq_open >= 0 || oq_outside) return;
     uint32_t q = oq_next % OQ_N;
     if (__atomic_load_n(&oq_busy[q], __ATOMIC_ACQUIRE)) {
         warn_once(W_QUERY, "occlusion query ring full: draws left uncounted");

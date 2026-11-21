@@ -1688,7 +1688,7 @@ static void repeat_stats(const VkExec *ex, const VkPipeInfo *info) {
         p_bind_buf ubo[2][18], ssbo[2][16];
         float vp[6], point_size;
     } last, cur;
-    if (!bind_stats_on()) return;
+    if (!bind_stats_on() || ex->draw) return;
     memset(&cur, 0, sizeof cur);
     cur.prog = ex->prog, cur.pipe = ex->pipe, cur.info = info;
     const int st[2] = {NVN_STAGE_VS, NVN_STAGE_FS};
