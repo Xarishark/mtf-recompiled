@@ -118,7 +118,8 @@ def run_tool(ctx, step, args, what, phase=None, progress=None, env=None, cwd=Non
     with open(log, 'ab') as f:
         f.write(b'\n$ ' + ' '.join(str(a) for a in args).encode('utf-8', 'replace') + b'\n')
         p = subprocess.Popen([str(a) for a in args], cwd=str(cwd or ctx.layout.root), env=full_env, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         rest = b''
         try:
             while chunk := p.stdout.read1(1 << 16):

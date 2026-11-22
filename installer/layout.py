@@ -81,7 +81,7 @@ def _find_cmake(root, tools):
 
 def dev_layout(root):
     commit = subprocess.run(['git', '-C', str(root), 'rev-parse', '--short', 'HEAD'], capture_output=True,
-                            text=True).stdout.strip()
+                            text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).stdout.strip()
     vf = root / 'VERSION'
     semver = vf.read_text(encoding='utf-8').strip() if vf.is_file() else '0.1.0'
     tc = root / 'toolchain'

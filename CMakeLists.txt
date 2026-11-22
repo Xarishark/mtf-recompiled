@@ -181,7 +181,7 @@ target_link_libraries(mtf-recomp PRIVATE vulkan-1 SDL3 opus vpx datachannel juic
 # for the C++ files (the menu, ImGui, Vulkan Memory Allocator).
 file(GLOB MTF_DEPS_DLLS "${MTF_DEPS_DIR}/bin/*.dll")
 get_filename_component(MTF_CXX_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
-list(APPEND MTF_DEPS_DLLS "${MTF_CXX_BIN}/../x86_64-w64-mingw32/bin/libc++.dll" "${MTF_CXX_BIN}/../x86_64-w64-mingw32/bin/libunwind.dll")
+list(APPEND MTF_DEPS_DLLS "${MTF_CXX_BIN}/../x86_64-w64-mingw32/bin/libc++.dll" "${MTF_CXX_BIN}/../x86_64-w64-mingw32/bin/libunwind.dll" "${MTF_CXX_BIN}/../x86_64-w64-mingw32/bin/libwinpthread-1.dll")
 foreach(MTF_DLL IN LISTS MTF_DEPS_DLLS)
     add_custom_command(TARGET mtf-recomp POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${MTF_DLL}" "${MTF_OUTPUT_DIR}/")
 endforeach()
