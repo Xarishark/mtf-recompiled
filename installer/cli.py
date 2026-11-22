@@ -48,7 +48,7 @@ def main(argv=None):
     ap.add_argument('--nup', type=Path, help='your Mario Tennis Fever .nup')
     ap.add_argument('--content', type=Path, help="a folder with the game's files instead of the .nup")
     ap.add_argument('--firmware', type=Path, help="optional: the firmware's Contents/registered folder, or a folder with the "
-                                                  'decoded system fonts; without them the button icons show as ??')
+                                                  'decoded system fonts')
     ap.add_argument('--keys', type=Path, help='prod.keys, only to read the firmware; it is read in place and never stored')
     ap.add_argument('--dest', type=Path, required=True, help='install folder (about 10 GB)')
     ap.add_argument('--root', type=Path, help='release folder or repository (default: the folder above installer/)')

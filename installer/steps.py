@@ -336,8 +336,6 @@ class Fonts(Step):
     def run(self, ctx):
         opts, rep = ctx.options, ctx.reporter
         if not opts.firmware:
-            if fonts_folder(fonts_dir(ctx)) is None:
-                rep.warning('warn.no_fonts')
             return {}
         ready = fonts_folder(opts.firmware)
         if ready:
@@ -591,7 +589,7 @@ class Finish(Step):
             (ctx.temp / name).unlink(missing_ok=True)
 
 
-STEPS = (Check, Extract, Fonts, Lift, Capture, LiftNro, Shaders, Build, Dlss, Finish)
+STEPS = (Check, Extract, Lift, Capture, LiftNro, Shaders, Build, Dlss, Finish)
 STEP_IDS = [s.id for s in STEPS]
 
 

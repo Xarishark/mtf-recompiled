@@ -26,7 +26,7 @@ TEXT = Path(__file__).resolve().parent / 'text'
 UI_LANGUAGES = ('en', 'pt-BR')
 # what the language switch in the window's corner shows for each
 UI_LANGUAGE_LABELS = {'en': 'English', 'pt-BR': 'Português (Brasil)'}
-STEP_ORDER = ('check', 'extract', 'fonts', 'lift', 'capture', 'lift-nro', 'shaders', 'build', 'dlss', 'finish')
+STEP_ORDER = ('check', 'extract', 'lift', 'capture', 'lift-nro', 'shaders', 'build', 'dlss', 'finish')
 # message parameter -> catalog id prefix of the names that replace its raw values
 PARAM_NAMES = {'step': 'step.'}
 LANG_PT_BR = 0x0416   # Portuguese (Brazil), the whole LANGID: Portugal's Portuguese stays English

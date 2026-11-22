@@ -547,7 +547,7 @@ class App:
 
 # ---- self test ---------------------------------------------------------------------------------------------------
 
-STEP_IDS = ['check', 'extract', 'fonts', 'lift', 'capture', 'lift-nro', 'shaders', 'build', 'dlss', 'finish']
+STEP_IDS = ['check', 'extract', 'lift', 'capture', 'lift-nro', 'shaders', 'build', 'dlss', 'finish']
 SAMPLE_START = {'type': 'start', 'release': 'selftest', 'mode': 'install', 'dest': 'Z:/selftest/MTF', 'log': 'D:\\log.txt',
                 'steps': STEP_IDS}
 SAMPLE_RUN = [
