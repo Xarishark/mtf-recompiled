@@ -2831,7 +2831,9 @@ void vk_pipeline_prewarm(void) {
 
     PlatThread *t[64];
     int nt = 0;
-    for (int i = 0; i < cpus && i < 64 && queued; i++)
+    const char *ps = cfg_get("MTF_PIPE_SYNC");
+    int single = !(ps && !strcmp(ps, "0")) && vk_ctx()->props.vendorID == 0x10de && !P.gpl;
+    for (int i = 0; !single && i < cpus && i < 64 && queued; i++)
         if ((t[nt] = plat_thread_new(warm_builder, NULL, "pipe prewarm"))) nt++;
     if (!nt) warm_builder(NULL);
     for (int i = 0; i < nt; i++) plat_thread_join(t[i]);

@@ -1230,7 +1230,9 @@ static int par_threads(void) {
     if (par_mode < 0) {
         const char *e = cfg_get("MTF_REPLAY_THREADS");
         uint32_t cpus = plat_cpu_usable();
-        par_mode = e && *e ? atoi(e) : vk_caps.amd ? 0 : cpus >= 12 ? 6 : cpus >= 8 ? 4 : 0;
+        par_mode = e && *e ? atoi(e)
+                 : (vk_caps.amd || (vk_ctx()->props.vendorID == 0x10de && !vk_pipeline_async_on())) ? 0
+                 : cpus >= 12 ? 6 : cpus >= 8 ? 4 : 0;
         if (par_mode < 0) par_mode = 0;
         if (par_mode)
             rt_log("vk: passes of %d or more draws are recorded in slices of up to %d draws into secondary command buffers "
