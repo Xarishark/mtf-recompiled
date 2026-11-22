@@ -646,7 +646,7 @@ static void tab_multiplayer(float scale) {
     if (info.state == STREAM_STATE_OFF) {
         reveal_link = false;
         if (!info.cf_installed) ImGui::BeginDisabled();
-        if (ImGui::Button("CloudFlare (recommended)", ImVec2(220 * scale, 0))) stream_host_start_mode(STREAM_MODE_CLOUDFLARE);
+        if (ImGui::Button("Cloudflare (WebSocket)", ImVec2(210 * scale, 0))) stream_host_start_mode(STREAM_MODE_CLOUDFLARE);
         if (!info.cf_installed) ImGui::EndDisabled();
 
         ImGui::SameLine(0, 10 * scale);
@@ -694,7 +694,7 @@ static void tab_multiplayer(float scale) {
         ImGui::Spacing();
         ImGui::TextWrapped("If you share your stream in Local Host mode (without Cloudflare), "
                            "your public IP address will be exposed to the connected players.\n\n"
-                           "Use CloudFlare (recommended) to hide your IP behind a trycloudflare.com tunnel, "
+                           "Use Cloudflare (WebSocket) or WebRTC to hide your IP behind a trycloudflare.com tunnel, "
                            "or click OK to start in Local Host mode anyway.");
         ImGui::PopTextWrapPos();
         ImGui::Spacing();

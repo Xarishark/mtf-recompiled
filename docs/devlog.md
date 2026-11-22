@@ -238,3 +238,14 @@
 - **Verification:**
   - Audited all `1,956` git-tracked files (`Suspicious tracked files: []`) and ran `python tools/check_content.py` (`0` violations).
   - Built `build/fork/bin/mtf-recomp.exe` on `main` cleanly via `ninja` (`0` errors) and packaged `build/release/mtf-recomp-0.1.0-src.zip`.
+
+
+### 2026-11-22 — GUI Installer (`MTF-Recomp-Setup.exe`) Fixes & `v0.1.0` Release Prep
+- **Changes:**
+  - `CMakeLists.txt`: Bundled `libwinpthread-1.dll` into `MTF_DEPS_DLLS` so `libvpx-1.dll` loads cleanly during `--capture-nro` and runtime execution.
+  - `installer/steps.py`, `installer/layout.py`: Added `CREATE_NO_WINDOW` to subprocess calls, prioritized `build/toolchain/xlate/dmsh_xlate.exe` (`0.1.0+6caba99`) over stale `build/xlate_nx/dmsh_xlate.exe`, and cleared stale `shaders/` before re-translating.
+  - `installer/steps.py`, `installer/gui.py`, `installer/guilogic.py`, `installer/cli.py`, `installer/text/{en,pt-BR}.json`: Removed the obsolete `fonts` step and `??` button-icon warning (button glyphs are generated dynamically by `ov_font.c` / `glyph_draw.c`), and bundled `installer/assets` + `installer/text` into `MTF-Recomp-Setup.exe`.
+  - `runtime/ui/menu.cpp`: Renamed `CloudFlare (recommended)` to `Cloudflare (WebSocket)` alongside `WebRTC (Low Latency UDP)` and `Local Host`.
+  - `README.md`, `docs/port-status.md`: Added Multiplayer & Remote Play comparison table (transport, use cases, IP privacy, expected delay) and GUI Installer quick-start instructions.
+- **Verification:**
+  - Verified `python -m installer.gui --selftest` (`exit 0`), `python tools/check_content.py` (`exit 0`), PyInstaller `MTF-Recomp-Setup.exe` build (`exit 0`), and `python tools/make_release.py --version 0.1.0`.
