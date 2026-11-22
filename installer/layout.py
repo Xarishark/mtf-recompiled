@@ -17,6 +17,7 @@ Dev mode, root = a repository checkout: .venv's Python, the toolchain of docs/bu
 version from VERSION with -dev and the commit, build/generated/installer as the temp folder.
 """
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -58,22 +59,60 @@ def release_layout(root):
                   temp=root / 'temp')
 
 
+def _first_existing(candidates):
+    for p in candidates:
+        if p and Path(p).exists():
+            return Path(p)
+    return Path(candidates[0]) if candidates else Path('missing')
+
+
+def _find_cmake(root, tools):
+    cands = []
+    if tools.get('cmake_path'):
+        cands.append(tools['cmake_path'])
+    w = shutil.which('cmake')
+    if w:
+        cands.append(w)
+    for vs in sorted(Path('C:/Program Files/Microsoft Visual Studio').glob('*/**/CMake/CMake/bin/cmake.exe')):
+        cands.append(vs)
+    cands.append(root / 'build' / 'toolchain' / 'cmake-missing')
+    return _first_existing(cands)
+
+
 def dev_layout(root):
     commit = subprocess.run(['git', '-C', str(root), 'rev-parse', '--short', 'HEAD'], capture_output=True,
                             text=True).stdout.strip()
     vf = root / 'VERSION'
     semver = vf.read_text(encoding='utf-8').strip() if vf.is_file() else '0.1.0'
-    toolchain = root / 'build' / 'toolchain'
-    manifest = toolchain / 'toolchain-manifest.json'
+    tc = root / 'toolchain'
+    btc = root / 'build' / 'toolchain'
+    manifest = btc / 'toolchain-manifest.json'
     tools = json.loads(manifest.read_text(encoding='utf-8-sig')) if manifest.is_file() else {}
-    trees = sorted(p.parent.parent for p in toolchain.glob('llvm-mingw-*/bin/clang.exe'))
-    venv = root / '.venv' / 'Scripts' / 'python.exe'
+    trees = sorted(p.parent.parent for base in (tc, btc) if base.is_dir() for p in base.glob('llvm-mingw-*/bin/clang.exe'))
+    py_cands = [root / '.venv' / 'Scripts' / 'python.exe', tc / 'python' / 'python.exe']
+    if not getattr(sys, 'frozen', False):
+        py_cands.append(Path(sys.executable))
+    py_which = shutil.which('python')
+    if py_which:
+        py_cands.append(Path(py_which))
+    ninja_cands = [tc / 'ninja' / 'ninja.exe']
+    if tools.get('ninja_path'):
+        ninja_cands.append(Path(tools['ninja_path']))
+    nw = shutil.which('ninja')
+    if nw:
+        ninja_cands.append(Path(nw))
+    deps = _first_existing([tc / 'deps-mingw', btc / 'deps'])
+    xlate = _first_existing([
+        root / 'build' / 'xlate_nx' / 'dmsh_xlate.exe',
+        root / 'build' / 'xlate' / 'totk_xlate.exe',
+        btc / 'dmsh_xlate-sbuf' / 'dmsh_xlate.dll',
+    ])
     return Layout(root=root, dev=True, release=f'{semver}-dev+{commit or "unknown"}',
-                  python=venv if venv.is_file() else Path(sys.executable),
-                  llvm=trees[-1] if trees else toolchain / 'llvm-mingw-missing',
-                  cmake=Path(tools.get('cmake_path', toolchain / 'cmake-missing')),
-                  ninja=Path(tools.get('ninja_path', toolchain / 'ninja.exe')), deps=toolchain / 'deps',
-                  xlate=toolchain / 'dmsh_xlate-sbuf' / 'dmsh_xlate.dll', temp=root / 'build' / 'generated' / 'installer')
+                  python=_first_existing(py_cands),
+                  llvm=trees[-1] if trees else tc / 'llvm-mingw-missing',
+                  cmake=_find_cmake(root, tools),
+                  ninja=_first_existing(ninja_cands), deps=deps,
+                  xlate=xlate, temp=root / 'build' / 'generated' / 'installer')
 
 
 def is_release(root):
