@@ -477,6 +477,7 @@ class Shaders(Step):
             ctx.reporter.progress('shaders', 'copy', force=True)
             tree_link_or_copy(opts.shaders_from, dst)
             return
+        shutil.rmtree(dst, ignore_errors=True)
         src = ctx.temp / 'shaders-src'
         tools = lay.root / 'tools' / 'shaders'
         run_tool(ctx, 'shaders', [lay.python, tools / 'extract.py', '--archive', romfs(ctx) / '42', '--nro', captured(ctx),

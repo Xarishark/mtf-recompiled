@@ -103,8 +103,8 @@ def dev_layout(root):
         ninja_cands.append(Path(nw))
     deps = _first_existing([tc / 'deps-mingw', btc / 'deps'])
     xlate = _first_existing([
-        root / 'build' / 'xlate_nx' / 'dmsh_xlate.exe',
-        root / 'build' / 'xlate' / 'totk_xlate.exe',
+        btc / 'xlate' / 'dmsh_xlate.exe',
+        root / 'bin' / 'xlate' / 'dmsh_xlate.exe',
         btc / 'dmsh_xlate-sbuf' / 'dmsh_xlate.dll',
     ])
     return Layout(root=root, dev=True, release=f'{semver}-dev+{commit or "unknown"}',
