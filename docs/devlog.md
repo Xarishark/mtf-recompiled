@@ -249,3 +249,11 @@
   - `README.md`, `docs/port-status.md`: Added Multiplayer & Remote Play comparison table (transport, use cases, IP privacy, expected delay) and GUI Installer quick-start instructions.
 - **Verification:**
   - Verified `python -m installer.gui --selftest` (`exit 0`), `python tools/check_content.py` (`exit 0`), PyInstaller `MTF-Recomp-Setup.exe` build (`exit 0`), and `python tools/make_release.py --version 0.1.0`.
+
+
+### 2026-11-22 — `v0.1.1`: `F1 -> Cheats`, NVIDIA GPL Crash Fix & Installer `MENU_LANG`
+- **Changes:**
+  - `profiles/0400D4201C6EA000/cheats_profile.h`, `runtime/cheats.{c,h}`, `runtime/cfg.c`, `runtime/gfx_present.c`, `runtime/ui_text.{h,c}`, `runtime/ui/menu.cpp`: Added **Cheats** tab in `F1` (`Unlock Everything` / `Disable All` + live toggles for Characters, Costumes & Colors, Rackets, Courts, and Cups & Modes) backed by non-destructive in-memory bitfield snapshots in `nro0` `.bss`.
+  - `runtime/vk_caps.c`, `runtime/vk_pipeline.c`, `runtime/vk_exec.c`: Re-enabled `VK_EXT_graphics_pipeline_library` (`GPL` + `fast-link`) by default and guarded non-GPL NVIDIA fallback paths against multi-threaded `vkCreateGraphicsPipelines` crashes (`nvoglv64.dll+0x10ea90`).
+  - `installer/{gui,guilogic,cli,steps}.py`: Passed the installer's selected language (`en` / `pt-BR`) via `--lang` to `Finish.run()` so `mtf.ini` starts with `MENU_LANG` matching the setup language.
+  - `VERSION`, `README.md`, `docs/port-status.md`: Bumped to `0.1.1` and documented `F1 -> Cheats`.

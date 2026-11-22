@@ -13,7 +13,8 @@ Static recompilation of *Mario Tennis Fever* (Nintendo Switch 2, Update `1.1.1` 
 - **Resolution & Upscaling:** `720p`–`8K (4320p)`, smart `auto` matching window/display size, `50%`–`200%` render scale (supersampling), AMD FSR 1, Bilinear, and NVIDIA DLAA/DLSS.
 - **Controls & UI:** Full keyboard and gamepad remapping (`F1 -> Controls`), dynamic button icons (Nintendo / Xbox / PlayStation / Keyboard), HDR10, and ImGui settings menu (`F1` / `Esc` / `Minus+Plus`) in English and Brazilian Portuguese (`pt-BR`).
 - **Multiplayer & Browser Remote Play (`F1 -> Multiplayer`):** Local multi-gamepad routing (`P1`–`P4`) plus built-in browser streaming (VP8 + Opus + remote controller input) so friends can join as `P2`–`P4` directly from Chrome/Edge.
-- **GUI Installer (`MTF-Recomp-Setup.exe`):** Guided Windows setup (`EN` / `pt-BR`) to pick your legal `.nup` or extracted `1.1.1` dump, choose the install directory, optionally download `nvngx_dlss.dll`, and check for GitHub updates.
+- **Cheats (`F1 -> Cheats`):** Live in-memory unlock toggles for multiplayer/free-play (Unlock All Characters, Costumes & Colors, Rackets, Courts, Cups & Modes, plus one-click Unlock Everything / Disable All).
+- **GUI Installer (`MTF-Recomp-Setup.exe`):** Guided Windows setup (`EN` / `pt-BR`, also saved as the default `F1` menu language) to pick your legal `.nup` or extracted `1.1.1` dump, choose the install directory, optionally download `nvngx_dlss.dll`, and check for GitHub updates.
 
 ## Multiplayer & Remote Play (`F1 -> Multiplayer`)
 

@@ -313,7 +313,7 @@ class App:
 
     def form(self):
         return Form(game=self.vars['game'].get(), dest=self.vars['dest'].get(), dlss=self.dlss_var.get(),
-                    firmware=self.vars['firmware'].get(), keys=self.vars['keys'].get())
+                    firmware=self.vars['firmware'].get(), keys=self.vars['keys'].get(), lang=self.cat.lang)
 
     def refresh_form(self):
         self.update_hint.configure(text=self.cat('ui.update_mode') if self.form().update_mode() else '')

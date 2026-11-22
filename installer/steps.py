@@ -576,9 +576,15 @@ class Finish(Step):
         ctx.reporter.progress('finish', 'settings', force=True)
         ini = ctx.dest / 'mtf.ini'
         if not ini.exists():
+            extra = ''
+            if (ctx.dest / DLSS_DLL).is_file():
+                extra += 'DLAA = 1\n'
+            lang = getattr(ctx.options, 'lang', None)
+            if lang:
+                extra += f'MENU_LANG = {lang}\n'
             ini.write_text('# MTF Recomp settings, written by the in-game menu (Minus+Plus, F1 or Esc).\n'
                            '# KEY = value; the MTF_KEY environment variable wins over a line here.\n'
-                           + ('DLAA = 1\n' if (ctx.dest / DLSS_DLL).is_file() else ''), encoding='utf-8')
+                           + extra, encoding='utf-8')
         (ctx.dest / 'profile').mkdir(exist_ok=True)
         if ctx.options.keep_work or ctx.options.only:
             return

@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-11-22  
 **Target game:** *Mario Tennis Fever* (Switch 2 / `Ounce`, Title ID `0400D4201C6EA000`, Update `1.1.1` / `v327680`)  
-**Current phase:** `v0.1.0` Release Ready — Playable PC Port + Frame Gen + Input Remapping + `F1 -> Multiplayer` Browser Streaming + GUI Installer (`MTF-Recomp-Setup.exe`)
+**Current phase:** `v0.1.1` Release Ready — Playable PC Port + Frame Gen + Input Remapping + `F1 -> Multiplayer` + `F1 -> Cheats` + GUI Installer (`MTF-Recomp-Setup.exe`)
 
 ## Module Status
 

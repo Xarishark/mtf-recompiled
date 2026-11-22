@@ -99,6 +99,7 @@ class Form:
     dlss: bool = False
     firmware: str = ''   # optional, for the system fonts
     keys: str = ''       # prod.keys, only to read the firmware
+    lang: str = ''       # installer UI language -> default F1 MENU_LANG
 
     def installed_state(self):
         """The recorded state of the install folder (mtf-install.json), or None. Never raises."""
@@ -156,6 +157,8 @@ class Form:
             cmd += ['--temp', str(temp)]
         if self.dlss:
             cmd.append('--dlss')
+        if self.lang:
+            cmd += ['--lang', self.lang]
         return cmd
 
 

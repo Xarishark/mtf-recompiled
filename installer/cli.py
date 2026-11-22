@@ -62,6 +62,7 @@ def main(argv=None):
     ap.add_argument('--only', nargs='+', default=[], choices=STEP_IDS, help='run only these steps')
     ap.add_argument('--force', nargs='+', default=[], choices=STEP_IDS, help='run these steps even if done before')
     ap.add_argument('--keep-work', action='store_true', help='keep the generated code and the objects in the temp folder')
+    ap.add_argument('--lang', choices=('en', 'pt-BR'), help='default F1 menu language written to mtf.ini')
     args = ap.parse_args(argv)
 
     # The window cancels with Ctrl+Break to the installer's process group (CREATE_NEW_PROCESS_GROUP), which also reaches
