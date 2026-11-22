@@ -23,6 +23,7 @@
 #include "backends/imgui_impl_vulkan.h"
 #include "ui/binds_page.h"
 #include "ui/option_rows.h"
+#include "../cheats.h"
 #include "stream_host.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -286,7 +287,7 @@ extern "C" void menu_vk_release(void) {
 // working directory) as menu-test-<frame>-<page>.png; after the last tab the menu closes.
 // MTF_MENU_TEST_SET=<frame>:<key>=<value>[,<key>=<value>...][;<frame>:...]: cfg_set of each key (MTF_ prefix optional)
 // at that presented frame, menu open or not. mtf.ini is written only by the pseudo-key SAVE=1.
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_MULTIPLAYER, TAB_MENU, TAB_ADVANCED, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_MULTIPLAYER, TAB_CHEATS, TAB_MENU, TAB_ADVANCED, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -754,6 +755,25 @@ static void tab_multiplayer(float scale) {
     ImGui::EndChild();
 }
 
+static void tab_cheats(float scale) {
+    ImGui::TextWrapped("%s", menu_text(UI_MENU_CHEATS_NOTE));
+    ImGui::Spacing();
+    if (ImGui::Button(menu_text(UI_MENU_CHEATS_UNLOCK_ALL_BTN), ImVec2(200 * scale, 0))) cheats_set_all(1);
+    ImGui::SameLine(0, 12 * scale);
+    if (ImGui::Button(menu_text(UI_MENU_CHEATS_DISABLE_ALL_BTN), ImVec2(170 * scale, 0))) cheats_set_all(0);
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    opt_begin("##cheats", scale);
+    opt_toggle("MTF_CHEAT_UNLOCK_CHARS", UI_MENU_CHEAT_CHARS, UI_MENU_CHEAT_CHARS_DESC);
+    opt_toggle("MTF_CHEAT_UNLOCK_COSTUMES", UI_MENU_CHEAT_COSTUMES, UI_MENU_CHEAT_COSTUMES_DESC);
+    opt_toggle("MTF_CHEAT_UNLOCK_RACKETS", UI_MENU_CHEAT_RACKETS, UI_MENU_CHEAT_RACKETS_DESC);
+    opt_toggle("MTF_CHEAT_UNLOCK_COURTS", UI_MENU_CHEAT_COURTS, UI_MENU_CHEAT_COURTS_DESC);
+    opt_toggle("MTF_CHEAT_UNLOCK_MODES", UI_MENU_CHEAT_MODES, UI_MENU_CHEAT_MODES_DESC);
+    opt_end();
+}
+
 static void tab_menu(float scale) {
     opt_begin("##menu", scale);
     static const UiTextId langs[] = {UI_MENU_MENU_LANG_AUTO, UI_MENU_LANGNAME_EN, UI_MENU_LANGNAME_PT_BR};
@@ -968,7 +988,8 @@ static void restart_confirm(void) {
 }
 
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN,   UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MULTIPLAYER, UI_MENU_TAB_MENU, UI_MENU_TAB_ADVANCED};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MULTIPLAYER, UI_MENU_TAB_CHEATS,
+                                              UI_MENU_TAB_MENU,     UI_MENU_TAB_ADVANCED};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // the page whose first row takes the cursor at its next layout
@@ -1017,6 +1038,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
             case TAB_MULTIPLAYER: tab_multiplayer(scale); break;
+            case TAB_CHEATS: tab_cheats(scale); break;
             case TAB_MENU: tab_menu(scale); break;
             case TAB_ADVANCED: tab_advanced(scale); break;
             }

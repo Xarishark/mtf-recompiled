@@ -111,6 +111,11 @@ static const struct { const char *key, *def; } defaults[] = {
     {"SPLIT_DRAWS", "64"},          // vk_exec.c: the replay's command buffer is submitted in parts of this many draws...
     {"SPLIT_US", "1000"},           // ...and at least this many microseconds of recording, so the GPU starts early
     {"VK_SUBGROUP_PIN", "1"},       // vk_caps.c: pin the subgroup size the shaders were translated for
+    {"CHEAT_UNLOCK_CHARS", "0"},    // cheats.c: unlock all characters in memory
+    {"CHEAT_UNLOCK_COSTUMES", "0"}, // cheats.c: unlock all alternate character costumes/colors
+    {"CHEAT_UNLOCK_RACKETS", "0"},  // cheats.c: unlock all rackets in memory
+    {"CHEAT_UNLOCK_COURTS", "0"},   // cheats.c: unlock all courts in memory
+    {"CHEAT_UNLOCK_MODES", "0"},    // cheats.c: unlock all tournament cups and modes
 };
 
 // The settings the menu shows (ui/menu.cpp), in its order: what each accepts and whether it applies at once. A NULL
@@ -178,6 +183,10 @@ static CfgMeta metas[] = {
     {"VK_SUBGROUP_PIN", NULL, "0|1", RESTART}, {"VRAM_HEADROOM", "1", "0|1", RESTART}, {"HEAP_LAZY", "1", "0|1", RESTART},
     {"REPLAY_THREADS", "", "0..16", RESTART},
     {"NAN_GUARD", "0", "0|zero|mark", RESTART},
+    // cheats
+    {"CHEAT_UNLOCK_CHARS", NULL, "0|1", LIVE}, {"CHEAT_UNLOCK_COSTUMES", NULL, "0|1", LIVE},
+    {"CHEAT_UNLOCK_RACKETS", NULL, "0|1", LIVE}, {"CHEAT_UNLOCK_COURTS", NULL, "0|1", LIVE},
+    {"CHEAT_UNLOCK_MODES", NULL, "0|1", LIVE},
     // diagnostics
     {"TRACE", "", NULL, RESTART},
 };

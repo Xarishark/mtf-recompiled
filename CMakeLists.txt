@@ -107,6 +107,7 @@ set(MTF_RUNTIME_SOURCES
     runtime/romfs.c
     runtime/sha256.c
     runtime/stream_host.c
+    runtime/cheats.c
     runtime/stream_webrtc.cpp
     runtime/stubs.c
     runtime/svc.c
