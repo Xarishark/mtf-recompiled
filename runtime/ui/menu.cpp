@@ -33,6 +33,7 @@
 
 extern "C" {
 #include "cfg.h"
+#include "update_check.h"
 int gfx_window_refresh_hz(void);
 #include "input.h"
 #include "platform/platform.h"
@@ -1009,6 +1010,15 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
     ImGui::TextDisabled("%s", version);
 
+    UpdateInfo upd{};
+    if (update_check_status(&upd)) {
+        char msg[128];
+        snprintf(msg, sizeof msg, menu_text(UI_MENU_UPDATE_REMINDER), upd.tag, rt_port_version);
+        ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.25f, 1.0f), "%s", msg);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(menu_text(UI_MENU_UPDATE_DOWNLOAD))) update_check_open_url();
+    }
+
     int step = g_modal || binds_modal()                                                                 ? 0
              : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
              : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
@@ -1341,7 +1351,55 @@ static void perf_draw(const MenuTarget *t, float scale) {
 }
 
 // ---- the overlay (present path, present lock held)
+static uint64_t g_toast_start_ns = 0;
+static bool g_toast_done = false;
+
+static bool update_toast_active(void) {
+    if (g_toast_done) return false;
+    UpdateInfo upd{};
+    return update_check_status(&upd) != 0;
+}
+
+static void update_toast_draw(const MenuTarget *t, float scale) {
+    if (g_toast_done) return;
+    UpdateInfo upd{};
+    if (!update_check_status(&upd)) return;
+    uint64_t now = plat_now_ns();
+    if (!g_toast_start_ns) g_toast_start_ns = now;
+    double elapsed = (double)(now - g_toast_start_ns) / 1e9;
+    const double t_in = 0.35, t_hold = 5.0, t_out = 0.45;
+    const double total = t_in + t_hold + t_out;
+    if (elapsed >= total) {
+        g_toast_done = true;
+        return;
+    }
+    float k = 1.0f;
+    if (elapsed < t_in) {
+        float u = (float)(elapsed / t_in);
+        k = 1.0f - (1.0f - u) * (1.0f - u);
+    } else if (elapsed > t_in + t_hold) {
+        float u = (float)((elapsed - (t_in + t_hold)) / t_out);
+        k = 1.0f - u * u;
+    }
+    float y = (-56.0f + 70.0f * k) * scale;
+    ImGui::SetNextWindowPos(ImVec2((float)t->width * 0.5f, y), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.88f * k);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, k);
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.93f, 0.76f, 0.33f, 0.9f * k));
+    ImGui::Begin("##update_toast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                                ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                                                ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+    char msg[160];
+    snprintf(msg, sizeof msg, menu_text(UI_MENU_UPDATE_TOAST), upd.tag);
+    ImGui::TextColored(ImVec4(0.96f, 0.82f, 0.38f, 1.0f), "%s", msg);
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
+    update_check_start();
     if (shot) *shot = NULL;
     if (!g_test.parsed) test_parse();
     if (g_test.next_set < g_test.n_sets && frame >= g_test.sets[g_test.next_set].frame) test_apply_sets(frame);
@@ -1355,7 +1413,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
             g_tab_request = 0;
             set_open(1);
             open = true;
-        } else if (!g_perf_mode) {
+        } else if (!g_perf_mode && !update_toast_active()) {
             return 0;
         }
     }
@@ -1410,6 +1468,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     ImGui::NewFrame();
     if (open) layout_menu(t->width, t->height, scale);
     perf_draw(t, scale);
+    update_toast_draw(t, scale);
     ImGui::Render();
     if (open) g_save_pending = opt_save_tick(0);
     g_cost_ns += plat_now_ns() - t0;
