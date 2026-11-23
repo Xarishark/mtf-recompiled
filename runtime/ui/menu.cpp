@@ -645,6 +645,25 @@ static void tab_multiplayer(float scale) {
                        "Remote players open the link in Chrome/Edge and automatically control Player 2-4.");
     ImGui::Spacing();
 
+    {
+        const char *cur_q = cfg_value("MTF_STREAM_QUALITY");
+        static const char *q_vals[3] = {"performance", "balanced", "quality"};
+        static const char *q_names[3] = {"Performance (540p, 2.2 Mbps)", "Balanced (720p, 4.5 Mbps)", "Quality (720p, 7.5 Mbps)"};
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Stream Quality:");
+        for (int i = 0; i < 3; i++) {
+            ImGui::SameLine(0, 8 * scale);
+            bool active = !strcmp(cur_q, q_vals[i]);
+            if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.48f, 0.85f, 1.0f));
+            if (ImGui::Button(q_names[i])) {
+                cfg_set("MTF_STREAM_QUALITY", q_vals[i]);
+                opt_save_tick(1);
+            }
+            if (active) ImGui::PopStyleColor();
+        }
+        ImGui::Spacing();
+    }
+
     if (info.state == STREAM_STATE_OFF) {
         reveal_link = false;
         if (!info.cf_installed) ImGui::BeginDisabled();

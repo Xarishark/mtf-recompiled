@@ -275,7 +275,7 @@ int webrtc_broadcast_media(const uint8_t *data, size_t len) {
         if (!dcs[i]) continue;
         try {
             if (dcs[i]->isOpen()) {
-                if (is_video_delta && dcs[i]->bufferedAmount() > 192 * 1024) {
+                if (is_video_delta && dcs[i]->bufferedAmount() > 384 * 1024) {
                     dropped = 1;
                     continue;
                 }

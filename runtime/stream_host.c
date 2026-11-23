@@ -13,6 +13,7 @@
 #include <vpx/vp8cx.h>
 #include <vpx/vpx_encoder.h>
 
+#include "cfg.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "stream_host.h"
@@ -65,9 +66,27 @@ static char g_cf_install_msg[128] = {0};
 static PlatMutex g_enc_lock = PLAT_MUTEX_INIT;
 static vpx_codec_ctx_t g_vpx;
 static int g_vpx_ok = 0;
-static int g_vpx_w = 0, g_vpx_h = 0;
+static int g_vpx_w = 0, g_vpx_h = 0, g_vpx_quality = -1;
 static vpx_image_t g_vpx_img;
 static uint64_t g_vpx_pts = 0;
+
+static int stream_quality_mode(void) {
+    const char *v = cfg_value("MTF_STREAM_QUALITY");
+    if (!strcmp(v, "performance")) return 0;
+    if (!strcmp(v, "quality")) return 2;
+    return 1;
+}
+
+void stream_host_target_size(int *w, int *h) {
+    int q = stream_quality_mode();
+    if (q == 0) {
+        if (w) *w = 960;
+        if (h) *h = 540;
+    } else {
+        if (w) *w = 1280;
+        if (h) *h = 720;
+    }
+}
 static uint64_t g_last_vid_ns = 0;
 
 // Audio encoder state
@@ -975,31 +994,40 @@ void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride) {
     if (now - g_last_vid_ns < 10000000ull) return;
     g_last_vid_ns = now;
 
+    int q = stream_quality_mode();
     plat_mutex_lock(&g_enc_lock);
-    if (!g_vpx_ok || g_vpx_w != w || g_vpx_h != h) {
+    if (!g_vpx_ok || g_vpx_w != w || g_vpx_h != h || g_vpx_quality != q) {
         if (g_vpx_ok) { vpx_codec_destroy(&g_vpx); vpx_img_free(&g_vpx_img); g_vpx_ok = 0; }
         vpx_codec_enc_cfg_t cfg;
         if (vpx_codec_enc_config_default(vpx_codec_vp8_cx(), &cfg, 0) == VPX_CODEC_OK) {
+            static const unsigned k_kbps[3] = {2200, 4500, 7500};
+            static const unsigned k_qmin[3] = {8, 4, 2};
+            static const unsigned k_qmax[3] = {56, 48, 36};
+            static const unsigned k_kf[3] = {45, 45, 60};
+            static const int k_cpu[3] = {-10, -8, -6};
             cfg.g_w = (unsigned)w;
             cfg.g_h = (unsigned)h;
             cfg.g_timebase.num = 1;
             cfg.g_timebase.den = 60;
-            cfg.rc_target_bitrate = 2400;
+            cfg.rc_target_bitrate = k_kbps[q];
+            cfg.rc_min_quantizer = k_qmin[q];
+            cfg.rc_max_quantizer = k_qmax[q];
             cfg.rc_end_usage = VPX_CBR;
-            cfg.rc_buf_sz = 100;
-            cfg.rc_buf_initial_sz = 50;
-            cfg.rc_buf_optimal_sz = 50;
+            cfg.rc_buf_sz = 120;
+            cfg.rc_buf_initial_sz = 60;
+            cfg.rc_buf_optimal_sz = 60;
             cfg.g_lag_in_frames = 0;
             cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
             cfg.kf_mode = VPX_KF_AUTO;
-            cfg.kf_max_dist = 45;
+            cfg.kf_max_dist = k_kf[q];
             cfg.g_threads = 4;
             if (vpx_codec_enc_init(&g_vpx, vpx_codec_vp8_cx(), &cfg, 0) == VPX_CODEC_OK &&
                 vpx_img_alloc(&g_vpx_img, VPX_IMG_FMT_I420, (unsigned)w, (unsigned)h, 1)) {
-                vpx_codec_control(&g_vpx, VP8E_SET_CPUUSED, -10);
+                vpx_codec_control(&g_vpx, VP8E_SET_CPUUSED, k_cpu[q]);
                 g_vpx_ok = 1;
                 g_vpx_w = w;
                 g_vpx_h = h;
+                g_vpx_quality = q;
                 g_vpx_pts = 0;
             }
         }
