@@ -1353,19 +1353,31 @@ static void perf_draw(const MenuTarget *t, float scale) {
 // ---- the overlay (present path, present lock held)
 static uint64_t g_toast_start_ns = 0;
 static bool g_toast_done = false;
+static bool g_toast_checked = false;
 
 static bool update_toast_active(void) {
     if (g_toast_done) return false;
     UpdateInfo upd{};
-    return update_check_status(&upd) != 0;
+    if (!update_check_status(&upd)) return false;
+    if (!g_toast_checked) {
+        g_toast_checked = true;
+        const char *seen = cfg_get("MTF_UPDATE_NOTIFIED_TAG");
+        if (seen && !strcmp(seen, upd.tag)) {
+            g_toast_done = true;
+            return false;
+        }
+        g_toast_start_ns = plat_now_ns();
+        cfg_set("MTF_UPDATE_NOTIFIED_TAG", upd.tag);
+        cfg_save();
+    }
+    return true;
 }
 
 static void update_toast_draw(const MenuTarget *t, float scale) {
-    if (g_toast_done) return;
+    if (!update_toast_active()) return;
     UpdateInfo upd{};
     if (!update_check_status(&upd)) return;
     uint64_t now = plat_now_ns();
-    if (!g_toast_start_ns) g_toast_start_ns = now;
     double elapsed = (double)(now - g_toast_start_ns) / 1e9;
     const double t_in = 0.35, t_hold = 5.0, t_out = 0.45;
     const double total = t_in + t_hold + t_out;
