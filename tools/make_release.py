@@ -90,9 +90,9 @@ def make_release(version: str, out_dir: Path) -> Path:
     return zip_path
 
 
-def make_windows_zip(version: str, out_dir: Path, setup_exe: Path) -> Path:
-    """Package MTF-Recomp-v<version>-Windows-x64.zip for RecompLauncher (recomplauncher.json + Setup.exe + sources)."""
-    src_zip = make_release(version, out_dir)
+def make_windows_zip(version: str, out_dir: Path, setup_path: Path) -> Path:
+    """Package MTF-Recomp-v<version>-Windows-x64.zip for RecompLauncher (recomplauncher.json + Setup + sources)."""
+    make_release(version, out_dir)
     stage = out_dir / f"mtf-recomp-{version}-src"
     win_zip = out_dir / f"MTF-Recomp-v{version}-Windows-x64.zip"
     top = Path(f"MTF-Recomp-v{version}-Windows-x64")
@@ -102,8 +102,12 @@ def make_windows_zip(version: str, out_dir: Path, setup_exe: Path) -> Path:
         for p in sorted(stage.rglob("*")):
             if p.is_file():
                 zf.write(p, top / p.relative_to(stage))
-        if setup_exe.is_file():
-            zf.write(setup_exe, top / setup_exe.name)
+        if setup_path.is_dir():
+            for p in sorted(setup_path.rglob("*")):
+                if p.is_file():
+                    zf.write(p, top / p.relative_to(setup_path))
+        elif setup_path.is_file():
+            zf.write(setup_path, top / setup_path.name)
     return win_zip
 
 
@@ -117,7 +121,9 @@ def main() -> int:
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"Created clean release archive: {zip_path} ({size_mb:.2f} MiB)")
     if args.windows_zip:
-        win_zip = make_windows_zip(args.version, args.out, args.out / "MTF-Recomp-Setup.exe")
+        onedir = args.out / "MTF-Recomp-Setup"
+        setup_path = onedir if onedir.is_dir() else (args.out / "MTF-Recomp-Setup.exe")
+        win_zip = make_windows_zip(args.version, args.out, setup_path)
         win_mb = win_zip.stat().st_size / (1024 * 1024)
         print(f"Created RecompLauncher Windows archive: {win_zip} ({win_mb:.2f} MiB)")
     return 0
