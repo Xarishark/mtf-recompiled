@@ -185,13 +185,18 @@ static void ws_send_frame(SOCKET s, uint8_t opcode, const uint8_t *payload, size
 }
 
 static int ws_broadcast_bin(const uint8_t *payload, size_t len) {
+    int dropped = 0;
+    int need_ws = 0;
     if (g_mode == STREAM_MODE_WEBRTC) {
-        int dropped = webrtc_broadcast_media(payload, len);
-        int any = 0;
-        for (int i = 0; i < STREAM_MAX_CLIENTS; i++)
-            if (webrtc_peer_is_open(i)) { any = 1; break; }
-        if (any) g_bytes_sent += len;
-        return dropped;
+        dropped = webrtc_broadcast_media(payload, len);
+        int any_rtc = 0;
+        for (int i = 0; i < STREAM_MAX_CLIENTS; i++) {
+            if (!g_clients[i].active) continue;
+            if (webrtc_peer_is_open(i)) any_rtc = 1;
+            else if (g_clients[i].sock != INVALID_SOCKET) need_ws = 1;
+        }
+        if (any_rtc) g_bytes_sent += len;
+        if (!need_ws) return dropped;
     }
     uint8_t hdr[10];
     size_t hlen = 0;
@@ -212,6 +217,7 @@ static int ws_broadcast_bin(const uint8_t *payload, size_t len) {
     plat_mutex_lock(&g_send_lock);
     for (int i = 0; i < STREAM_MAX_CLIENTS; i++) {
         if (!g_clients[i].active || g_clients[i].sock == INVALID_SOCKET) continue;
+        if (g_mode == STREAM_MODE_WEBRTC && webrtc_peer_is_open(i)) continue;
         if (sock_send_all(g_clients[i].sock, hdr, hlen) < 0 || sock_send_all(g_clients[i].sock, payload, len) < 0) {
             closesocket(g_clients[i].sock);
             g_clients[i].sock = INVALID_SOCKET;
@@ -221,7 +227,7 @@ static int ws_broadcast_bin(const uint8_t *payload, size_t len) {
         }
     }
     plat_mutex_unlock(&g_send_lock);
-    return 0;
+    return dropped;
 }
 
 // ---- Embedded Browser Client HTML5 (WebCodecs VP8 + Opus + Gamepad API + Keyboard)
@@ -306,6 +312,8 @@ static const char k_html_page[] =
 "pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});"
 "pc.onicecandidate=e=>{if(e.candidate&&ws&&ws.readyState===1)"
 "ws.send(JSON.stringify({type:'candidate',candidate:e.candidate.candidate,mid:e.candidate.sdpMid||'0'}));};"
+"pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed'||pc.connectionState==='closed')"
+"{statEl.textContent='Connected as Player '+pnum+' (WebSocket fallback)';}};"
 "pc.ondatachannel=ev=>{"
 "const dc=ev.channel;dc.binaryType='arraybuffer';"
 "if(dc.label==='media'){dc.onopen=()=>{statEl.textContent='Connected as Player '+pnum+' (WebRTC UDP)';};"
@@ -361,7 +369,7 @@ static const char k_html_page[] =
 "const buf=new ArrayBuffer(13),dv=new DataView(buf);"
 "dv.setUint8(0,0x11);dv.setUint32(1,b>>>0,true);dv.setInt16(5,lx,true);dv.setInt16(7,ly,true);dv.setInt16(9,rx,true);dv.setInt16(11,ry,true);"
 "if(dcIn&&dcIn.readyState==='open')dcIn.send(buf);"
-"else if(!useRtc&&ws&&ws.readyState===1)ws.send(buf);},8);"
+"else if(ws&&ws.readyState===1)ws.send(buf);},8);"
 "setInterval(()=>{if(ws&&ws.readyState===1)ws.send('{\"type\":\"ping\"}');},25000);"
 "connect();"
 "</script></body></html>";
