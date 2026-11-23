@@ -230,6 +230,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
+    case WM_SYSKEYDOWN:
+        if (w == VK_F4 && (l & (1 << 29)) && !(l & (1 << 30))) {
+            PostMessageW(h, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        break;
     case WM_KEYDOWN:
         if (w == VK_F12 && !(l & (1 << 30))) vk_dump_request(), diag_watch_key();   // MTF_DUMP=key / MTF_WATCH_KEY
         if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
