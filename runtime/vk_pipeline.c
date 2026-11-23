@@ -164,10 +164,9 @@ static void cache_path_init(void) {
 static void cache_load(VkCtx *c) {
     cache_path_init();
     const char *pc_cfg = cfg_get("MTF_VK_PIPE_CACHE");
-    int use_cache = (pc_cfg && *pc_cfg) ? strcmp(pc_cfg, "0") != 0 : (c->props.vendorID != 0x10de);
-    if (!use_cache) {
+    if (pc_cfg && !strcmp(pc_cfg, "0")) {
         P.cache = VK_NULL_HANDLE;
-        rt_log("vk_pipeline: VkPipelineCache disabled on NVIDIA (MTF_VK_PIPE_CACHE=1 overrides)");
+        rt_log("vk_pipeline: VkPipelineCache disabled (MTF_VK_PIPE_CACHE=0)");
         return;
     }
     void *data = NULL;
