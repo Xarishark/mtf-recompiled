@@ -163,6 +163,13 @@ static void cache_path_init(void) {
 // Cache data whose header names another device or driver is dropped before Vulkan sees it.
 static void cache_load(VkCtx *c) {
     cache_path_init();
+    const char *pc_cfg = cfg_get("MTF_VK_PIPE_CACHE");
+    int use_cache = (pc_cfg && *pc_cfg) ? strcmp(pc_cfg, "0") != 0 : (c->props.vendorID != 0x10de);
+    if (!use_cache) {
+        P.cache = VK_NULL_HANDLE;
+        rt_log("vk_pipeline: VkPipelineCache disabled on NVIDIA (MTF_VK_PIPE_CACHE=1 overrides)");
+        return;
+    }
     void *data = NULL;
     size_t size = 0;
     FILE *f = P.cache_path[0] ? fopen(P.cache_path, "rb") : NULL;
