@@ -52,6 +52,7 @@ void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride);
 void stream_host_push_audio(const float *pcm_interleaved, uint32_t frames, int channels, int rate);
 int stream_host_remote_connected(int player);
 int stream_host_remote_poll(int player, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
+int stream_host_pop_toast(int *player, int *connected);
 
 #ifdef __cplusplus
 }

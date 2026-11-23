@@ -37,6 +37,34 @@ typedef struct {
 
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
 static PlatMutex g_send_lock = PLAT_MUTEX_INIT;
+
+typedef struct { int player, connected; } StreamToast;
+static StreamToast g_toast_q[16];
+static unsigned g_toast_head = 0, g_toast_tail = 0;
+
+static void push_toast(int player, int connected) {
+    plat_mutex_lock(&g_lock);
+    unsigned next = (g_toast_tail + 1) % 16;
+    if (next != g_toast_head) {
+        g_toast_q[g_toast_tail] = (StreamToast){player, connected};
+        g_toast_tail = next;
+    }
+    plat_mutex_unlock(&g_lock);
+}
+
+int stream_host_pop_toast(int *player, int *connected) {
+    plat_mutex_lock(&g_lock);
+    if (g_toast_head == g_toast_tail) {
+        plat_mutex_unlock(&g_lock);
+        return 0;
+    }
+    StreamToast t = g_toast_q[g_toast_head];
+    g_toast_head = (g_toast_head + 1) % 16;
+    plat_mutex_unlock(&g_lock);
+    if (player) *player = t.player;
+    if (connected) *connected = t.connected;
+    return 1;
+}
 static volatile int g_running = 0;
 static volatile int g_state = STREAM_STATE_OFF;
 static volatile int g_mode = STREAM_MODE_CLOUDFLARE;
@@ -491,6 +519,7 @@ static DWORD WINAPI ws_client_thread(LPVOID param) {
     g_clients[slot].active = 0;
     g_clients[slot].buttons = 0;
     plat_mutex_unlock(&g_lock);
+    push_toast(slot + 2, 0);
     rt_log("stream: Player %d disconnected from browser", slot + 2);
     return 0;
 }
@@ -582,6 +611,7 @@ static void handle_http_conn(SOCKET s) {
         g_clients[slot].need_keyframe = 1;
         g_clients[slot].last_input_ns = plat_now_ns();
         plat_mutex_unlock(&g_lock);
+        push_toast(slot + 2, 1);
         rt_log("stream: browser connected as Player %d", slot + 2);
         HANDLE th = CreateThread(NULL, 0, ws_client_thread, (LPVOID)(intptr_t)slot, 0, NULL);
         if (th) CloseHandle(th);

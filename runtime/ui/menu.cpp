@@ -1429,12 +1429,67 @@ static void update_toast_draw(const MenuTarget *t, float scale) {
     ImGui::PopStyleVar();
 }
 
+static uint64_t g_mp_toast_start_ns = 0;
+static int g_mp_toast_player = 0;
+static int g_mp_toast_conn = 0;
+static bool g_mp_toast_on = false;
+
+static bool mp_toast_active(void) {
+    int p = 0, conn = 0;
+    while (stream_host_pop_toast(&p, &conn)) {
+        g_mp_toast_player = p;
+        g_mp_toast_conn = conn;
+        g_mp_toast_start_ns = plat_now_ns();
+        g_mp_toast_on = true;
+    }
+    return g_mp_toast_on;
+}
+
+static void mp_toast_draw(const MenuTarget *t, float scale) {
+    if (!g_mp_toast_on) return;
+    uint64_t now = plat_now_ns();
+    double elapsed = (double)(now - g_mp_toast_start_ns) / 1e9;
+    const double t_in = 0.25, t_hold = 3.0, t_out = 0.35;
+    const double total = t_in + t_hold + t_out;
+    if (elapsed >= total) {
+        g_mp_toast_on = false;
+        return;
+    }
+    float k = 1.0f;
+    if (elapsed < t_in) {
+        float u = (float)(elapsed / t_in);
+        k = 1.0f - (1.0f - u) * (1.0f - u);
+    } else if (elapsed > t_in + t_hold) {
+        float u = (float)((elapsed - (t_in + t_hold)) / t_out);
+        k = 1.0f - u * u;
+    }
+    float y_off = update_toast_active() ? 48.0f : 0.0f;
+    float y = (-50.0f + (64.0f + y_off) * k) * scale;
+    ImVec4 col = g_mp_toast_conn ? ImVec4(0.35f, 0.88f, 0.48f, 1.0f) : ImVec4(0.95f, 0.50f, 0.32f, 1.0f);
+    ImGui::SetNextWindowPos(ImVec2((float)t->width * 0.5f, y), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.88f * k);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, k);
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(col.x, col.y, col.z, 0.9f * k));
+    ImGui::Begin("##mp_toast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                            ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                                            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+    char msg[96];
+    snprintf(msg, sizeof msg, menu_text(g_mp_toast_conn ? UI_MENU_PLAYER_CONNECTED : UI_MENU_PLAYER_DISCONNECTED),
+             g_mp_toast_player);
+    ImGui::TextColored(col, "%s", msg);
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     update_check_start();
     if (shot) *shot = NULL;
     if (!g_test.parsed) test_parse();
     if (g_test.next_set < g_test.n_sets && frame >= g_test.sets[g_test.next_set].frame) test_apply_sets(frame);
     perf_tick(plat_now_ns(), t);
+    bool mp_toast = mp_toast_active();
     bool open = g_open.load(std::memory_order_relaxed);
     if (!open) {
         if (g_save_pending) g_save_pending = opt_save_tick(1);   // closed: the last change goes to mtf.ini now
@@ -1444,7 +1499,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
             g_tab_request = 0;
             set_open(1);
             open = true;
-        } else if (!g_perf_mode && !update_toast_active()) {
+        } else if (!g_perf_mode && !update_toast_active() && !mp_toast) {
             return 0;
         }
     }
@@ -1500,6 +1555,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     if (open) layout_menu(t->width, t->height, scale);
     perf_draw(t, scale);
     update_toast_draw(t, scale);
+    mp_toast_draw(t, scale);
     ImGui::Render();
     if (open) g_save_pending = opt_save_tick(0);
     g_cost_ns += plat_now_ns() - t0;
