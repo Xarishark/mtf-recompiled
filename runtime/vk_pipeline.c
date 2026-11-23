@@ -798,7 +798,7 @@ static uint32_t *spirv_rewrite_inputs(const uint32_t *w, uint64_t n, uint32_t at
     if (!attr_type || n < 5) return NULL;
     uint32_t orig_bound = w[3];
     if (orig_bound >= (1u << 22)) return NULL;
-    uint64_t fn_at = 0;
+    uint64_t fn_at = 0, var_at = 0;
     uint32_t bound = orig_bound, scalar[3] = {0, 0, 0};
     struct { uint32_t id, comp, count; } vec[64];
     struct { uint32_t id, type; } ptr[64];
@@ -829,8 +829,11 @@ static uint32_t *spirv_rewrite_inputs(const uint32_t *w, uint64_t n, uint32_t at
             pointee[a[0]] = a[2];
             if (a[1] == SPV_SC_INPUT && nptr < 64) ptr[nptr].id = a[0], ptr[nptr++].type = a[2];
         } else if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == SPV_SC_INPUT && a[1] < orig_bound) {
+            if (!var_at && !fn_at) var_at = i;
             int l = loc_of[a[1]];
             if (l >= 0 && ((attr_type >> (2 * l)) & 3)) var_t[a[1]] = (uint8_t)((attr_type >> (2 * l)) & 3);
+        } else if (op == SPV_OP_VARIABLE && !var_at && !fn_at) {
+            var_at = i;
         } else if (op == SPV_OP_FUNCTION && !fn_at) {
             fn_at = i;
         }
@@ -909,16 +912,17 @@ static uint32_t *spirv_rewrite_inputs(const uint32_t *w, uint64_t n, uint32_t at
     uint64_t total = n + (uint64_t)nt + (uint64_t)n_loads * 4;
     o = malloc(total * 4);
     if (!o) goto out;
+    uint64_t ins_at = var_at ? var_at : fn_at;
     uint32_t *p = o;
     memcpy(p, w, 5 * 4), p += 5;
     for (uint64_t i = 5; i < fn_at;) {
+        if (i == ins_at && nt) memcpy(p, types, (size_t)nt * 4), p += nt;
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         memcpy(p, w + i, len * 4);
         if (op == SPV_OP_VARIABLE && len >= 4 && w[i + 2] < orig_bound && ptr_new[w[i + 2]])
             p[1] = ptr_new[w[i + 2]];
         p += len, i += len;
     }
-    if (nt) memcpy(p, types, (size_t)nt * 4), p += nt;
     for (uint64_t i = fn_at; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if ((op == SPV_OP_ACCESS_CHAIN || op == SPV_OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 &&
@@ -1650,6 +1654,7 @@ static int mid_stages(const VkPipeState *s, const GfxShader *mid[3], uint32_t of
 }
 
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
+    if (!l || !l->layout || k->n_color > 8) return VK_NULL_HANDLE;
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
@@ -1768,7 +1773,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                                  .depthClampEnable = k->clamp, .polygonMode = (VkPolygonMode)k->poly_mode,
                                                  .lineWidth = 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples,
+                                               .rasterizationSamples = k->samples ? (VkSampleCountFlagBits)k->samples : VK_SAMPLE_COUNT_1_BIT,
                                                .alphaToCoverageEnable = k->a2c};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
                                                 .maxDepthBounds = 1.0f};
@@ -1888,7 +1893,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
                                                  .pNext = P.pv_last ? &pvs : NULL, .depthClampEnable = k->clamp,
                                                  .polygonMode = (VkPolygonMode)k->poly_mode, .lineWidth = 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples,
+                                               .rasterizationSamples = k->samples ? (VkSampleCountFlagBits)k->samples : VK_SAMPLE_COUNT_1_BIT,
                                                .alphaToCoverageEnable = k->a2c};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
                                                 .maxDepthBounds = 1.0f};
