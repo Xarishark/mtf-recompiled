@@ -165,14 +165,14 @@ static void ws_send_frame(SOCKET s, uint8_t opcode, const uint8_t *payload, size
     plat_mutex_unlock(&g_send_lock);
 }
 
-static void ws_broadcast_bin(const uint8_t *payload, size_t len) {
+static int ws_broadcast_bin(const uint8_t *payload, size_t len) {
     if (g_mode == STREAM_MODE_WEBRTC) {
-        webrtc_broadcast_media(payload, len);
+        int dropped = webrtc_broadcast_media(payload, len);
         int any = 0;
         for (int i = 0; i < STREAM_MAX_CLIENTS; i++)
             if (webrtc_peer_is_open(i)) { any = 1; break; }
         if (any) g_bytes_sent += len;
-        return;
+        return dropped;
     }
     uint8_t hdr[10];
     size_t hlen = 0;
@@ -202,6 +202,7 @@ static void ws_broadcast_bin(const uint8_t *payload, size_t len) {
         }
     }
     plat_mutex_unlock(&g_send_lock);
+    return 0;
 }
 
 // ---- Embedded Browser Client HTML5 (WebCodecs VP8 + Opus + Gamepad API + Keyboard)
@@ -254,7 +255,7 @@ static const char k_html_page[] =
 "const sw=f.displayWidth,sh=f.displayHeight;"
 "if(cropMode===0){if(cv.width!==sw||cv.height!==sh){cv.width=sw;cv.height=sh;}ctx.drawImage(f,0,0,sw,sh);}"
 "else{const hw=(sw/2)|0,sx=cropMode===1?(sw-hw):0;if(cv.width!==hw||cv.height!==sh){cv.width=hw;cv.height=sh;}ctx.drawImage(f,sx,0,hw,sh,0,0,hw,sh);}"
-"f.close();},error:e=>console.error('vdec',e)});"
+"f.close();},error:e=>{console.error('vdec',e);setTimeout(()=>{initDecoders();if(ws&&ws.readyState===1)ws.send('{\"type\":\"kf\"}');},50);}});"
 "vdec.configure({codec:'vp8',optimizeForLatency:true,colorSpace:{primaries:'bt709',transfer:'iec61966-2-1',matrix:'bt470bg',fullRange:true}});"
 "if(adec)try{adec.close()}catch(_){}"
 "if('AudioDecoder'in window){adec=new AudioDecoder({output:ad=>{"
@@ -342,6 +343,7 @@ static const char k_html_page[] =
 "dv.setUint8(0,0x11);dv.setUint32(1,b>>>0,true);dv.setInt16(5,lx,true);dv.setInt16(7,ly,true);dv.setInt16(9,rx,true);dv.setInt16(11,ry,true);"
 "if(dcIn&&dcIn.readyState==='open')dcIn.send(buf);"
 "else if(!useRtc&&ws&&ws.readyState===1)ws.send(buf);},8);"
+"setInterval(()=>{if(ws&&ws.readyState===1)ws.send('{\"type\":\"ping\"}');},25000);"
 "connect();"
 "</script></body></html>";
 
@@ -440,8 +442,14 @@ static DWORD WINAPI ws_client_thread(LPVOID param) {
             ws_send_frame(s, 0xA, buf, (size_t)plen);
             continue;
         }
-        if (opcode == 0x1 && is_rtc) {
-            webrtc_peer_handle_signal(slot, (const char *)buf);
+        if (opcode == 0x1) {
+            if (strstr((const char *)buf, "\"kf\"")) {
+                plat_mutex_lock(&g_lock);
+                g_clients[slot].need_keyframe = 1;
+                plat_mutex_unlock(&g_lock);
+            } else if (is_rtc && !strstr((const char *)buf, "\"ping\"")) {
+                webrtc_peer_handle_signal(slot, (const char *)buf);
+            }
             continue;
         }
         if ((opcode == 0x2 || opcode == 0x0) && plen >= 13 && buf[0] == 0x11) {
@@ -976,14 +984,15 @@ void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride) {
             cfg.g_h = (unsigned)h;
             cfg.g_timebase.num = 1;
             cfg.g_timebase.den = 60;
-            cfg.rc_target_bitrate = 4000;
+            cfg.rc_target_bitrate = 2400;
             cfg.rc_end_usage = VPX_CBR;
             cfg.rc_buf_sz = 100;
             cfg.rc_buf_initial_sz = 50;
             cfg.rc_buf_optimal_sz = 50;
             cfg.g_lag_in_frames = 0;
+            cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
             cfg.kf_mode = VPX_KF_AUTO;
-            cfg.kf_max_dist = 60;
+            cfg.kf_max_dist = 45;
             cfg.g_threads = 4;
             if (vpx_codec_enc_init(&g_vpx, vpx_codec_vp8_cx(), &cfg, 0) == VPX_CODEC_OK &&
                 vpx_img_alloc(&g_vpx_img, VPX_IMG_FMT_I420, (unsigned)w, (unsigned)h, 1)) {
@@ -1021,7 +1030,12 @@ void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride) {
                     memcpy(msg + 4, &hh, 2);
                     memcpy(msg + 6, &ts, 4);
                     memcpy(msg + 10, pkt->data.frame.buf, sz);
-                    ws_broadcast_bin(msg, 10 + sz);
+                    if (ws_broadcast_bin(msg, 10 + sz)) {
+                        plat_mutex_lock(&g_lock);
+                        for (int i = 0; i < STREAM_MAX_CLIENTS; i++)
+                            if (g_clients[i].active) g_clients[i].need_keyframe = 1;
+                        plat_mutex_unlock(&g_lock);
+                    }
                     free(msg);
                     g_frames_sent++;
                 }

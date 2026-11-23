@@ -4,6 +4,7 @@
 
 #include <rtc/rtc.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -142,8 +143,7 @@ int webrtc_peer_start(int slot, const char *stun_url, const char *turn_url,
     });
 
     p.pc->onStateChange([slot](rtc::PeerConnection::State state) {
-        if (state == rtc::PeerConnection::State::Disconnected ||
-            state == rtc::PeerConnection::State::Failed ||
+        if (state == rtc::PeerConnection::State::Failed ||
             state == rtc::PeerConnection::State::Closed) {
             WebRtcStateCb cb = nullptr;
             void *usr = nullptr;
@@ -157,11 +157,15 @@ int webrtc_peer_start(int slot, const char *stun_url, const char *turn_url,
         }
     });
 
+    rtc::DataChannelInit init_media;
+    init_media.reliability.unordered = false;
+    init_media.reliability.maxPacketLifeTime = std::chrono::milliseconds(150);
+
     rtc::DataChannelInit init_unord;
     init_unord.reliability.unordered = true;
     init_unord.reliability.maxRetransmits = 0;
 
-    p.dc_media = p.pc->createDataChannel("media", init_unord);
+    p.dc_media = p.pc->createDataChannel("media", init_media);
     p.dc_media->onOpen([slot]() {
         WebRtcStateCb cb = nullptr;
         void *usr = nullptr;
@@ -255,8 +259,9 @@ int webrtc_peer_is_open(int slot) {
     return g_peers[slot].active && g_peers[slot].media_open ? 1 : 0;
 }
 
-void webrtc_broadcast_media(const uint8_t *data, size_t len) {
-    if (!data || !len) return;
+int webrtc_broadcast_media(const uint8_t *data, size_t len) {
+    if (!data || !len) return 0;
+    const bool is_video_delta = (len >= 2 && data[0] == 1 && data[1] == 0);
     std::shared_ptr<rtc::DataChannel> dcs[kMaxPeers];
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -265,12 +270,19 @@ void webrtc_broadcast_media(const uint8_t *data, size_t len) {
                 dcs[i] = g_peers[i].dc_media;
         }
     }
+    int dropped = 0;
     for (int i = 0; i < kMaxPeers; i++) {
         if (!dcs[i]) continue;
         try {
-            if (dcs[i]->isOpen())
+            if (dcs[i]->isOpen()) {
+                if (is_video_delta && dcs[i]->bufferedAmount() > 192 * 1024) {
+                    dropped = 1;
+                    continue;
+                }
                 dcs[i]->send(reinterpret_cast<const rtc::byte *>(data), len);
+            }
         } catch (...) {
         }
     }
+    return dropped;
 }

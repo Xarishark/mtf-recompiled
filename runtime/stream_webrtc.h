@@ -21,7 +21,8 @@ int webrtc_peer_start(int slot, const char *stun_url, const char *turn_url,
 void webrtc_peer_handle_signal(int slot, const char *json_msg);
 void webrtc_peer_close(int slot);
 int webrtc_peer_is_open(int slot);
-void webrtc_broadcast_media(const uint8_t *data, size_t len);
+// Returns 1 if any peer dropped a video delta frame due to DataChannel congestion.
+int webrtc_broadcast_media(const uint8_t *data, size_t len);
 
 #ifdef __cplusplus
 }
