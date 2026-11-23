@@ -193,25 +193,25 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Root Cause:** `runtime/main.c` parses `--seconds <N>` on the command line rather than `TOTK_SECONDS` / `MTF_SECONDS`.
 - **Fix / Usage:** Pass `--seconds <N>` directly on the CLI (`.\build\v327680_stage2\mtf-stage2.exe --seconds 8`), which exits cleanly with status `0` after `N` seconds.
 
-## 23. Issue #14 — Cena 3D lavada / esbranquiçada em SDR
-- **Symptom:** Na quadra de treino em SDR (`TOTK_HDR=0`), a cena 3D (grama, Mario, tendas, céu) aparece lavada/esbranquiçada, enquanto a UI 2D e o estádio ao fundo à direita têm contraste normal.
-- **Root Cause:** O passe que gera a 3D LUT de perspectiva aérea `8x8x64` (`0x804bff0000`, `draws 64`, `layers 0+64`, `gs=NULL`) usa `vs f444e5b3aba250a3` sem `BuiltIn Layer`. Todos os 64 draws sobrescrevem apenas a `slice 0` (deixando `slice 0` com o valor do céu distante `[52, 145, 255]` e `slices 1..63` em `[0, 0, 0]`). O `pass 0013` (`fs 2795532640a31474`) então aplica a névoa da `slice 0` sobre toda a geometria próxima à câmera, lavando a quadra e os personagens.
-- **Fix:** Ignorar os draws do passe `8x8x64` em `runtime/vk_exec_draw.c` (`prepare_draw_impl`), mantendo o volume em `(0, 0, 0)` sem névoa espúria em primeiro plano.
-- **Verification:** Captura automatizada em gameplay (`work/practice.script`, `TOTK_DUMP=650` em `work/dump_nofog/pass_0034_t0_1706x960_43_rgba8srgb.png`) validada com cores, sombras e contraste idênticos à referência do Switch 2.
+## 23. Issue #14 — Washed-Out / Whitish 3D Scene in SDR
+- **Symptom:** On the practice court in SDR (`TOTK_HDR=0`), the 3D scene (grass, Mario, tents, sky) appears washed out/whitish, while the 2D UI and the background stadium on the right have normal contrast.
+- **Root Cause:** The pass generating the `8x8x64` aerial perspective 3D LUT (`0x804bff0000`, `draws 64`, `layers 0+64`, `gs=NULL`) uses `vs f444e5b3aba250a3` without `BuiltIn Layer`. All 64 draws overwrite only `slice 0` (leaving `slice 0` with the distant sky value `[52, 145, 255]` and `slices 1..63` at `[0, 0, 0]`). `pass 0013` (`fs 2795532640a31474`) then applies `slice 0`'s fog over all geometry near the camera, washing out the court and characters.
+- **Fix:** Skip draws of the `8x8x64` pass in `runtime/vk_exec_draw.c` (`prepare_draw_impl`), keeping the volume at `(0, 0, 0)` without spurious foreground fog.
+- **Verification:** Automated gameplay capture (`work/practice.script`, `TOTK_DUMP=650`) validated with colors, shadows, and contrast matching the Switch 2 reference.
 
-## 24. Issue #15 — Nuvens / céu em excesso comparado à referência do Switch 2
-- **Symptom:** Após corrigir as cores na Issue #14, o céu na quadra de treino apresenta excesso de nuvens/cobertura branca cobrindo o fundo azul, enquanto na referência do Switch 2 o céu é predominantemente azul com poucas nuvens à mostra.
-- **Next step:** Inspecionar o passe de céu/nuvens (`pass 0009` / `pass 0012` `341x480 rgba16f`) e verificar se a diferença vem de `TCS`/`TES` (cloud sea tessellation) ou do shader/textura de nuvens.
+## 24. Issue #15 — Excessive Clouds / Sky Coverage vs. Switch 2 Reference
+- **Symptom:** After fixing colors in Issue #14, the sky on the practice court shows excessive white cloud coverage over the blue background, whereas the Switch 2 reference is predominantly blue with fewer clouds visible.
+- **Next step:** Inspect the sky/cloud pass (`pass 0009` / `pass 0012` `341x480 rgba16f`) and verify whether the difference comes from `TCS`/`TES` (cloud sea tessellation) or from the cloud shader/texture.
 
-## 25. Issue #16 — Black box stuttering around characters when playing
-- **Symptom:** Caixas pretas intermitentes (black box stuttering) ao redor dos personagens durante o gameplay (facilmente reproduzível no tutorial após fazer um saque e andar pela quadra), além da sombra do Mario dando stuttering no tutorial.
-- **Diagnostics:** Adicionada a hotkey `F7` (`runtime/gfx_window_win.c`, `runtime/vk_dump.c`) para ligar/desligar captura contínua de logs (`[host]` + resumo de passes e frames em `logs/capture_<n>.log`) sem readback de PNG.
-- **Next step:** Capturar logs com `F7` durante o stuttering da sombra e das caixas pretas ao redor dos personagens e também testar `X` (Toss) + movimentação em `INPUT_SCRIPT`.
+## 25. Issue #16 — Black Box Stuttering Around Characters During Gameplay
+- **Symptom:** Intermittent black boxes around characters during gameplay (reproducible in the tutorial after serving and walking around the court), plus Mario's shadow stuttering in the tutorial.
+- **Diagnostics:** Added `F7` hotkey (`runtime/gfx_window_win.c`, `runtime/vk_dump.c`) to toggle continuous log capture (`[host]` + pass/frame summaries in `logs/capture_<n>.log`) without PNG readback.
+- **Next step:** Capture logs with `F7` during shadow/black-box stuttering and test `X` (Toss) + movement in `INPUT_SCRIPT`.
 
-## 26. `MTF_FPS_LIMIT > 60` acelera a simulação do jogo (Fork 1:1)
-- **Symptom:** Com `VK_PRESENT=immediate` e `MTF_FPS_LIMIT=144` em partida real, os personagens se movem mais rápido (simulação acelerada em ~2.4x) em vez de manter velocidade `1x` com mais quadros.
-- **Root Cause:** Sobrescrever apenas o ponteiro global de FPS alvo (`0x70035611b8` lido por `f_7003061ab8` em `nro0`) libera o pacer `nn::os::SleepThread` para rodar a 144/1900+ FPS, mas a lógica/física do jogo ainda usa passo fixo de `1/60s` por frame.
-- **Fix (Planned):** Localizar o delta-time de simulação com `MTF_SCAN_DT` + análise de `nro0` para patch de `REALTIME` (como `frame_rate.c` do `dkb-pc-recomp`) e/ou portar Frame Generation (`vk_framegen.c`, `Inhale` Auto mode) mantendo simulação em `60 Hz`.
+## 26. `MTF_FPS_LIMIT > 60` Accelerates Game Simulation (1:1 Fork)
+- **Symptom:** With `VK_PRESENT=immediate` and `MTF_FPS_LIMIT=144` in a real match, characters move faster (~2.4x simulation speed) instead of keeping `1x` speed with more frames.
+- **Root Cause:** Overriding only the global target FPS pointer (`0x70035611b8` read by `f_7003061ab8` in `nro0`) uncaps the `nn::os::SleepThread` pacer to 144/1900+ FPS, while game logic/physics still uses a fixed `1/60s` step per frame.
+- **Fix (Implemented via Frame Gen):** Keep simulation at `60 Hz` and achieve `120–240 FPS` at `1x` real speed via optical-flow Frame Generation (`MTF_FRAMEGEN` in `runtime/vk_framegen.c`). Native delta-time decoupling remains optional/future.
 
 ## 27. Lightning Racket `VK_ERROR_DEVICE_LOST` (`0fa55a01f31ef9a6` / `SSign` on Blackwell `610.88`)
 - **Symptom:** Starting a match with the Lightning Racket froze and crashed with `VK_ERROR_DEVICE_LOST (-4)` (`instruction pointer (invalid) at 0x200xxxxxx`) on RTX 5070 Ti (driver `610.88`).
@@ -219,14 +219,14 @@ This catalog tracks every *Mario Tennis Fever*-specific technical obstacle using
 - **Fix:** `spirv_fixup` in `runtime/vk_pipeline.c` rewrites `GLSL.std.450` `SSign(int32)` to `SClamp(x, -1, 1)` (`ExtInst 45`).
 - **Verification:** Standalone Vulkan repro switched from `vkQueueWaitIdle: -4` to `0`, and Lightning Racket match ran cleanly.
 
-## 28. `nvoglv64.dll+0x10ea90` Access Violation on 3rd–4th Match (`pipe_worker`)
-- **Symptom:** After 3–4 consecutive matches with different characters/rackets, `pipe_worker` crashed in `create_graphics` (`vkCreateGraphicsPipelines`, `runtime/vk_pipeline.c:1760`) at `nvoglv64.dll+0x10ea90` reading `0x8`, even with `pipeline-cache.bin` deleted.
-- **Root Cause:** NVIDIA `610.88` driver crash when building graphics pipelines concurrently on background `pipe_worker` threads without GPL (`!P.gpl`).
-- **Fix:** Default `MTF_PIPE_SYNC=1` in `vk_pipeline_async_enable` when `vendorID == 0x10de && !P.gpl` (`MTF_PIPE_SYNC=0` overrides).
-- **Verification:** User verified 10 consecutive matches with distinct characters and rackets without crashing.
+## 28. `nvoglv64.dll+0x10ea90` Access Violation in Character Select / Free Play (`spirv_rewrite_inputs`)
+- **Symptom:** Navigating characters in Free Play or after several matches crashed in `create_graphics` / `lib_create` (`vkCreateGraphicsPipelines`, `runtime/vk_pipeline.c`) at `nvoglv64.dll+0x10ea90` reading `0x8`.
+- **Root Cause:** When `k->attr_type != 0` (e.g., `attr=0xc0`), `spirv_rewrite_inputs` in `runtime/vk_pipeline.c` emitted newly generated `OpTypeInt` / `OpTypeVector` / `OpTypePointer` instructions at `fn_at` (`OpFunction`) — **after** global `OpVariable` declarations that referenced them, producing an illegal SPIR-V forward type reference that crashed `nvoglv64.dll`'s SPIR-V parser.
+- **Fix:** Updated `spirv_rewrite_inputs` (`6abc64f`) to insert newly created `OpType*` definitions at `var_at` (before the first `OpVariable`), and kept synchronous pipeline builds on NVIDIA (`5076a61`) with `VkPipelineCache` enabled (`153d2f6`).
+- **Verification:** Passing through all characters in Free Play and boot prewarm (`1,389` pipelines, `0` failed) run cleanly without crashing.
 
-## 29. Crash na seleção de personagens com `MTF_REPLAY_THREADS=6` (arrays `static` em `vk_exec_draw.c`)
-- **Symptom:** Ao entrar na tela de seleção de personagens (primeiro passe com `>= 256` draws), logo após `vk: 5 replay slice workers started` no `mtf.log`, o jogo fechava imediatamente.
-- **Root Cause:** Em `runtime/vk_exec_draw.c`, os arrays temporários `static RsRange tmp[MAX_DESC]` (`rs_list`), `static VkWriteDescriptorSet w[MAX_BINDINGS]`, `static VkDescSlot d[MAX_DESC]` e `static VkBufferView bv[MAX_DESC]` (`bind_resources`), além de `wait_frame`/`wait_left_ns` e chamadas de `vk_dlaa_draw` / `mvobj_draw`, eram compartilhados globalmente entre as 6 threads de fatias, causando corrupção concorrente de descritores.
-- **Fix:** Movidos `rs_tmp`, `bind_w`, `bind_d`, `bind_bv`, `wait_frame` e `wait_left_ns` para `DrawCtx` por thread; `vk_dlaa_draw` passou a rodar na coleta (`par_take`) em ordem de draw, e `vk_dlaa_draw`/`mvobj_draw` dentro de `prepare_draw`/`op_draw_idx` só rodam quando `!ex->draw`.
-- **Verification:** Rebuild limpo (`0` erros), smoke test de boot OK (`alive=True`), `python tools/check_content.py` (`0` violações); auditados também `vk_pipeline_set_dynamic_delta` (`DC` -> `_Thread_local`), `gpl_link` (`cache_lock`), `vk_exec_oq_draw` (`oq_outside` guard), `repeat_stats` (`!ex->draw`) e `vk_mem_count` (`count_quiet`).
+## 29. Character Select Crash with `MTF_REPLAY_THREADS=6` (`static` Scratch Arrays in `vk_exec_draw.c`)
+- **Symptom:** Entering the character selection screen (first pass with `>= 256` draws), right after `vk: 5 replay slice workers started` in `mtf.log`, the game exited immediately.
+- **Root Cause:** In `runtime/vk_exec_draw.c`, temporary `static` arrays (`rs_list`, `bind_resources`), `wait_frame`/`wait_left_ns`, and `vk_dlaa_draw` / `mvobj_draw` calls were shared globally across the 6 slice worker threads, causing concurrent descriptor corruption.
+- **Fix:** Moved `rs_tmp`, `bind_w`, `bind_d`, `bind_bv`, `wait_frame`, and `wait_left_ns` into per-thread `DrawCtx`; moved `vk_dlaa_draw` to collection order (`par_take`) and gated `vk_dlaa_draw`/`mvobj_draw` inside `prepare_draw`/`op_draw_idx` on `!ex->draw`.
+- **Verification:** Clean rebuild (`0` errors), boot smoke test (`alive=True`), `python tools/check_content.py` (`0` violations), and audited `DC` (`_Thread_local`), `cache_lock`, `oq_outside`, `repeat_stats`, and `count_quiet`.

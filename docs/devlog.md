@@ -184,7 +184,7 @@
   - User verified Lightning Racket match runs without freezing/crashing, and `MTF_PIPE_SYNC=1` passed 10 consecutive matches with distinct characters and rackets.
   - Rebuilt `build/fork/bin/mtf-recomp.exe` (`0` errors) and verified `python tools/check_content.py` (`0` violations).
 
-### 2026-11-20 — Tier 2 / Etapa 2.1: Memória, VRAM Headroom, Lazy Heap & Sparse Mirror Copy
+### 2026-11-20 — Tier 2 / Stage 2.1: Memory, VRAM Headroom, Lazy Heap & Sparse Mirror Copy
 - **Changes:**
   - `runtime/vk_headroom.c`, `CMakeLists.txt`, `runtime/gfx_stubs.c`, `runtime/cfg.c`: Ported `vk_headroom.c` (`MTF_VRAM_HEADROOM=1` default) from `dkb-pc-recomp` (`4e7f9b2`, MIT) to pre-allocate the next 256 MiB VMA block per memory type in background and back off above 85% of VRAM budget.
   - `runtime/platform/platform.h`, `runtime/platform/win32.c`, `runtime/host.h`, `runtime/memory.c`, `runtime/romfs.c`, `runtime/fs_host.c`, `runtime/vk_memory.c`, `runtime/cfg.c`: Ported `MTF_HEAP_LAZY=1` (default) via `fault_veh` 64 KiB on-demand commit + `mem_touch` before host file reads / pool imports.
@@ -199,7 +199,7 @@
   - A/B boot check for `HEAP_LAZY`: `HEAP_LAZY=0` (`5072 MB` at 6s) vs `HEAP_LAZY=1` (`5079.3 MB` at 6s); commit savings take effect when guest expands heap via `svcSetHeapSize`.
   - Verified `python tools/check_content.py` (`0` violations).
 
-### 2026-11-21 — Tier 2 / Etapa 2.2: Replay Paralelo Multi-Thread (`MTF_REPLAY_THREADS`)
+### 2026-11-21 — Tier 2 / Stage 2.2: Multi-Threaded Parallel Replay (`MTF_REPLAY_THREADS`)
 - **Changes:**
   - `runtime/vk_exec.c`, `runtime/vk_exec.h`, `runtime/cfg.c`: Ported parallel pass slicing (`MTF_REPLAY_THREADS`, default `6` on >=12 logical CPUs / `4` on >=8 CPUs / `0` on AMD) from `dkb-pc-recomp` (`4e7f9b2`, MIT). Large passes (`>= 256` draws) are sliced into secondary command buffers (`48..1024` draws) and recorded across worker threads in parallel, then executed via `vkCmdExecuteCommands`.
   - `runtime/vk_exec_draw.c`: Isolated per-thread draw/memo/descriptor state into `DrawCtx` (`tls_dc` + `vk_exec_draw_slice_enter`, `vk_exec_draw_slices_begin`, `vk_exec_draw_slice_ctx`, `vk_exec_draw_slice_view`, `vk_exec_draw_slices_end`, `vk_exec_draw_rebase`) and `PlatOnce` for `dummies_init`, preserving all MTF-specific hooks (ACES HDR, DLAA, breadcrumbs, NVN2).
@@ -212,7 +212,7 @@
   - 6s smoke test (`alive=True`, 0 `FATAL`) confirmed in `build/fork/bin/logs/mtf.log`: `vk: passes of 256 or more draws are recorded in slices of up to 1024 draws into secondary command buffers (MTF_REPLAY_THREADS=6, the default: recorded by that many threads)`.
   - Verified `python tools/check_content.py` (`0` violations).
 
-### 2026-11-21 — Tier 2 / Etapa 2.3: Fragment NaN Guard (`MTF_NAN_GUARD`) & Créditos MIT
+### 2026-11-21 — Tier 2 / Stage 2.3: Fragment NaN Guard (`MTF_NAN_GUARD`) & MIT Credits
 - **Changes:**
   - `runtime/spirv_nan_guard.{c,h}`, `CMakeLists.txt`, `runtime/vk_pipeline.c`, `runtime/cfg.c`: Ported `spirv_nan_guard` (`MTF_NAN_GUARD`, `0|zero|mark`, default `0`) from `dkb-pc-recomp` (`4e7f9b2`, MIT) into `make_module()` to sanitize NaN fragment shader color outputs when enabled.
   - `THIRD_PARTY_NOTICES.md`, `docs/roadmap.md`, `docs/perf-methodology.md`: Consolidated all Tier 2 MIT attributions for `dkb-pc-recomp` (`4e7f9b2`).
@@ -221,7 +221,7 @@
   - 6s smoke test with `MTF_NAN_GUARD=zero` (`alive=True`, 0 `FATAL`) confirmed `[host] vk: NaN guard on fragment outputs: zero (MTF_NAN_GUARD)`.
   - Verified `python tools/check_content.py` (`0` violations).
 
-### 2026-11-21 — Menu `F1`: Remapeamento de Controles (Teclado & Gamepad) + Opções Tier 2
+### 2026-11-21 — `F1` Menu: Control Remapping (Keyboard & Gamepad) + Tier 2 Options
 - **Changes:**
   - `runtime/input_map.{c,h}`, `runtime/input.{c,h}`, `runtime/cfg.c`: Ported full action-to-key/gamepad mapping tables (`MTF_BIND_A..SHAKE`, 2 keyboard slots + gamepad button per action, live reload on `cfg_version()` change) and `input_capture()` / `input_key_char()` / `input_pad_label()`.
   - `runtime/ui/binds_page.{cpp,h}`, `runtime/ui/option_rows.{cpp,h}`, `runtime/ui/menu.cpp`, `runtime/ui_text.{h,c}`, `CMakeLists.txt`: Added **Controller** and **Keyboard** sub-tabs under **Controls** with interactive 5s modal capture, clear (`Delete`/`Backspace`/`Y`), auto-swap notifications, and "Reset button bindings" in EN + PT-BR; exposed `MTF_REPLAY_THREADS`, `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, and `MTF_NAN_GUARD` in **Advanced**.
@@ -257,3 +257,16 @@
   - `runtime/vk_caps.c`, `runtime/vk_pipeline.c`, `runtime/vk_exec.c`: Re-enabled `VK_EXT_graphics_pipeline_library` (`GPL` + `fast-link`) by default and guarded non-GPL NVIDIA fallback paths against multi-threaded `vkCreateGraphicsPipelines` crashes (`nvoglv64.dll+0x10ea90`).
   - `installer/{gui,guilogic,cli,steps}.py`: Passed the installer's selected language (`en` / `pt-BR`) via `--lang` to `Finish.run()` so `mtf.ini` starts with `MENU_LANG` matching the setup language.
   - `VERSION`, `README.md`, `docs/port-status.md`: Bumped to `0.1.1` and documented `F1 -> Cheats`.
+
+
+### 2026-11-23 — `v0.1.2`–`v0.1.4`: RecompLauncher SDK, GitHub Actions Releases, Stream Quality, Update Notifier & `spirv_rewrite_inputs` Fix
+- **Changes:**
+  - `recomplauncher.json`, `installer/{cli,exe_entry,layout}.py`, `runtime/{gfx_present,input}.c`: Added RecompLauncher SDK integration (Levels 1–3, headless `--prepare`, `RECOMPLAUNCHER_MODE=bigpicture` fullscreen, `RECOMPLAUNCHER_PAD` initial button icons) and guarded missing `git` in `dev_layout`.
+  - `.github/workflows/release.yml`, `tools/make_release.py`: Added clean GitHub Actions Windows `--onedir` release workflow (`MTF-Recomp-v<ver>-Windows-x64.zip` trimmed of dev `docs/`/`tests/`/`installer/*.py`, plus `mtf-recomp-<ver>-src.zip`).
+  - `runtime/{stream_webrtc.cpp,stream_host.c,gfx_present.c,cfg.c,ui/menu.cpp}`: Switched WebRTC media DataChannel to ordered partial reliability (`150 ms`), added congestion delta skipping + keyframe recovery, `25s` WS keepalive, automatic WebSocket fallback when UDP is blocked, `Performance`/`Balanced`/`Quality` presets (`STREAM_QUALITY`), and 3s player connect/disconnect toasts.
+  - `runtime/{update_check.h,update_check.c,ui/menu.cpp,ui_text.*}`, `CMakeLists.txt`: Added asynchronous GitHub release checker on boot with one-time 5s top toast (`UPDATE_NOTIFIED_TAG` in `mtf.ini`) and `F1` menu reminder + download button.
+  - `runtime/vk_pipeline.c`: Fixed `spirv_rewrite_inputs` emitting `OpType*` after `OpVariable` (`nvoglv64.dll+0x10ea90` crash in Free Play character select), kept synchronous pipeline builds on NVIDIA, and re-enabled `VkPipelineCache`.
+  - `runtime/gfx_window_win.c`: Added `Alt+F4` (`WM_SYSKEYDOWN`) window close support.
+  - `README.md`, `CONTRIBUTING.md`, `docs/*`: Upgraded README with screenshots (`docs/images/`), copyright notice, AI disclosure, controls, and bug-reporting guide; standardized all `docs/*.md` to English.
+- **Verification:**
+  - `python tools/build_fork.py`, `python -m installer.gui --selftest`, `python tools/check_content.py`, and GitHub Actions release builds (`v0.1.3`, `v0.1.4`) all passed cleanly.

@@ -63,44 +63,44 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 
 Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`).
 
-> **Regra do Pipeline:** Antes de atacar qualquer issue abaixo, consultar [docs/switch2-recomp-rag.md](switch2-recomp-rag.md) para reaproveitar soluções comprovadas (código MIT copiável ou referência clean-room para GPL-3.0).
+> **Pipeline Rule:** Before tackling any issue below, consult [docs/switch2-recomp-rag.md](switch2-recomp-rag.md) to reuse proven solutions (copyable MIT code or clean-room reference for GPL-3.0).
 
-1. **FPS Alto (> 60 FPS) & Frame Generation**
-   - [x] Expor `MTF_FPS_LIMIT` (`30|40|45|60|90|120|144|240|display|unlimited`) no `cfg.c`, menu in-game (`F1`) e pacer de `nro0` (`0x70035611b8`): medido **144 FPS** (`display`) e **~1925 FPS** (`unlimited` na abertura) — útil para benchmark de otimizações.
-   - [x] **FPS > 60 em velocidade real `1x` funciona via Frame Generation (`MTF_FRAMEGEN`):** portado de `mkw-recomp` / `SkyboundTotk` (MIT, `vk_framegen.c` + `fg_*_spv.h`, modos `off|120|monitor|unlimited` com swapchain de 5 imagens em `gfx_present.c` para até `4x` = `240 FPS`). Validado em jogo pelo usuário (`60 FPS` base + `2x` = `120 FPS` fluidos a `1x`).
-   - [ ] *(Opcional / futuro)* Desacoplar simulação nativa do `60 Hz` (`frame_rate.c` + delta-time patches): teste em partida com `MTF_FPS_LIMIT=144` sem Frame Gen confirmou aceleração (~2.4x), pois o jogo usa passo fixo de `1/60s`.
-2. **Resolução de Renderização, Upscaling & Câmera/Ultrawide**
-   - [x] **Fluxo claro de Resolução de Renderização + Upscaling + >4K/Supersampling:** `OUTPUT_RES=auto` agora acompanha a janela/tela (`1080p` em janela `1080p`, sem downscale forçado de `1440p`), `ov_resolution.c` suporta até `5K (2880p)` / `8K (4320p)` e `RENDER_SCALE` vai de `50%` até `200%` (supersampling); menu (`F1`) reorganizado na ordem Escala de renderização -> Resolução de saída -> Upscaler (`FSR 1`/`Bilinear`) -> `DLAA/DLSS`.
-   - [ ] *(Opcional / futuro)* Avaliar `FSR 3.1` / `NIS` do RAG (`xc2-ns2-recomp`, `Recompia`) e implementar `ULTRAWIDE` (`21:9`/`32:9`), `HUD_POSITION` e `FOV`.
-   - [ ] Implementar `ULTRAWIDE`, `HUD_POSITION` (`edges|centered`) e `ASPECT_PATCH`.
-   - [ ] Implementar `FOV` (`res_fov_live()`), `WINDOW_MODE` (`windowed|borderless|fullscreen`) e `DEVICE_PROFILE`.
-3. **Anti-Aliasing, Upscaling & HDR Nativo**
-   - [ ] Portar `SMAA` (`vk_smaa.c` + `smaa_*_spv.h`).
-   - [ ] Portar `HDR_NATIVE` + `spirv_hdr_shoulder.c`.
-   - [ ] Expor `SHADOW_RES` e `SHADOW_SCALE` no menu in-game (`metas[]` em `runtime/cfg.c`).
-4. **Otimizações de CPU, GPU & Memória (Vulkan Backend — Tier 2, Prioridade Atual)**
-   Metodologia de medição A/B e tabela de evolução em [docs/perf-methodology.md](perf-methodology.md).
-   - **Etapa 2.1 — Memória, VRAM & Redução de Stutter (PCs de 16 GB RAM / 8 GB VRAM):**
-     - [x] Portar `vk_headroom.c` (`MTF_VRAM_HEADROOM`, pré-alocação de blocos VMA em background com recuo automático acima de 85% do orçamento de VRAM).
-     - [x] Portar `MTF_HEAP_LAZY` (`runtime/platform/win32.c` `fault_veh` + `runtime/memory.c` `mem_touch`) e `MTF_SPARSE_MIRROR_COPY` (`runtime/vk_memory.c` + `mirror_sparse_spv.h`). *(Nota: `MTF_WB_ASYNC`/`MTF_WB_UNLOCKED` pertencem ao write-back assíncrono de `vk_texture.c`, fora desta etapa.)*
-     - [x] Implementar controle de *commit headroom* no Windows (`MTF_COMMIT_HEADROOM_MIB`, padrão `512` MiB, clean-room via `GlobalMemoryStatusEx` `ullAvailPageFile` em `plat_mem_avail_commit`) para evitar OOM em 16 GB RAM.
-     - [x] **Gate 2.1:** `check_content.py` limpo, build sem erros e smoke test de boot verificando ativação de `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY=auto` e `MTF_COMMIT_HEADROOM_MIB` (`5076 MB` no boot inicial); medições em partida registradas em [docs/perf-methodology.md](perf-methodology.md).
-   - **Etapa 2.2 — Performance de CPU no Replay Vulkan:**
-     - [x] Portar replay paralelo multi-thread (`MTF_REPLAY_THREADS`, padrão `6` em >=12 CPUs / `4` em >=8 CPUs / `0` em AMD) em [runtime/vk_exec.c](runtime/vk_exec.c) + `DrawCtx` por thread em [runtime/vk_exec_draw.c](runtime/vk_exec_draw.c) + suporte de queries herdadas em [runtime/vk_exec_xfer.c](runtime/vk_exec_xfer.c) + write-back local por thread em [runtime/vk_memory.c](runtime/vk_memory.c). *(Nota: `MTF_REC_PUB` em `vk_rec.c` e `vk_pipeline_prewarm(..., cpus)` em `vk_pipeline.c` já cobriam o papel de `REC_BATCH` e `PREWARM_XLATE` no runtime.)*
-     - [x] Avaliar `vk_spec.c` + `vk_exec_draw_helper.c` (`MTF_REPLAY_PAR`): mantido como opcional/futuro, pois `MTF_REPLAY_THREADS=6` já paraleliza os passes grandes (>=256 draws) sem duplicar `vk_exec_draw.c` em `vk_exec_draw_helper.c`.
-     - [x] **Gate 2.2:** Build limpo, `check_content.py` sem violações e smoke test confirmando `MTF_REPLAY_THREADS=6, the default`; medições A/B (`MTF_REPLAY_THREADS=0` vs `6`) em partida registradas em [docs/perf-methodology.md](perf-methodology.md).
-   - **Etapa 2.3 — Robustez de Shaders & Documentação:**
-     - [x] Portar `spirv_nan_guard.c` (`MTF_NAN_GUARD` opcional para fragment shaders: `0|zero|mark`).
-     - [x] Registrar créditos MIT de `dkb-pc-recomp` (`4e7f9b2`) em `THIRD_PARTY_NOTICES.md`.
-5. **Menu de Configurações (`F1`) & Remapeamento de Controles**
-   - [x] Portar remapeamento completo de teclado (2 slots + `SHAKE` + analógicos) e gamepad (`binds_page.cpp` + `input_map.{c,h}` + `input_capture` + `MTF_BIND_*`) na aba Controles do menu `F1` (sub-abas **Controle** e **Teclado**, salvamento imediato em `mtf.ini` e aplicação ao vivo).
-   - [x] Complementar a aba Avançado do menu `F1` com as opções da Tier 2 (`MTF_REPLAY_THREADS`, `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, `MTF_NAN_GUARD`).
-6. **Multiplayer Online (Prioridade Máxima — Branch `feat/multiplayer-ldn`)**
-   Roadmap completo e backlog detalhado em [docs/multiplayer-roadmap.md](multiplayer-roadmap.md).
-   - [x] Seleção de inputs Multiplayer (`P1..P4`) no menu `F1` (`runtime/input.c`, `runtime/ov_hid.c`), correção de crash (`ProfanityFilter`) e correção do *split-screen* (`vk_dlaa.c`).
-   - [ ] **Fase 1:** MVP de **Sala P2P no Menu `F1`** (Criar Sala / Entrar por Código, Host = P1, Convidado = P2 via UDP em *Free Play* e modos locais).
-   - [ ] **Fase 2:** Stream de vídeo/áudio (`libvpx`/`opus`) do Host para os Convidados (`P2..P4`) em tempo real.
-   - [ ] **Fase 3:** Servidor Gateway/Relay leve (oculta IP do Host + salas públicas/privadas) e tela **Online Room** no `F1`.
-7. **Diagnóstico, Mods & Pipeline de Build**
-   - [ ] Portar `flight.c` (`FLIGHT`), `vk_crumbs.c`, `prof_win.c`/`perf.c`, `rdoc.c`, `mods_scan.h` (`ROMFS_MODS`/`ROMFS_PATCHES`), `MOUSE_CAMERA` e `RUMBLE_TRIGGERS`.
-   - [ ] Manter `tools/build_fork.py` + `tools/mtf_launcher.py` alinhados à build limpa do fork.
+1. **High FPS (> 60 FPS), Frame Pacing & Frame Generation**
+   - [x] Expose `MTF_FPS_LIMIT` (`30|40|45|60|90|120|144|240|display|unlimited`) in `cfg.c`, in-game menu (`F1`), and `nro0` pacer (`0x70035611b8`): measured **144 FPS** (`display`) and **~1925 FPS** (`unlimited` on opening) — useful for optimization benchmarks.
+   - [x] **FPS > 60 at `1x` real speed via Frame Generation (`MTF_FRAMEGEN`):** ported from `mkw-recomp` / `SkyboundTotk` (MIT, `vk_framegen.c` + `fg_*_spv.h`, `off|120|monitor|unlimited` modes with 5-image swapchain in `gfx_present.c` for up to `4x` = `240 FPS`). Validated in-game (`60 FPS` base + `2x` = smooth `120 FPS` at `1x` speed).
+   - [ ] *(Optional / future)* Decouple native simulation from `60 Hz` (`frame_rate.c` + delta-time patches): match testing with `MTF_FPS_LIMIT=144` without Frame Gen confirmed ~2.4x speedup due to the fixed `1/60s` step.
+2. **Render Resolution, Upscaling & Camera/Ultrawide**
+   - [x] **Clear Render Resolution + Upscaling + >4K/Supersampling flow:** `OUTPUT_RES=auto` tracks the window/display (`1080p` in a `1080p` window, no forced `1440p` downscale), `ov_resolution.c` supports up to `5K (2880p)` / `8K (4320p)`, and `RENDER_SCALE` spans `50%` to `200%` (supersampling); `F1` menu reorganized in order: Render scale → Output resolution → Upscaler (`FSR 1`/`Bilinear`) → `DLAA/DLSS`.
+   - [ ] *(Optional / future)* Evaluate `FSR 3.1` / `NIS` from RAG (`xc2-ns2-recomp`, `Recompia`) and implement `ULTRAWIDE` (`21:9`/`32:9`), `HUD_POSITION`, and `FOV`.
+   - [ ] Implement `ULTRAWIDE`, `HUD_POSITION` (`edges|centered`), and `ASPECT_PATCH`.
+   - [ ] Implement `FOV` (`res_fov_live()`), `WINDOW_MODE` (`windowed|borderless|fullscreen`), and `DEVICE_PROFILE`.
+3. **Anti-Aliasing, Upscaling & Native HDR**
+   - [ ] Port `SMAA` (`vk_smaa.c` + `smaa_*_spv.h`).
+   - [ ] Port `HDR_NATIVE` + `spirv_hdr_shoulder.c`.
+   - [ ] Expose `SHADOW_RES` and `SHADOW_SCALE` in the in-game menu (`metas[]` in `runtime/cfg.c`).
+4. **CPU, GPU & Memory Optimizations (Vulkan Backend — Tier 2)**
+   A/B measurement methodology and evolution table in [docs/perf-methodology.md](perf-methodology.md).
+   - **Stage 2.1 — Memory, VRAM & Stutter Reduction (16 GB RAM / 8 GB VRAM PCs):**
+     - [x] Port `vk_headroom.c` (`MTF_VRAM_HEADROOM`, background VMA block pre-allocation with automatic backoff above 85% VRAM budget).
+     - [x] Port `MTF_HEAP_LAZY` (`runtime/platform/win32.c` `fault_veh` + `runtime/memory.c` `mem_touch`) and `MTF_SPARSE_MIRROR_COPY` (`runtime/vk_memory.c` + `mirror_sparse_spv.h`).
+     - [x] Implement Windows commit headroom control (`MTF_COMMIT_HEADROOM_MIB`, default `512` MiB, clean-room via `GlobalMemoryStatusEx` `ullAvailPageFile` in `plat_mem_avail_commit`) to prevent OOM on 16 GB RAM.
+     - [x] **Gate 2.1:** `check_content.py` clean, zero build errors, and boot smoke test verifying `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY=auto`, and `MTF_COMMIT_HEADROOM_MIB` (`5076 MB` initial boot); match measurements recorded in [docs/perf-methodology.md](perf-methodology.md).
+   - **Stage 2.2 — Vulkan Replay CPU Performance:**
+     - [x] Port multi-threaded parallel pass replay (`MTF_REPLAY_THREADS`, default `6` on >=12 CPUs / `4` on >=8 CPUs / `0` on AMD) in [runtime/vk_exec.c](runtime/vk_exec.c) + per-thread `DrawCtx` in [runtime/vk_exec_draw.c](runtime/vk_exec_draw.c) + inherited query support in [runtime/vk_exec_xfer.c](runtime/vk_exec_xfer.c) + per-thread local write-back in [runtime/vk_memory.c](runtime/vk_memory.c).
+     - [x] Evaluate `vk_spec.c` + `vk_exec_draw_helper.c` (`MTF_REPLAY_PAR`): kept optional/future since `MTF_REPLAY_THREADS=6` already parallelizes large passes (>=256 draws) without duplicating `vk_exec_draw.c`.
+     - [x] **Gate 2.2:** Clean build, zero `check_content.py` violations, and smoke test confirming `MTF_REPLAY_THREADS=6`; A/B measurements (`MTF_REPLAY_THREADS=0` vs `6`) recorded in [docs/perf-methodology.md](perf-methodology.md).
+   - **Stage 2.3 — Shader Robustness & Documentation:**
+     - [x] Port `spirv_nan_guard.c` (optional `MTF_NAN_GUARD` for fragment shaders: `0|zero|mark`).
+     - [x] Record `dkb-pc-recomp` (`4e7f9b2`) MIT credits in `THIRD_PARTY_NOTICES.md`.
+5. **Settings Menu (`F1`) & Control Remapping**
+   - [x] Port full keyboard (2 slots + `SHAKE` + analog sticks) and gamepad remapping (`binds_page.cpp` + `input_map.{c,h}` + `input_capture` + `MTF_BIND_*`) in `F1 -> Controls` (**Controller** and **Keyboard** sub-tabs, instant `mtf.ini` save and live application).
+   - [x] Add Tier 2 options (`MTF_REPLAY_THREADS`, `MTF_VRAM_HEADROOM`, `MTF_HEAP_LAZY`, `MTF_SPARSE_MIRROR_COPY`, `MTF_NAN_GUARD`) to `F1 -> Advanced`, plus `F1 -> Cheats` (`runtime/cheats.{h,c}`) and in-game GitHub release notifier (`runtime/update_check.{h,c}`).
+6. **Online Multiplayer (`F1 -> Multiplayer`)**
+   Full roadmap and detailed backlog in [docs/multiplayer-roadmap.md](multiplayer-roadmap.md).
+   - [x] Multiplayer input selection (`P1..P4`) in `F1` (`runtime/input.c`, `runtime/ov_hid.c`), `ProfanityFilter` crash fix, and split-screen DLAA/DLSS fix (`vk_dlaa.c`).
+   - [x] **Phase 1 & 2:** Embedded Browser Streaming host (`runtime/stream_host.c` + `runtime/stream_webrtc.cpp`: VP8 + Opus + WebRTC UDP DataChannel / Cloudflare Tunnel / Local Host + remote P2..P4 inputs).
+   - [x] **Phase 3:** Ordered partial-reliability media channel, automatic WebSocket fallback, `Performance`/`Balanced`/`Quality` presets, and 3s player connect/disconnect toasts.
+7. **Diagnostics, Mods, Distribution & Build Pipeline**
+   - [x] Add RecompLauncher SDK support (`recomplauncher.json` Levels 1–3, headless `--prepare`, `RECOMPLAUNCHER_*` env integration) and GitHub Actions `--onedir` release workflow (`.github/workflows/release.yml`).
+   - [ ] Port `flight.c` (`FLIGHT`), `vk_crumbs.c`, `prof_win.c`/`perf.c`, `rdoc.c`, `mods_scan.h` (`ROMFS_MODS`/`ROMFS_PATCHES`), `MOUSE_CAMERA`, and `RUMBLE_TRIGGERS`.
+   - [ ] Keep `tools/build_fork.py` + `tools/mtf_launcher.py` aligned with clean fork builds.
