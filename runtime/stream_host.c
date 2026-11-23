@@ -18,6 +18,7 @@
 #include "platform/platform.h"
 #include "stream_host.h"
 #include "stream_webrtc.h"
+#include "stream_hwenc.h"
 
 #define STREAM_PORT_DEFAULT 11455
 #define STREAM_MAX_CLIENTS 3   // Players 2..4 (indices 1..3)
@@ -33,6 +34,9 @@ typedef struct {
     int32_t lx, ly, rx, ry;
     uint64_t last_input_ns;
     int need_keyframe;
+    int caps_known;
+    int caps_av1;
+    int caps_h264;
 } StreamClient;
 
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
@@ -97,6 +101,11 @@ static int g_vpx_ok = 0;
 static int g_vpx_w = 0, g_vpx_h = 0, g_vpx_quality = -1;
 static vpx_image_t g_vpx_img;
 static uint64_t g_vpx_pts = 0;
+static int g_hw_fail_mask = 0;
+static int g_hw_ok = 0, g_hw_codec = 0, g_hw_w = 0, g_hw_h = 0, g_hw_q = -1;
+static int g_active_codec = STREAM_CODEC_VP8;
+static uint8_t *g_nv12_buf = NULL;
+static size_t g_nv12_cap = 0;
 
 static int stream_quality_mode(void) {
     const char *v = cfg_value("MTF_STREAM_QUALITY");
@@ -288,7 +297,7 @@ static const char k_html_page[] =
 "<script>"
 "const qs=new URLSearchParams(location.search),roomCode=(qs.get('code')||'').toUpperCase();"
 "const statEl=document.getElementById('stat'),cv=document.getElementById('cv'),ctx=cv.getContext('2d',{alpha:false,desynchronized:true});"
-"let ws=null,pc=null,dcIn=null,vdec=null,adec=null,actx=null,audioOn=false,cropMode=0,nextPlayTime=0,needKf=true,useRtc=false;"
+"let ws=null,pc=null,dcIn=null,vdec=null,vdecCodec=-1,adec=null,actx=null,audioOn=false,cropMode=0,nextPlayTime=0,needKf=true,useRtc=false;"
 "const keys={};"
 "window.addEventListener('keydown',e=>{keys[e.code]=1;if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))e.preventDefault();});"
 "window.addEventListener('keyup',e=>{keys[e.code]=0;});"
@@ -301,15 +310,19 @@ static const char k_html_page[] =
 "if(!actx)actx=new AudioContext({sampleRate:48000,latencyHint:'interactive'});"
 "if(actx.state==='suspended')await actx.resume();"
 "audioOn=!audioOn;document.getElementById('btnAudio').textContent='Audio: '+(audioOn?'On':'Off');nextPlayTime=0;};"
-"function initDecoders(){"
+"function codecStr(c){return c===2?'av01.0.04M.08':c===1?'avc1.42E01F':'vp8';}"
+"function initVideoDecoder(c){"
 "if(vdec)try{vdec.close()}catch(_){}"
-"needKf=true;"
+"vdecCodec=c;needKf=true;"
 "vdec=new VideoDecoder({output:f=>{"
 "const sw=f.displayWidth,sh=f.displayHeight;"
 "if(cropMode===0){if(cv.width!==sw||cv.height!==sh){cv.width=sw;cv.height=sh;}ctx.drawImage(f,0,0,sw,sh);}"
 "else{const hw=(sw/2)|0,sx=cropMode===1?(sw-hw):0;if(cv.width!==hw||cv.height!==sh){cv.width=hw;cv.height=sh;}ctx.drawImage(f,sx,0,hw,sh,0,0,hw,sh);}"
-"f.close();},error:e=>{console.error('vdec',e);setTimeout(()=>{initDecoders();if(ws&&ws.readyState===1)ws.send('{\"type\":\"kf\"}');},50);}});"
-"vdec.configure({codec:'vp8',optimizeForLatency:true,colorSpace:{primaries:'bt709',transfer:'iec61966-2-1',matrix:'bt470bg',fullRange:true}});"
+"f.close();},error:e=>{console.error('vdec',e);setTimeout(()=>{initVideoDecoder(vdecCodec);if(ws&&ws.readyState===1)ws.send('{\"type\":\"kf\"}');},50);}});"
+"vdec.configure({codec:codecStr(c),optimizeForLatency:true,colorSpace:{primaries:'bt709',transfer:'iec61966-2-1',matrix:'bt470bg',fullRange:true}});"
+"}"
+"function initDecoders(){"
+"initVideoDecoder(0);"
 "if(adec)try{adec.close()}catch(_){}"
 "if('AudioDecoder'in window){adec=new AudioDecoder({output:ad=>{"
 "if(!audioOn||!actx){ad.close();return;}"
@@ -322,8 +335,10 @@ static const char k_html_page[] =
 "}"
 "function onMediaBuf(ab){"
 "const u=new Uint8Array(ab),dv=new DataView(ab),t=u[0];"
-"if(t===1&&vdec&&vdec.state==='configured'){"
-"const kf=u[1]===1,ts=dv.getUint32(6,true)*1000;"
+"if(t===1){"
+"const c=u[1]>>4,kf=(u[1]&1)===1,ts=dv.getUint32(6,true)*1000;"
+"if(c!==vdecCodec)initVideoDecoder(c);"
+"if(!vdec||vdec.state!=='configured')return;"
 "if(needKf&&!kf)return; needKf=false;"
 "vdec.decode(new EncodedVideoChunk({type:kf?'key':'delta',timestamp:ts,data:u.subarray(10)}));"
 "}else if(t===2&&adec&&adec.state==='configured'&&audioOn){"
@@ -356,7 +371,11 @@ static const char k_html_page[] =
 "const proto=location.protocol==='https:'?'wss://':'ws://';"
 "ws=new WebSocket(proto+location.host+'/ws'+(roomCode?'?code='+encodeURIComponent(roomCode):''));"
 "ws.binaryType='arraybuffer';"
-"ws.onopen=()=>{statEl.textContent='Connected (waiting frames...)';};"
+"ws.onopen=async()=>{statEl.textContent='Connected (waiting frames...)';"
+"let av1=false,h264=false;"
+"try{av1=(await VideoDecoder.isConfigSupported({codec:'av01.0.04M.08',optimizeForLatency:true})).supported;}catch(_){}"
+"try{h264=(await VideoDecoder.isConfigSupported({codec:'avc1.42E01F',optimizeForLatency:true})).supported;}catch(_){}"
+"if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'caps',av1,h264}));};"
 "ws.onclose=e=>{if(!useRtc)statEl.textContent='Disconnected ('+(e.reason||e.code)+')';};"
 "ws.onmessage=async ev=>{"
 "if(typeof ev.data==='string'){"
@@ -498,7 +517,18 @@ static DWORD WINAPI ws_client_thread(LPVOID param) {
             continue;
         }
         if (opcode == 0x1) {
-            if (strstr((const char *)buf, "\"kf\"")) {
+            if (strstr((const char *)buf, "\"caps\"")) {
+                int av1 = strstr((const char *)buf, "\"av1\":true") != NULL;
+                int h264 = strstr((const char *)buf, "\"h264\":true") != NULL;
+                plat_mutex_lock(&g_lock);
+                g_clients[slot].caps_known = 1;
+                g_clients[slot].caps_av1 = av1;
+                g_clients[slot].caps_h264 = h264;
+                g_clients[slot].need_keyframe = 1;
+                plat_mutex_unlock(&g_lock);
+                rt_log("stream: Player %d browser decode caps: AV1=%s, H.264=%s, VP8=yes",
+                       slot + 2, av1 ? "yes" : "no", h264 ? "yes" : "no");
+            } else if (strstr((const char *)buf, "\"kf\"")) {
                 plat_mutex_lock(&g_lock);
                 g_clients[slot].need_keyframe = 1;
                 plat_mutex_unlock(&g_lock);
@@ -956,6 +986,9 @@ void stream_host_stop(void) {
 
     plat_mutex_lock(&g_enc_lock);
     if (g_vpx_ok) { vpx_codec_destroy(&g_vpx); vpx_img_free(&g_vpx_img); g_vpx_ok = 0; g_vpx_w = g_vpx_h = 0; }
+    if (g_hw_ok) { stream_hwenc_close(); g_hw_ok = 0; g_hw_codec = 0; g_hw_w = g_hw_h = 0; }
+    free(g_nv12_buf); g_nv12_buf = NULL; g_nv12_cap = 0;
+    g_active_codec = STREAM_CODEC_VP8;
     plat_mutex_unlock(&g_enc_lock);
 
     plat_mutex_lock(&g_aud_lock);
@@ -988,6 +1021,33 @@ void stream_host_info(StreamHostInfo *out) {
     out->frames_sent = g_frames_sent;
     out->bytes_sent = g_bytes_sent;
     plat_mutex_unlock(&g_lock);
+}
+
+static int pick_stream_codec(void) {
+    int hw = stream_hwenc_probe() & ~g_hw_fail_mask;
+    const char *pref = cfg_value("MTF_STREAM_CODEC");
+    if (!strcmp(pref, "vp8")) return STREAM_CODEC_VP8;
+    if (!strcmp(pref, "av1") && (hw & (1 << STREAM_CODEC_AV1))) return STREAM_CODEC_AV1;
+    if (!strcmp(pref, "h264") && (hw & (1 << STREAM_CODEC_H264))) return STREAM_CODEC_H264;
+    // Auto: prefer AV1 (GPU) -> H.264 (GPU) -> VP8 (CPU), gated by connected clients' browser decode support.
+    int can_av1 = (hw & (1 << STREAM_CODEC_AV1)) != 0;
+    int can_h264 = (hw & (1 << STREAM_CODEC_H264)) != 0;
+    plat_mutex_lock(&g_lock);
+    for (int i = 0; i < STREAM_MAX_CLIENTS; i++) {
+        if (!g_clients[i].active) continue;
+        if (!g_clients[i].caps_known) { can_av1 = 0; can_h264 = 0; break; }
+        if (!g_clients[i].caps_av1) can_av1 = 0;
+        if (!g_clients[i].caps_h264) can_h264 = 0;
+    }
+    plat_mutex_unlock(&g_lock);
+    if (can_av1) return STREAM_CODEC_AV1;
+    if (can_h264) return STREAM_CODEC_H264;
+    return STREAM_CODEC_VP8;
+}
+
+void stream_host_codec_info(int *hw_mask, int *active_codec) {
+    if (hw_mask) *hw_mask = stream_hwenc_probe() & ~g_hw_fail_mask;
+    if (active_codec) *active_codec = g_active_codec;
 }
 
 static int any_client_connected(void) {
@@ -1026,22 +1086,112 @@ static void bgra_to_i420(const uint8_t *bgra, int stride, int w, int h, vpx_imag
     }
 }
 
+static void bgra_to_nv12(const uint8_t *bgra, int stride, int w, int h, uint8_t *nv12) {
+    uint8_t *Y = nv12;
+    uint8_t *UV = nv12 + (size_t)w * (size_t)h;
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = bgra + y * stride;
+        uint8_t *yr = Y + y * w;
+        for (int x = 0; x < w; x++) {
+            int b = row[x * 4 + 0], g = row[x * 4 + 1], r = row[x * 4 + 2];
+            int yv = (77 * r + 150 * g + 29 * b + 128) >> 8;
+            yr[x] = (uint8_t)(yv < 0 ? 0 : yv > 255 ? 255 : yv);
+        }
+        if ((y & 1) == 0 && y + 1 < h) {
+            const uint8_t *row2 = row + stride;
+            uint8_t *uvr = UV + (y >> 1) * w;
+            for (int x = 0; x + 1 < w; x += 2) {
+                int b = (row[x * 4 + 0] + row[(x + 1) * 4 + 0] + row2[x * 4 + 0] + row2[(x + 1) * 4 + 0]) >> 2;
+                int g = (row[x * 4 + 1] + row[(x + 1) * 4 + 1] + row2[x * 4 + 1] + row2[(x + 1) * 4 + 1]) >> 2;
+                int r = (row[x * 4 + 2] + row[(x + 1) * 4 + 2] + row2[x * 4 + 2] + row2[(x + 1) * 4 + 2]) >> 2;
+                int u = ((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128;
+                int v = ((128 * r - 107 * g - 21 * b + 128) >> 8) + 128;
+                uvr[x + 0] = (uint8_t)(u < 0 ? 0 : u > 255 ? 255 : u);
+                uvr[x + 1] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+            }
+        }
+    }
+}
+
+static void broadcast_video_pkt(int codec, int kf, int w, int h, uint64_t now, const uint8_t *data, size_t sz) {
+    uint8_t *msg = malloc(10 + sz);
+    if (!msg) return;
+    uint16_t ww = (uint16_t)w, hh = (uint16_t)h;
+    uint32_t ts = (uint32_t)(now / 1000000ull);
+    msg[0] = 1;
+    msg[1] = (uint8_t)(((codec & 0xf) << 4) | (kf ? 1 : 0));
+    memcpy(msg + 2, &ww, 2);
+    memcpy(msg + 4, &hh, 2);
+    memcpy(msg + 6, &ts, 4);
+    memcpy(msg + 10, data, sz);
+    if (ws_broadcast_bin(msg, 10 + sz)) {
+        plat_mutex_lock(&g_lock);
+        for (int i = 0; i < STREAM_MAX_CLIENTS; i++)
+            if (g_clients[i].active) g_clients[i].need_keyframe = 1;
+        plat_mutex_unlock(&g_lock);
+    }
+    free(msg);
+    g_frames_sent++;
+}
+
 void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride) {
     if (!g_running || !bgra || w <= 0 || h <= 0 || !any_client_connected()) return;
     uint64_t now = plat_now_ns();
     if (now - g_last_vid_ns < 10000000ull) return;
     g_last_vid_ns = now;
 
+    static const unsigned k_kbps[3] = {2200, 4500, 7500};
+    static const unsigned k_kf[3] = {45, 45, 60};
     int q = stream_quality_mode();
+    int codec = pick_stream_codec();
+
     plat_mutex_lock(&g_enc_lock);
+    if (codec != STREAM_CODEC_VP8) {
+        if (!g_hw_ok || g_hw_codec != codec || g_hw_w != w || g_hw_h != h || g_hw_q != q) {
+            if (g_hw_ok) { stream_hwenc_close(); g_hw_ok = 0; }
+            if (stream_hwenc_open(codec, w, h, 60, (int)k_kbps[q], (int)k_kf[q])) {
+                g_hw_ok = 1; g_hw_codec = codec; g_hw_w = w; g_hw_h = h; g_hw_q = q;
+            } else {
+                g_hw_fail_mask |= (1 << codec);
+                codec = pick_stream_codec();
+            }
+        }
+        if (codec != STREAM_CODEC_VP8 && g_hw_ok) {
+            size_t need_nv12 = (size_t)w * (size_t)h * 3 / 2;
+            if (g_nv12_cap < need_nv12) {
+                uint8_t *nb = realloc(g_nv12_buf, need_nv12);
+                if (nb) { g_nv12_buf = nb; g_nv12_cap = need_nv12; }
+            }
+            if (g_nv12_buf) {
+                bgra_to_nv12(bgra, stride, w, h, g_nv12_buf);
+                int force_kf = 0;
+                plat_mutex_lock(&g_lock);
+                for (int i = 0; i < STREAM_MAX_CLIENTS; i++) {
+                    if (g_clients[i].active && g_clients[i].need_keyframe) {
+                        force_kf = 1;
+                        g_clients[i].need_keyframe = 0;
+                    }
+                }
+                plat_mutex_unlock(&g_lock);
+                const uint8_t *pkt = NULL;
+                size_t psz = 0;
+                int okf = 0;
+                if (stream_hwenc_encode(g_nv12_buf, w, h, force_kf, &pkt, &psz, &okf) && pkt && psz > 0) {
+                    g_active_codec = codec;
+                    broadcast_video_pkt(codec, okf, w, h, now, pkt, psz);
+                }
+                plat_mutex_unlock(&g_enc_lock);
+                return;
+            }
+        }
+    }
+    g_active_codec = STREAM_CODEC_VP8;
     if (!g_vpx_ok || g_vpx_w != w || g_vpx_h != h || g_vpx_quality != q) {
         if (g_vpx_ok) { vpx_codec_destroy(&g_vpx); vpx_img_free(&g_vpx_img); g_vpx_ok = 0; }
         vpx_codec_enc_cfg_t cfg;
         if (vpx_codec_enc_config_default(vpx_codec_vp8_cx(), &cfg, 0) == VPX_CODEC_OK) {
-            static const unsigned k_kbps[3] = {2200, 4500, 7500};
             static const unsigned k_qmin[3] = {8, 4, 2};
             static const unsigned k_qmax[3] = {56, 48, 36};
-            static const unsigned k_kf[3] = {45, 45, 60};
             static const int k_cpu[3] = {-10, -8, -6};
             cfg.g_w = (unsigned)w;
             cfg.g_h = (unsigned)h;
@@ -1084,27 +1234,8 @@ void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride) {
             const vpx_codec_cx_pkt_t *pkt;
             while ((pkt = vpx_codec_get_cx_data(&g_vpx, &iter)) != NULL) {
                 if (pkt->kind != VPX_CODEC_CX_FRAME_PKT) continue;
-                size_t sz = pkt->data.frame.sz;
-                uint8_t *msg = malloc(10 + sz);
-                if (msg) {
-                    uint8_t kf = (pkt->data.frame.flags & VPX_FRAME_IS_KEY) ? 1 : 0;
-                    uint16_t ww = (uint16_t)w, hh = (uint16_t)h;
-                    uint32_t ts = (uint32_t)(now / 1000000ull);
-                    msg[0] = 1;
-                    msg[1] = kf;
-                    memcpy(msg + 2, &ww, 2);
-                    memcpy(msg + 4, &hh, 2);
-                    memcpy(msg + 6, &ts, 4);
-                    memcpy(msg + 10, pkt->data.frame.buf, sz);
-                    if (ws_broadcast_bin(msg, 10 + sz)) {
-                        plat_mutex_lock(&g_lock);
-                        for (int i = 0; i < STREAM_MAX_CLIENTS; i++)
-                            if (g_clients[i].active) g_clients[i].need_keyframe = 1;
-                        plat_mutex_unlock(&g_lock);
-                    }
-                    free(msg);
-                    g_frames_sent++;
-                }
+                int kf = (pkt->data.frame.flags & VPX_FRAME_IS_KEY) ? 1 : 0;
+                broadcast_video_pkt(STREAM_CODEC_VP8, kf, w, h, now, pkt->data.frame.buf, pkt->data.frame.sz);
             }
         }
     }

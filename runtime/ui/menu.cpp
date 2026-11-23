@@ -664,6 +664,35 @@ static void tab_multiplayer(float scale) {
         ImGui::Spacing();
     }
 
+    {
+        int hw_mask = 0, active_c = 0;
+        stream_host_codec_info(&hw_mask, &active_c);
+        const char *cur_c = cfg_value("MTF_STREAM_CODEC");
+        static const char *c_vals[4] = {"auto", "av1", "h264", "vp8"};
+        static const char *c_names[4] = {"Auto (Recommended)", "AV1 (GPU)", "H.264 (GPU)", "VP8 (CPU)"};
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Stream Codec:");
+        for (int i = 0; i < 4; i++) {
+            ImGui::SameLine(0, 8 * scale);
+            bool avail = (i == 0 || i == 3) || (i == 1 && (hw_mask & (1 << 2))) || (i == 2 && (hw_mask & (1 << 1)));
+            bool active = !strcmp(cur_c, c_vals[i]);
+            if (!avail) ImGui::BeginDisabled();
+            if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.48f, 0.85f, 1.0f));
+            if (ImGui::Button(c_names[i])) {
+                cfg_set("MTF_STREAM_CODEC", c_vals[i]);
+                opt_save_tick(1);
+            }
+            if (active) ImGui::PopStyleColor();
+            if (!avail) ImGui::EndDisabled();
+        }
+        const char *act_name = active_c == 2 ? "AV1 (GPU)" : active_c == 1 ? "H.264 (GPU)" : "VP8 (CPU)";
+        ImGui::TextDisabled("Detected GPU encoders: AV1=%s, H.264=%s | Active: %s",
+                            (hw_mask & (1 << 2)) ? "Yes" : "No",
+                            (hw_mask & (1 << 1)) ? "Yes" : "No",
+                            act_name);
+        ImGui::Spacing();
+    }
+
     if (info.state == STREAM_STATE_OFF) {
         reveal_link = false;
         if (!info.cf_installed) ImGui::BeginDisabled();

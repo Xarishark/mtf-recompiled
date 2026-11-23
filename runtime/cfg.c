@@ -151,6 +151,7 @@ static CfgMeta metas[] = {
     {"PAD_LAYOUT", NULL, "auto|positional", LIVE}, {"BUTTON_ICONS", "auto", "auto|nintendo|xbox|playstation|keyboard", LIVE},
     {"MULTIPLAYER_INPUT", NULL, "0|1", LIVE},
     {"STREAM_QUALITY", "balanced", "performance|balanced|quality", LIVE},
+    {"STREAM_CODEC", "auto", "auto|av1|h264|vp8", LIVE},
     {"P1_INPUT", NULL, NULL, LIVE}, {"P2_INPUT", NULL, NULL, LIVE},
     {"P3_INPUT", NULL, NULL, LIVE}, {"P4_INPUT", NULL, NULL, LIVE},
     {"BIND_A", "", NULL, LIVE}, {"BIND_B", "", NULL, LIVE}, {"BIND_X", "", NULL, LIVE}, {"BIND_Y", "", NULL, LIVE},
