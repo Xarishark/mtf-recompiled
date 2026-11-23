@@ -1,0 +1,342 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Mario Tennis Fever: Recompiled",
+  "game": {
+    "kind": "folder",
+    "label": "Your extracted Mario Tennis Fever (Update 1.1.1 / v327680) folder containing exefs/ and romfs/.",
+    "check": {
+      "file": "exefs/main"
+    }
+  },
+  "start": {
+    "program": [
+      "mtf-recomp.exe",
+      "bin/mtf-recomp.exe"
+    ],
+    "args": []
+  },
+  "saves": [
+    "{install}/profile",
+    "{install}/mtf.ini"
+  ],
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": "{install}/mtf.ini",
+      "new": {
+        "OUTPUT_RES": "auto",
+        "RENDER_SCALE": "100",
+        "FPS_LIMIT": "60",
+        "VK_PRESENT": "fifo",
+        "FULLSCREEN": "0",
+        "WINDOW_SIZE": "1920x1080",
+        "UPSCALER": "fsr",
+        "DLAA": "0",
+        "DLSS": "dlaa",
+        "FRAMEGEN": "off",
+        "ASPECT": "fit",
+        "AUDIO_CHANNELS": "auto",
+        "VOLUME": "100",
+        "BUTTON_ICONS": "auto",
+        "PAD_LAYOUT": "auto",
+        "LANG": "en-US"
+      }
+    }
+  ],
+  "settings": [
+    {
+      "id": "output_res",
+      "label": "Output resolution",
+      "help": "Target internal output height. Auto matches your display.",
+      "choices": [
+        { "label": "Auto", "set": { "OUTPUT_RES": "auto" } },
+        { "label": "720p", "set": { "OUTPUT_RES": "720" } },
+        { "label": "1080p", "set": { "OUTPUT_RES": "1080" } },
+        { "label": "1440p", "set": { "OUTPUT_RES": "1440" } },
+        { "label": "4K (2160p)", "set": { "OUTPUT_RES": "2160" } }
+      ],
+      "defaults": { "OUTPUT_RES": "auto" }
+    },
+    {
+      "id": "render_scale",
+      "label": "Render scale",
+      "help": "3D scene resolution percentage relative to the output resolution.",
+      "choices": [
+        { "label": "100%", "set": { "RENDER_SCALE": "100" } },
+        { "label": "90%", "set": { "RENDER_SCALE": "90" } },
+        { "label": "80% (Console)", "set": { "RENDER_SCALE": "game" } },
+        { "label": "70%", "set": { "RENDER_SCALE": "70" } },
+        { "label": "60%", "set": { "RENDER_SCALE": "60" } },
+        { "label": "50%", "set": { "RENDER_SCALE": "50" } }
+      ],
+      "defaults": { "RENDER_SCALE": "100" }
+    },
+    {
+      "id": "fps_limit",
+      "label": "Frame rate limit",
+      "help": "60 FPS is the console's native rate. Higher rates may affect timing.",
+      "choices": [
+        { "label": "60 FPS", "set": { "FPS_LIMIT": "60" } },
+        { "label": "120 FPS", "set": { "FPS_LIMIT": "120" } },
+        { "label": "144 FPS", "set": { "FPS_LIMIT": "144" } },
+        { "label": "30 FPS", "set": { "FPS_LIMIT": "30" } },
+        { "label": "Uncapped", "set": { "FPS_LIMIT": "0" } }
+      ],
+      "defaults": { "FPS_LIMIT": "60" }
+    },
+    {
+      "id": "vsync",
+      "label": "V-Sync",
+      "help": "Prevents screen tearing. Fast keeps low latency without tearing.",
+      "choices": [
+        { "label": "On (FIFO)", "set": { "VK_PRESENT": "fifo" } },
+        { "label": "Fast (Mailbox)", "set": { "VK_PRESENT": "mailbox" } },
+        { "label": "Off (Immediate)", "set": { "VK_PRESENT": "immediate" } }
+      ],
+      "defaults": { "VK_PRESENT": "fifo" }
+    },
+    {
+      "id": "fullscreen",
+      "label": "Fullscreen",
+      "help": "Start the game in borderless fullscreen mode (F11 toggles in-game).",
+      "choices": [
+        { "label": "Windowed", "set": { "FULLSCREEN": "0" } },
+        { "label": "Fullscreen", "set": { "FULLSCREEN": "1" } }
+      ],
+      "defaults": { "FULLSCREEN": "0" }
+    },
+    {
+      "id": "window_size",
+      "label": "Window size",
+      "help": "Client area size when running in windowed mode.",
+      "choices": [
+        { "label": "1280x720", "set": { "WINDOW_SIZE": "1280x720" } },
+        { "label": "1920x1080", "set": { "WINDOW_SIZE": "1920x1080" } },
+        { "label": "2560x1440", "set": { "WINDOW_SIZE": "2560x1440" } },
+        { "label": "3840x2160", "set": { "WINDOW_SIZE": "3840x2160" } }
+      ],
+      "defaults": { "WINDOW_SIZE": "1920x1080" },
+      "when": { "FULLSCREEN": "0" }
+    },
+    {
+      "id": "upscaler",
+      "label": "Upscaler",
+      "help": "Spatial upscaling filter when the window is larger than the game output.",
+      "choices": [
+        { "label": "AMD FSR 1", "set": { "UPSCALER": "fsr" } },
+        { "label": "Bilinear", "set": { "UPSCALER": "bilinear" } }
+      ],
+      "defaults": { "UPSCALER": "fsr" }
+    },
+    {
+      "id": "dlaa",
+      "label": "NVIDIA DLSS / DLAA",
+      "help": "Requires an NVIDIA RTX GPU and nvngx_dlss.dll next to the game.",
+      "choices": [
+        { "label": "Off", "set": { "DLAA": "0" } },
+        { "label": "On", "set": { "DLAA": "1" } }
+      ],
+      "defaults": { "DLAA": "0" }
+    },
+    {
+      "id": "dlss_mode",
+      "label": "DLSS quality mode",
+      "help": "DLAA renders at native resolution; Quality/Balanced/Performance upscale.",
+      "choices": [
+        { "label": "DLAA (Native)", "set": { "DLSS": "dlaa" } },
+        { "label": "Quality", "set": { "DLSS": "quality" } },
+        { "label": "Balanced", "set": { "DLSS": "balanced" } },
+        { "label": "Performance", "set": { "DLSS": "performance" } },
+        { "label": "Ultra Performance", "set": { "DLSS": "ultra_performance" } }
+      ],
+      "defaults": { "DLSS": "dlaa" },
+      "when": { "DLAA": "1" }
+    },
+    {
+      "id": "framegen",
+      "label": "Frame generation",
+      "help": "Interpolates frames using optical flow for smoother motion.",
+      "choices": [
+        { "label": "Off", "set": { "FRAMEGEN": "off" } },
+        { "label": "120 FPS", "set": { "FRAMEGEN": "120" } },
+        { "label": "Monitor refresh", "set": { "FRAMEGEN": "monitor" } },
+        { "label": "Unlimited", "set": { "FRAMEGEN": "unlimited" } }
+      ],
+      "defaults": { "FRAMEGEN": "off" }
+    },
+    {
+      "id": "aspect",
+      "label": "Aspect ratio",
+      "help": "Keep 16:9 aspect with bars or stretch to fill the window.",
+      "choices": [
+        { "label": "Fit (16:9)", "set": { "ASPECT": "fit" } },
+        { "label": "Stretch", "set": { "ASPECT": "stretch" } }
+      ],
+      "defaults": { "ASPECT": "fit" }
+    },
+    {
+      "id": "audio_channels",
+      "label": "Audio channels",
+      "help": "Auto follows your Windows audio device layout.",
+      "choices": [
+        { "label": "Auto", "set": { "AUDIO_CHANNELS": "auto" } },
+        { "label": "Stereo", "set": { "AUDIO_CHANNELS": "stereo" } },
+        { "label": "5.1 Surround", "set": { "AUDIO_CHANNELS": "5.1" } }
+      ],
+      "defaults": { "AUDIO_CHANNELS": "auto" }
+    },
+    {
+      "id": "volume",
+      "label": "Master volume",
+      "help": "Overall game audio output level.",
+      "choices": [
+        { "label": "100%", "set": { "VOLUME": "100" } },
+        { "label": "80%", "set": { "VOLUME": "80" } },
+        { "label": "60%", "set": { "VOLUME": "60" } },
+        { "label": "40%", "set": { "VOLUME": "40" } },
+        { "label": "20%", "set": { "VOLUME": "20" } },
+        { "label": "Mute", "set": { "VOLUME": "0" } }
+      ],
+      "defaults": { "VOLUME": "100" }
+    },
+    {
+      "id": "button_icons",
+      "label": "Button prompt icons",
+      "help": "Auto switches live between controller and keyboard prompts.",
+      "choices": [
+        { "label": "Auto", "set": { "BUTTON_ICONS": "auto" } },
+        { "label": "Nintendo", "set": { "BUTTON_ICONS": "nintendo" } },
+        { "label": "Xbox", "set": { "BUTTON_ICONS": "xbox" } },
+        { "label": "PlayStation", "set": { "BUTTON_ICONS": "playstation" } },
+        { "label": "Keyboard", "set": { "BUTTON_ICONS": "keyboard" } }
+      ],
+      "defaults": { "BUTTON_ICONS": "auto" }
+    },
+    {
+      "id": "pad_layout",
+      "label": "Controller face layout",
+      "help": "Auto matches Switch A/B/X/Y labels; Positional swaps A/B and X/Y by position.",
+      "choices": [
+        { "label": "Auto", "set": { "PAD_LAYOUT": "auto" } },
+        { "label": "Positional", "set": { "PAD_LAYOUT": "positional" } }
+      ],
+      "defaults": { "PAD_LAYOUT": "auto" }
+    },
+    {
+      "id": "game_lang",
+      "label": "Game language",
+      "help": "In-game text and voice language.",
+      "choices": [
+        { "label": "English (US)", "set": { "LANG": "en-US" } },
+        { "label": "Português (Brasil)", "set": { "LANG": "pt-BR" } },
+        { "label": "Español (Latinoamérica)", "set": { "LANG": "es-419" } },
+        { "label": "Español (España)", "set": { "LANG": "es-ES" } },
+        { "label": "Français", "set": { "LANG": "fr-FR" } },
+        { "label": "Deutsch", "set": { "LANG": "de-DE" } },
+        { "label": "Italiano", "set": { "LANG": "it-IT" } },
+        { "label": "日本語", "set": { "LANG": "ja-JP" } },
+        { "label": "한국어", "set": { "LANG": "ko-KR" } }
+      ],
+      "defaults": { "LANG": "en-US" }
+    },
+    {
+      "id": "menu_lang",
+      "label": "Overlay menu language (F1)",
+      "help": "Language used by the in-game F1 settings overlay.",
+      "choices": [
+        { "label": "Auto", "set": { "MENU_LANG": "" } },
+        { "label": "English", "set": { "MENU_LANG": "en" } },
+        { "label": "Português (Brasil)", "set": { "MENU_LANG": "pt-BR" } }
+      ],
+      "defaults": { "MENU_LANG": "" }
+    },
+    {
+      "id": "cheat_chars",
+      "label": "Unlock all characters",
+      "help": "Unlocks all playable characters in memory without editing your save.",
+      "choices": [
+        { "label": "Off", "set": { "CHEAT_UNLOCK_CHARS": "0" } },
+        { "label": "On", "set": { "CHEAT_UNLOCK_CHARS": "1" } }
+      ],
+      "defaults": { "CHEAT_UNLOCK_CHARS": "0" }
+    },
+    {
+      "id": "cheat_costumes",
+      "label": "Unlock all outfits & colors",
+      "help": "Unlocks all alternate costumes and color variants in memory.",
+      "choices": [
+        { "label": "Off", "set": { "CHEAT_UNLOCK_COSTUMES": "0" } },
+        { "label": "On", "set": { "CHEAT_UNLOCK_COSTUMES": "1" } }
+      ],
+      "defaults": { "CHEAT_UNLOCK_COSTUMES": "0" }
+    },
+    {
+      "id": "cheat_rackets",
+      "label": "Unlock all rackets",
+      "help": "Unlocks all rackets in memory.",
+      "choices": [
+        { "label": "Off", "set": { "CHEAT_UNLOCK_RACKETS": "0" } },
+        { "label": "On", "set": { "CHEAT_UNLOCK_RACKETS": "1" } }
+      ],
+      "defaults": { "CHEAT_UNLOCK_RACKETS": "0" }
+    },
+    {
+      "id": "cheat_courts",
+      "label": "Unlock all courts",
+      "help": "Unlocks all courts in memory.",
+      "choices": [
+        { "label": "Off", "set": { "CHEAT_UNLOCK_COURTS": "0" } },
+        { "label": "On", "set": { "CHEAT_UNLOCK_COURTS": "1" } }
+      ],
+      "defaults": { "CHEAT_UNLOCK_COURTS": "0" }
+    },
+    {
+      "id": "cheat_modes",
+      "label": "Unlock all cups & modes",
+      "help": "Unlocks all tournament cups and game modes in memory.",
+      "choices": [
+        { "label": "Off", "set": { "CHEAT_UNLOCK_MODES": "0" } },
+        { "label": "On", "set": { "CHEAT_UNLOCK_MODES": "1" } }
+      ],
+      "defaults": { "CHEAT_UNLOCK_MODES": "0" }
+    }
+  ],
+  "looks": {
+    "graphics": "vulkan"
+  },
+  "folders": {
+    "saves": "{install}/profile",
+    "logs": "{install}/logs"
+  },
+  "actions": [
+    {
+      "id": "open_saves",
+      "label": "Open saves folder",
+      "help": "Opens the profile/ folder where save data is stored.",
+      "open": "saves"
+    },
+    {
+      "id": "open_logs",
+      "label": "Open logs folder",
+      "help": "Opens the logs/ folder containing mtf.log.",
+      "open": "logs"
+    }
+  ],
+  "prepare": {
+    "program": [
+      "MTF-Recomp-Setup.exe"
+    ],
+    "args": [
+      "--prepare",
+      "--game",
+      "{game}"
+    ],
+    "label": "Extracting, lifting, translating shaders, and compiling the game",
+    "timeout": 1800,
+    "done": [
+      "{install}/mtf-recomp.exe"
+    ]
+  }
+}

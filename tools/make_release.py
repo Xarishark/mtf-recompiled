@@ -30,6 +30,7 @@ INCLUDE_FILES = [
     "CMakeLists.txt",
     "VERSION",
     "config.example.toml",
+    "recomplauncher.json",
 ]
 
 SKIP_PARTS = {
@@ -89,14 +90,36 @@ def make_release(version: str, out_dir: Path) -> Path:
     return zip_path
 
 
+def make_windows_zip(version: str, out_dir: Path, setup_exe: Path) -> Path:
+    """Package MTF-Recomp-v<version>-Windows-x64.zip for RecompLauncher (recomplauncher.json + Setup.exe + sources)."""
+    src_zip = make_release(version, out_dir)
+    stage = out_dir / f"mtf-recomp-{version}-src"
+    win_zip = out_dir / f"MTF-Recomp-v{version}-Windows-x64.zip"
+    top = Path(f"MTF-Recomp-v{version}-Windows-x64")
+    if win_zip.exists():
+        win_zip.unlink()
+    with zipfile.ZipFile(win_zip, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False) as zf:
+        for p in sorted(stage.rglob("*")):
+            if p.is_file():
+                zf.write(p, top / p.relative_to(stage))
+        if setup_exe.is_file():
+            zf.write(setup_exe, top / setup_exe.name)
+    return win_zip
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Create a clean MTF Recomp release archive")
     ap.add_argument("--version", default="0.1.0-dev", help="Release version tag")
     ap.add_argument("--out", type=Path, default=ROOT / "build" / "release", help="Output directory")
+    ap.add_argument("--windows-zip", action="store_true", help="Also build MTF-Recomp-v<version>-Windows-x64.zip")
     args = ap.parse_args()
     zip_path = make_release(args.version, args.out)
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"Created clean release archive: {zip_path} ({size_mb:.2f} MiB)")
+    if args.windows_zip:
+        win_zip = make_windows_zip(args.version, args.out, args.out / "MTF-Recomp-Setup.exe")
+        win_mb = win_zip.stat().st_size / (1024 * 1024)
+        print(f"Created RecompLauncher Windows archive: {win_zip} ({win_mb:.2f} MiB)")
     return 0
 
 

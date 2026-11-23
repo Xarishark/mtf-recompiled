@@ -20,7 +20,7 @@ from pathlib import Path
 
 from . import layout as layouts
 from . import state as statefile
-from .events import Reporter
+from .events import Reporter, render
 from .runner import Context, run_steps
 from .steps import STEP_IDS, all_steps
 
@@ -92,5 +92,103 @@ def main(argv=None):
              steps=[s.id for s in steps])
     result = run_steps(steps, ctx)
     rep.emit('end', result=result, seconds=round(time.monotonic() - t0, 1))
+    rep.close()
+    return EXIT[result]
+
+
+class PrepareReporter(Reporter):
+    """Translates installer JSON events into RecompLauncher's `progress <0..1> <text>` protocol."""
+
+    def __init__(self, out=None, log_path=None):
+        super().__init__(out=out, log_path=log_path)
+        self._steps = list(STEP_IDS)
+        self._step_idx = 0
+
+    def emit(self, type, **fields):
+        event = {'type': type, 't': round(self.elapsed(), 2), **fields}
+        line = None
+        if type == 'plan':
+            self._steps = list(fields.get('run') or STEP_IDS)
+            self._step_idx = 0
+        elif type == 'step':
+            st = fields.get('state')
+            step_id = fields.get('step', '')
+            if step_id in self._steps:
+                self._step_idx = self._steps.index(step_id)
+            n = max(1, len(self._steps))
+            if st == 'started':
+                line = f'progress {self._step_idx / n:.3f} {render(self.catalog, "step." + step_id)}'
+            elif st in ('done', 'skipped'):
+                line = f'progress {min(1.0, (self._step_idx + 1) / n):.3f} {render(self.catalog, "step." + step_id)}'
+        elif type == 'progress':
+            step_id = fields.get('step', '')
+            phase = fields.get('phase', '')
+            n = max(1, len(self._steps))
+            base = self._step_idx / n
+            frac = 0.0
+            if fields.get('total'):
+                frac = min(1.0, max(0.0, float(fields.get('done', 0)) / float(fields['total'])))
+            pct = min(1.0, base + frac / n)
+            text = render(self.catalog, f'phase.{step_id}.{phase}')
+            line = f'progress {pct:.3f} {text}'
+        elif type == 'error':
+            msg = render(self.catalog, fields.get('id', ''), fields.get('params'))
+            sys.stderr.write(f'{msg}\n')
+            sys.stderr.flush()
+        if line is not None:
+            with self.lock:
+                self.out.write(line + '\n')
+                self.out.flush()
+        self.log(self.describe(event))
+        return event
+
+
+def prepare_main(argv=None):
+    ap = argparse.ArgumentParser(prog='MTF-Recomp-Setup --prepare')
+    ap.add_argument('--game', type=Path, required=True, help='path to the extracted game folder or .nup')
+    ap.add_argument('--dest', type=Path, help='install folder (default: executable folder)')
+    ap.add_argument('--root', type=Path, help='release folder or repository')
+    args = ap.parse_args(argv)
+
+    default_dest = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path.cwd()
+    dest = (args.dest or default_dest).resolve()
+    game = args.game.resolve()
+
+    layout = layouts.find(args.root)
+    temp = temp_folder(layout.temp.resolve(), dest)
+    log = temp / 'logs' / time.strftime('prepare-%Y%m%d-%H%M%S.log')
+    rep = PrepareReporter(log_path=log)
+    t0 = time.monotonic()
+
+    cli_ns = argparse.Namespace(
+        nup=game if game.is_file() else None,
+        content=game if game.is_dir() else None,
+        firmware=None,
+        keys=None,
+        dest=dest,
+        root=args.root,
+        temp=None,
+        jobs=max(1, (os.cpu_count() or 2) - 2),
+        dlss=False,
+        dlss_file=None,
+        shaders_from=None,
+        only=[],
+        force=[],
+        keep_work=False,
+        lang=None,
+    )
+    try:
+        state = statefile.load(dest)
+    except statefile.StateError as e:
+        rep.error(e.id, {'path': str(e.path)})
+        rep.close()
+        return 1
+
+    ctx = Context(layout, dest, temp, rep, cli_ns, state=state, forced=[], only=[])
+    result = run_steps(all_steps(), ctx)
+    if result == 'ok':
+        rep.out.write('progress 1.000 Ready to play\n')
+        rep.out.flush()
+    rep.log(f'prepare finished: {result} ({time.monotonic() - t0:.1f}s)')
     rep.close()
     return EXIT[result]

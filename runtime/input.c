@@ -309,7 +309,13 @@ static void start(void) {
         rt_log("input: off (MTF_INPUT=none)");
         return;
     }
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    const char *rl_pad = getenv("RECOMPLAUNCHER_PAD");
+    if (rl_pad) {
+        if (!strcmp(rl_pad, "xbox")) __atomic_store_n(&last_dev, INPUT_DEV_XBOX, __ATOMIC_RELAXED);
+        else if (!strcmp(rl_pad, "playstation")) __atomic_store_n(&last_dev, INPUT_DEV_PLAYSTATION, __ATOMIC_RELAXED);
+    }
+    const char *rl = getenv("RECOMPLAUNCHER");
+    if (!rl || strcmp(rl, "1")) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     sdl_ok = SDL_InitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_SENSOR);
     if (!sdl_ok) rt_log("input: SDL gamepad init failed (%s): keyboard only", SDL_GetError());
     else open_pad();
