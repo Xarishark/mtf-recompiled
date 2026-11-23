@@ -90,18 +90,41 @@ def make_release(version: str, out_dir: Path) -> Path:
     return zip_path
 
 
+PLAYER_DIRS = [
+    "profiles",
+    "recomp",
+    "runtime",
+    "tools",
+]
+
+PLAYER_FILES = [
+    "LICENSE",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "CMakeLists.txt",
+    "VERSION",
+    "recomplauncher.json",
+]
+
+
 def make_windows_zip(version: str, out_dir: Path, setup_path: Path) -> Path:
-    """Package MTF-Recomp-v<version>-Windows-x64.zip for RecompLauncher (recomplauncher.json + Setup + sources)."""
-    make_release(version, out_dir)
-    stage = out_dir / f"mtf-recomp-{version}-src"
+    """Package MTF-Recomp-v<version>-Windows-x64.zip for players / RecompLauncher (no docs/tests/installer .py)."""
     win_zip = out_dir / f"MTF-Recomp-v{version}-Windows-x64.zip"
     top = Path(f"MTF-Recomp-v{version}-Windows-x64")
     if win_zip.exists():
         win_zip.unlink()
     with zipfile.ZipFile(win_zip, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False) as zf:
-        for p in sorted(stage.rglob("*")):
-            if p.is_file():
-                zf.write(p, top / p.relative_to(stage))
+        for rel in PLAYER_FILES:
+            src = ROOT / rel
+            if src.is_file():
+                zf.write(src, top / rel)
+        for rel in PLAYER_DIRS:
+            src_dir = ROOT / rel
+            if not src_dir.is_dir():
+                continue
+            for p in sorted(src_dir.rglob("*")):
+                if p.is_file() and not should_skip(p.relative_to(ROOT)):
+                    zf.write(p, top / p.relative_to(ROOT))
         if setup_path.is_dir():
             for p in sorted(setup_path.rglob("*")):
                 if p.is_file():
