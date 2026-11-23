@@ -2467,7 +2467,7 @@ void vk_pipeline_async_enable(void) {
         if (strcmp(e, "0") != 0) return;
     } else {
         VkCtx *vc = vk_ctx();
-        if (vc && vc->props.vendorID == 0x10de && !P.gpl) return;
+        if (vc && vc->props.vendorID == 0x10de) return;
     }
     A.on = 1;
 }
@@ -2832,7 +2832,7 @@ void vk_pipeline_prewarm(void) {
     PlatThread *t[64];
     int nt = 0;
     const char *ps = cfg_get("MTF_PIPE_SYNC");
-    int single = !(ps && !strcmp(ps, "0")) && vk_ctx()->props.vendorID == 0x10de && !P.gpl;
+    int single = !(ps && !strcmp(ps, "0")) && vk_ctx()->props.vendorID == 0x10de;
     for (int i = 0; !single && i < cpus && i < 64 && queued; i++)
         if ((t[nt] = plat_thread_new(warm_builder, NULL, "pipe prewarm"))) nt++;
     if (!nt) warm_builder(NULL);
@@ -2852,10 +2852,10 @@ void vk_pipeline_prewarm(void) {
 static void prebuild_start(void) {
     plat_mutex_lock(&P.lock);
     const char *e = cfg_get("MTF_PIPE_SYNC");
-    if ((!e || !*e) && A.on && vk_ctx()->props.vendorID == 0x10de && !P.gpl) {
-        // Background pipe_worker builds hit nvoglv64.dll+0x10ea90 (0x8 read) on NVIDIA 610.88 after several matches.
+    if ((!e || !*e) && A.on && vk_ctx()->props.vendorID == 0x10de) {
+        // Background pipe_worker builds (both compile_pipeline and GPL lib_create) hit nvoglv64.dll+0x10ea90 (0x8 read) on NVIDIA.
         A.on = 0;
-        rt_log("vk_pipeline: synchronous pipeline builds on NVIDIA without GPL (MTF_PIPE_SYNC=0 overrides)");
+        rt_log("vk_pipeline: synchronous pipeline builds on NVIDIA (MTF_PIPE_SYNC=0 overrides)");
     }
     if (K.file && !K.warm) {
         rt_log("vk_pipeline: prebuild off%s; %zu records not built",
