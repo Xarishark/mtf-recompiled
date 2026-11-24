@@ -91,6 +91,7 @@ def make_release(version: str, out_dir: Path) -> Path:
 
 
 PLAYER_DIRS = [
+    "installer",
     "profiles",
     "recomp",
     "runtime",
