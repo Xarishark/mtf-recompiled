@@ -381,7 +381,7 @@ static int init(VkCtx *c) {
         rt_log("hdr: the present passes could not be created; the picture goes out unconverted");
         return 0;
     }
-    knee(0.85f);
+    knee(0.90f);
     rt_log("hdr: the scene's curve leaves ACES at %.3f (input %.3f, slope %.3f)", H.yk, H.vk, H.slope);
     return H.ok = 1;
 }
