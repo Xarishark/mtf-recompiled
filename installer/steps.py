@@ -395,7 +395,7 @@ def _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def):
 
     prebuilt_rt = (lay.deps / 'lib' / 'libmtfrt.a').is_file()
     link_driver = '$cc' if prebuilt_rt else '$cxx'
-    rt_libs = '-lmtfrt -lc++ ' if prebuilt_rt else ''
+    rt_libs = '-Wl,--whole-archive -lmtfrt -Wl,--no-whole-archive -lc++ ' if prebuilt_rt else ''
     rsp_file = tree / 'objects.rsp'
 
     lines = [
