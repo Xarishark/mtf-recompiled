@@ -29,8 +29,8 @@ TITLE = '0400D4201C6EA000'
 UPDATE = '327680'   # 1.1.1
 EXE = 'mtf-recomp.exe'
 GB = 1000 ** 3
-DEST_NEED = 20 * GB    # the game's files (base and update, while extracting), the shaders and the executable
-TEMP_NEED = 15 * GB    # generated C and objects, while the install runs
+DEST_NEED = 7 * GB     # the game's files (base and update, while extracting), the shaders and the executable
+TEMP_NEED = 2 * GB     # generated C and objects, while the install runs
 
 FONT_FILES = ('0-standard.bfttf', '1-chinese-simplified.bfttf', '2-chinese-simplified-extension.bfttf',
               '3-chinese-traditional.bfttf', '4-korean.bfttf', '5-nintendo-extension.bfttf')
