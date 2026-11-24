@@ -393,6 +393,10 @@ def _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def):
     rt_defs = f'-D{cpu_def} -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNDEBUG'
     rt_common = f'-O2 -g -Wall -fno-strict-aliasing {march} {rt_defs} {fmap} {rt_inc}'
 
+    prebuilt_rt = (lay.deps / 'lib' / 'libmtfrt.a').is_file()
+    link_driver = '$cc' if prebuilt_rt else '$cxx'
+    rt_libs = '-lmtfrt -lc++ ' if prebuilt_rt else ''
+
     lines = [
         'ninja_required_version = 1.5',
         f'cc = {esc(cc)}',
@@ -413,7 +417,7 @@ def _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def):
         'rule rc_rt',
         '  command = $rc --target=pe-x86-64 -O coff -i $in -o $out',
         'rule link',
-        f'  command = $cxx --target=x86_64-w64-windows-gnu -O2 -g {march} -fuse-ld=lld -Wl,--stack,16777216 -Wl,--error-limit=0 @$out.rsp -L{esc((lay.deps / "lib").as_posix())} -lvulkan-1 -lSDL3 -lopus -lvpx -ldatachannel -ljuice -lsrtp2 -lusrsctp -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -liphlpapi -lpsapi -lbcrypt -luser32 -lgdi32 -ldwmapi -limm32 -lwinmm -lole32 -loleaut32 -lmfplat -lmfuuid -lshell32 -luuid -lpdh -lrstrtmgr -lws2_32 -lwinhttp -o $out',
+        f'  command = {link_driver} --target=x86_64-w64-windows-gnu -O2 -g {march} -fuse-ld=lld -Wl,--stack,16777216 -Wl,--error-limit=0 @$out.rsp -L{esc((lay.deps / "lib").as_posix())} {rt_libs}-lvulkan-1 -lSDL3 -lopus -lvpx -ldatachannel -ljuice -lsrtp2 -lusrsctp -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -liphlpapi -lpsapi -lbcrypt -luser32 -lgdi32 -ldwmapi -limm32 -lwinmm -lole32 -loleaut32 -lmfplat -lmfuuid -lshell32 -luuid -lpdh -lrstrtmgr -lws2_32 -lwinhttp -o $out',
         '  rspfile = $out.rsp',
         '  rspfile_content = $in',
         '',
@@ -429,28 +433,40 @@ def _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def):
             lines.append(f'build {esc(obj.as_posix())}: cc_gen {esc(src.as_posix())}')
             objs.append(obj)
 
-    for rel_src in _runtime_sources_from_cmake(lay.root / 'CMakeLists.txt'):
-        src = lay.root / rel_src
-        obj = (obj_dir / 'rt' / rel_src).with_suffix('.obj')
-        obj.parent.mkdir(parents=True, exist_ok=True)
-        ext = src.suffix.lower()
-        if ext == '.rc':
-            lines.append(f'build {esc(obj.as_posix())}: rc_rt {esc(src.as_posix())}')
-        elif ext == '.cpp':
-            if rel_src == 'runtime/vk_vma.cpp':
-                extra = '-std=c++17 -Wno-nullability-completeness'
-            elif rel_src in ('runtime/ui/menu.cpp', 'runtime/ui/menu_win.cpp', 'runtime/ui/option_rows.cpp'):
-                extra = '-std=c++20'
-            elif rel_src.startswith('runtime/third_party/imgui/'):
-                extra = '-std=c++17 -w'
-            else:
-                extra = '-std=c++17'
-            lines.append(f'build {esc(obj.as_posix())}: cxx_rt {esc(src.as_posix())}')
-            lines.append(f'  extra = {extra}')
-        else:
+    if prebuilt_rt:
+        rc_obj = lay.deps / 'lib' / 'mtf.rc.obj'
+        if rc_obj.is_file():
+            objs.append(rc_obj)
+        for rel_src in ('runtime/loader.c', 'runtime/memory.c'):
+            src = lay.root / rel_src
+            obj = (obj_dir / 'rt' / rel_src).with_suffix('.obj')
+            obj.parent.mkdir(parents=True, exist_ok=True)
             lines.append(f'build {esc(obj.as_posix())}: cc_rt {esc(src.as_posix())}')
             lines.append('  extra = ')
-        objs.append(obj)
+            objs.append(obj)
+    else:
+        for rel_src in _runtime_sources_from_cmake(lay.root / 'CMakeLists.txt'):
+            src = lay.root / rel_src
+            obj = (obj_dir / 'rt' / rel_src).with_suffix('.obj')
+            obj.parent.mkdir(parents=True, exist_ok=True)
+            ext = src.suffix.lower()
+            if ext == '.rc':
+                lines.append(f'build {esc(obj.as_posix())}: rc_rt {esc(src.as_posix())}')
+            elif ext == '.cpp':
+                if rel_src == 'runtime/vk_vma.cpp':
+                    extra = '-std=c++17 -Wno-nullability-completeness'
+                elif rel_src in ('runtime/ui/menu.cpp', 'runtime/ui/menu_win.cpp', 'runtime/ui/option_rows.cpp'):
+                    extra = '-std=c++20'
+                elif rel_src.startswith('runtime/third_party/imgui/'):
+                    extra = '-std=c++17 -w'
+                else:
+                    extra = '-std=c++17'
+                lines.append(f'build {esc(obj.as_posix())}: cxx_rt {esc(src.as_posix())}')
+                lines.append(f'  extra = {extra}')
+            else:
+                lines.append(f'build {esc(obj.as_posix())}: cc_rt {esc(src.as_posix())}')
+                lines.append('  extra = ')
+            objs.append(obj)
 
     glue_c = glue / 'modules.c'
     glue_obj = obj_dir / 'glue' / 'modules.obj'

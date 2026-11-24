@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import re
 import shutil
 import subprocess
 import sys
@@ -139,13 +141,90 @@ def make_windows_zip(version: str, out_dir: Path, setup_path: Path, bundle_dir: 
     return win_zip
 
 
+def build_runtime_lib(llvm_dir: Path, deps_dir: Path, out_lib_dir: Path) -> None:
+    """Pre-compile runtime C/C++ sources (except loader.c/memory.c which include layout.h) into libmtfrt.a + mtf.rc.obj."""
+    cmake_text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    m = re.search(r"set\(MTF_RUNTIME_SOURCES\s+(.*?)\r?\n\)", cmake_text, re.S)
+    if not m:
+        raise RuntimeError("MTF_RUNTIME_SOURCES not found in CMakeLists.txt")
+    sources = []
+    for raw in m.group(1).splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line and line not in ("runtime/loader.c", "runtime/memory.c"):
+            sources.append(line)
+
+    obj_root = ROOT / "build" / "rt-objs"
+    if obj_root.exists():
+        shutil.rmtree(obj_root)
+    obj_root.mkdir(parents=True, exist_ok=True)
+    out_lib_dir.mkdir(parents=True, exist_ok=True)
+
+    cc = str(llvm_dir / "bin" / "clang.exe")
+    cxx = str(llvm_dir / "bin" / "clang++.exe")
+    rc = str(llvm_dir / "bin" / "llvm-windres.exe")
+    ar = str(llvm_dir / "bin" / "llvm-ar.exe")
+    common = [
+        "--target=x86_64-w64-windows-gnu", "-O2", "-g", "-Wall", "-fno-strict-aliasing",
+        "-march=x86-64-v2", "-D_WIN32_WINNT=0x0A00", "-DWINVER=0x0A00", "-DNDEBUG",
+        f"-ffile-prefix-map={ROOT.as_posix()}=.",
+        f"-I{(ROOT / 'runtime').as_posix()}",
+        f"-I{(ROOT / 'runtime' / 'third_party' / 'imgui').as_posix()}",
+        "-isystem", (deps_dir / "include").as_posix(),
+        "-isystem", (deps_dir / "include" / "vma").as_posix(),
+    ]
+
+    ar_objs: list[str] = []
+    tasks: list[tuple[list[str], Path, bool]] = []
+    for rel in sources:
+        src = ROOT / rel
+        obj = (obj_root / rel).with_suffix(".obj")
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        ext = src.suffix.lower()
+        if ext == ".rc":
+            tasks.append(([rc, "--target=pe-x86-64", "-O", "coff", "-i", str(src), "-o", str(out_lib_dir / "mtf.rc.obj")], obj, False))
+        elif ext == ".cpp":
+            if rel == "runtime/vk_vma.cpp":
+                extra = ["-std=c++17", "-Wno-nullability-completeness"]
+            elif rel in ("runtime/ui/menu.cpp", "runtime/ui/menu_win.cpp", "runtime/ui/option_rows.cpp"):
+                extra = ["-std=c++20"]
+            elif rel.startswith("runtime/third_party/imgui/"):
+                extra = ["-std=c++17", "-w"]
+            else:
+                extra = ["-std=c++17"]
+            tasks.append(([cxx, *common, *extra, "-c", str(src), "-o", str(obj)], obj, True))
+        else:
+            tasks.append(([cc, *common, "-std=gnu17", "-c", str(src), "-o", str(obj)], obj, True))
+
+    def _run(cmd_obj: tuple[list[str], Path, bool]) -> tuple[Path, bool]:
+        cmd, obj, is_ar = cmd_obj
+        subprocess.check_call(cmd)
+        return obj, is_ar
+
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        for obj, is_ar in pool.map(_run, tasks):
+            if is_ar:
+                ar_objs.append(str(obj))
+
+    lib_path = out_lib_dir / "libmtfrt.a"
+    if lib_path.exists():
+        lib_path.unlink()
+    subprocess.check_call([ar, "rcs", str(lib_path), *ar_objs])
+    shutil.rmtree(obj_root, ignore_errors=True)
+    print(f"Built {lib_path} ({lib_path.stat().st_size / (1024 * 1024):.2f} MiB)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Create a clean MTF Recomp release archive")
     ap.add_argument("--version", default="0.1.0-dev", help="Release version tag")
     ap.add_argument("--out", type=Path, default=ROOT / "build" / "release", help="Output directory")
     ap.add_argument("--windows-zip", action="store_true", help="Also build MTF-Recomp-v<version>-Windows-x64.zip")
     ap.add_argument("--bundle-dir", type=Path, default=None, help="Optional self-contained toolchain dir (python/llvm/cmake/bin/deps) to include in Windows zip")
+    ap.add_argument("--make-runtime-lib", action="store_true", help="Build libmtfrt.a + mtf.rc.obj into <bundle-dir>/deps/lib before packaging")
     args = ap.parse_args()
+    if args.make_runtime_lib:
+        bdir = args.bundle_dir or (ROOT / "build" / "release-bundle")
+        llvm = next((p for p in (ROOT / "toolchain").glob("llvm-mingw-*") if p.is_dir()), bdir / "llvm")
+        build_runtime_lib(llvm, ROOT / "toolchain" / "deps-mingw", bdir / "deps" / "lib")
     zip_path = make_release(args.version, args.out)
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"Created clean release archive: {zip_path} ({size_mb:.2f} MiB)")
