@@ -691,9 +691,22 @@ static void tab_multiplayer(float scale) {
                        "Remote players open the link in Chrome/Edge and automatically control Player 2-4.");
     ImGui::Spacing();
 
+    float arrow_w = ImGui::GetFrameHeight();
+    float label_start_x = ImGui::GetCursorPosX();
+    float sel_label_w = label_start_x + fmaxf(ImGui::CalcTextSize("Stream Quality:").x,
+                                              ImGui::CalcTextSize("Stream Codec:").x) + 18 * scale;
+    static const char *q_vals[3] = {"performance", "balanced", "quality"};
+    static const char *q_names[3] = {"Performance (540p, 2.2 Mbps)", "Balanced (720p, 4.5 Mbps)", "Quality (720p, 7.5 Mbps)"};
+    static const char *c_vals[4] = {"auto", "av1", "h264", "vp8"};
+    static const char *c_names[4] = {"Auto (Recommended)", "AV1 (GPU)", "H.264 (GPU)", "VP8 (CPU)"};
+    float sel_box_w = 0;
+    for (int i = 0; i < 3; i++) sel_box_w = fmaxf(sel_box_w, ImGui::CalcTextSize(q_names[i]).x);
+    for (int i = 0; i < 4; i++) sel_box_w = fmaxf(sel_box_w, ImGui::CalcTextSize(c_names[i]).x);
+    sel_box_w += 28 * scale;
+
     auto stream_selector = [&](const char *id, const char *label, const char *cfg_key,
                                const char *const *vals, const char *const *names,
-                               const bool *avail, int count, float label_w, float box_w) {
+                               const bool *avail, int count) {
         const char *cur = cfg_value(cfg_key);
         int idx = 0;
         for (int i = 0; i < count; i++) {
@@ -713,12 +726,12 @@ static void tab_multiplayer(float scale) {
         ImGui::PushID(id);
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(label);
-        ImGui::SameLine(label_w);
-        if (ImGui::Button("<", ImVec2(28 * scale, 0))) step_idx(-1);
+        ImGui::SameLine(sel_label_w);
+        if (ImGui::Button("<", ImVec2(arrow_w, 0))) step_idx(-1);
         ImGui::SameLine(0, 4 * scale);
         char popup_id[64];
         snprintf(popup_id, sizeof popup_id, "##popup_%s", id);
-        if (ImGui::Button(names[idx], ImVec2(box_w, 0))) ImGui::OpenPopup(popup_id);
+        if (ImGui::Button(names[idx], ImVec2(sel_box_w, 0))) ImGui::OpenPopup(popup_id);
         if (ImGui::IsItemFocused()) {
             if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, false))
                 step_idx(-1);
@@ -726,7 +739,7 @@ static void tab_multiplayer(float scale) {
                 step_idx(1);
         }
         ImGui::SameLine(0, 4 * scale);
-        if (ImGui::Button(">", ImVec2(28 * scale, 0))) step_idx(1);
+        if (ImGui::Button(">", ImVec2(arrow_w, 0))) step_idx(1);
 
         if (ImGui::BeginPopup(popup_id)) {
             for (int i = 0; i < count; i++) {
@@ -743,21 +756,13 @@ static void tab_multiplayer(float scale) {
         ImGui::PopID();
     };
 
-    float sel_label_w = 135 * scale;
-    float sel_box_w = 260 * scale;
-    {
-        static const char *q_vals[3] = {"performance", "balanced", "quality"};
-        static const char *q_names[3] = {"Performance (540p, 2.2 Mbps)", "Balanced (720p, 4.5 Mbps)", "Quality (720p, 7.5 Mbps)"};
-        stream_selector("stream_quality", "Stream Quality:", "MTF_STREAM_QUALITY", q_vals, q_names, nullptr, 3, sel_label_w, sel_box_w);
-    }
+    stream_selector("stream_quality", "Stream Quality:", "MTF_STREAM_QUALITY", q_vals, q_names, nullptr, 3);
 
     {
         int hw_mask = 0, active_c = 0;
         stream_host_codec_info(&hw_mask, &active_c);
-        static const char *c_vals[4] = {"auto", "av1", "h264", "vp8"};
-        static const char *c_names[4] = {"Auto (Recommended)", "AV1 (GPU)", "H.264 (GPU)", "VP8 (CPU)"};
         bool c_avail[4] = {true, (hw_mask & (1 << 2)) != 0, (hw_mask & (1 << 1)) != 0, true};
-        stream_selector("stream_codec", "Stream Codec:", "MTF_STREAM_CODEC", c_vals, c_names, c_avail, 4, sel_label_w, sel_box_w);
+        stream_selector("stream_codec", "Stream Codec:", "MTF_STREAM_CODEC", c_vals, c_names, c_avail, 4);
 
         const char *act_name = active_c == 2 ? "AV1 (GPU)" : active_c == 1 ? "H.264 (GPU)" : "VP8 (CPU)";
         ImGui::AlignTextToFramePadding();
