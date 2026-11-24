@@ -48,18 +48,32 @@ vec3 pq(vec3 nits) {
     return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
 }
 
+vec3 lift_shadows(vec3 c) {
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    if (l <= 1e-5) return c;
+    float t = clamp(l / 0.35, 0.0, 1.0);
+    float w = (1.0 - t) * (1.0 - t);
+    float target_l = mix(l, pow(l, 0.82), w);
+    return c * (target_l / l);
+}
+
 void main() {
     ivec2 at = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(at, pc.size))) return;
     vec3 w = clamp(texelFetch(win, at + pc.offset, 0).rgb, 0.0, 1.0);
-    vec3 nits = srgb_decode(w) * pc.n.x;
+    vec3 nits = lift_shadows(srgb_decode(w)) * pc.n.x;
     if (pc.n.w > 0.0) {
         vec2 uv = (vec2(at) + 0.5) / vec2(pc.size);
         vec3 x = min((texture(light, uv).rgb + texture(bloom, uv).rgb) * pc.n.w, vec3(16384.0));
         vec3 v = ACES_IN * x;
         vec3 sdr = clamp(ACES_OUT * vec3(aces_fit(v.r), aces_fit(v.g), aces_fit(v.b)), 0.0, 1.0);
         if (all(lessThanEqual(abs(srgb_encode(sdr) - w), vec3(1.5 / 255.0)))) {
-            vec3 hdr = max(ACES_OUT * vec3(aces_hdr(v.r), aces_hdr(v.g), aces_hdr(v.b)), vec3(0.0));
+            float m = max(v.r, max(v.g, v.b));
+            vec3 base = lift_shadows(sdr);
+            float scale = (m > pc.k.x) ? (aces_hdr(m) / max(aces_fit(m), 1e-5)) : 1.0;
+            vec3 hdr_luma = base * scale;
+            vec3 hdr_chan = max(ACES_OUT * vec3(aces_hdr(v.r), aces_hdr(v.g), aces_hdr(v.b)), vec3(0.0));
+            vec3 hdr = mix(hdr_luma, hdr_chan, m > pc.k.x ? 0.15 : 0.0);
             nits = hdr * pc.n.y;
         }
     }

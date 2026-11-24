@@ -23,11 +23,20 @@ vec3 pq(vec3 nits) {
     return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
 }
 
+vec3 lift_shadows(vec3 c) {
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    if (l <= 1e-5) return c;
+    float t = clamp(l / 0.35, 0.0, 1.0);
+    float w = (1.0 - t) * (1.0 - t);
+    float target_l = mix(l, pow(l, 0.82), w);
+    return c * (target_l / l);
+}
+
 void main() {
     ivec2 at = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(at, pc.size))) return;
     vec3 c = max(texelFetch(src, at + pc.offset, 0).rgb, vec3(0.0));
-    if (pc.p.z > 0.5) c = srgb_decode(clamp(c, 0.0, 1.0));
+    if (pc.p.z > 0.5) c = lift_shadows(srgb_decode(clamp(c, 0.0, 1.0)));
     const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
     vec3 nits = min(max(to2020 * c, vec3(0.0)) * pc.p.x, vec3(pc.p.y));
     imageStore(dst, at, vec4(pq(nits), 1.0));
