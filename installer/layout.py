@@ -43,10 +43,12 @@ class Layout:
 
     def missing(self):
         """Paths the steps need that do not exist."""
-        need = [self.python, self.llvm / 'bin' / 'clang.exe', self.cmake, self.ninja, self.deps / 'include' / 'SDL3' / 'SDL.h',
+        need = [self.python, self.llvm / 'bin' / 'clang.exe', self.ninja, self.deps / 'include' / 'SDL3' / 'SDL.h',
                 self.deps / 'lib', self.xlate, self.root / 'CMakeLists.txt', self.runtime / 'main.c',
                 self.root / 'recomp' / 'lift.py', self.root / 'recomp' / 'glue.py', self.root / 'tools' / 'nup_extract.py',
                 self.root / 'tools' / 'shaders' / 'translate.py']
+        if self.cmake is not None:
+            need.append(self.cmake)
         return [str(p) for p in need if not p.exists()]
 
 
@@ -54,7 +56,7 @@ def release_layout(root):
     version = root / 'VERSION'
     return Layout(root=root, dev=False,
                   release=version.read_text(encoding='utf-8').strip() if version.is_file() else 'unknown',
-                  python=root / 'python' / 'python.exe', llvm=root / 'llvm', cmake=root / 'cmake' / 'bin' / 'cmake.exe',
+                  python=root / 'python' / 'python.exe', llvm=root / 'llvm', cmake=None,
                   ninja=root / 'bin' / 'ninja.exe', deps=root / 'deps', xlate=root / 'bin' / 'xlate' / 'dmsh_xlate.exe',
                   temp=root / 'temp')
 

@@ -360,8 +360,114 @@ class Fonts(Step):
 
 # ---- building the runtime against lifted modules --------------------------------------------------------------------
 
+def _runtime_sources_from_cmake(cmake_file):
+    text = cmake_file.read_text(encoding='utf-8')
+    m = re.search(r'set\(MTF_RUNTIME_SOURCES\s+(.*?)\r?\n\)', text, re.S)
+    if not m:
+        raise InstallError('build.no_sources', path=str(cmake_file))
+    out = []
+    for raw in m.group(1).splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def):
+    """Emit build.ninja directly without requiring CMake."""
+    tree.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    cc = (lay.llvm / 'bin' / 'clang.exe').as_posix()
+    cxx = (lay.llvm / 'bin' / 'clang++.exe').as_posix()
+    rc = (lay.llvm / 'bin' / 'llvm-windres.exe').as_posix()
+
+    def esc(s):
+        return s.replace('$', '$$').replace(':', '$:').replace(' ', '$ ')
+
+    fmap = ' '.join(
+        f'-ffile-prefix-map={p.as_posix()}=.'
+        for p in (lay.root, tree, glue, lay.deps, *dirs)
+    )
+    gen_flags = f'-O2 -fwrapv -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden {march} -DNDEBUG {fmap} -I{esc((lay.root / "runtime").as_posix())}'
+    rt_inc = f'-I{esc((lay.root / "runtime").as_posix())} -I{esc((lay.root / "runtime" / "third_party" / "imgui").as_posix())} -I{esc(glue.as_posix())} -isystem {esc((lay.deps / "include").as_posix())} -isystem {esc((lay.deps / "include" / "vma").as_posix())}'
+    rt_defs = f'-D{cpu_def} -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNDEBUG'
+    rt_common = f'-O2 -g -Wall -fno-strict-aliasing {march} {rt_defs} {fmap} {rt_inc}'
+
+    lines = [
+        'ninja_required_version = 1.5',
+        f'cc = {esc(cc)}',
+        f'cxx = {esc(cxx)}',
+        f'rc = {esc(rc)}',
+        'rule cc_gen',
+        f'  command = $cc --target=x86_64-w64-windows-gnu {gen_flags} -std=gnu17 -MD -MF $out.d -c $in -o $out',
+        '  depfile = $out.d',
+        '  deps = gcc',
+        'rule cc_rt',
+        f'  command = $cc --target=x86_64-w64-windows-gnu {rt_common} -std=gnu17 $extra -MD -MF $out.d -c $in -o $out',
+        '  depfile = $out.d',
+        '  deps = gcc',
+        'rule cxx_rt',
+        f'  command = $cxx --target=x86_64-w64-windows-gnu {rt_common} $extra -MD -MF $out.d -c $in -o $out',
+        '  depfile = $out.d',
+        '  deps = gcc',
+        'rule rc_rt',
+        '  command = $rc --target=pe-x86-64 -O coff -i $in -o $out',
+        'rule link',
+        f'  command = $cxx --target=x86_64-w64-windows-gnu -O2 -g {march} -fuse-ld=lld -Wl,--stack,16777216 -Wl,--error-limit=0 @$out.rsp -L{esc((lay.deps / "lib").as_posix())} -lvulkan-1 -lSDL3 -lopus -lvpx -ldatachannel -ljuice -lsrtp2 -lusrsctp -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -liphlpapi -lpsapi -lbcrypt -luser32 -lgdi32 -ldwmapi -limm32 -lwinmm -lole32 -loleaut32 -lmfplat -lmfuuid -lshell32 -luuid -lpdh -lrstrtmgr -lws2_32 -lwinhttp -o $out',
+        '  rspfile = $out.rsp',
+        '  rspfile_content = $in',
+        '',
+    ]
+
+    objs = []
+    obj_dir = tree / 'obj'
+    for d in dirs:
+        for src in sorted(d.rglob('*.c')):
+            rel = src.relative_to(d).with_suffix('.obj')
+            obj = obj_dir / 'gen' / d.name / rel
+            obj.parent.mkdir(parents=True, exist_ok=True)
+            lines.append(f'build {esc(obj.as_posix())}: cc_gen {esc(src.as_posix())}')
+            objs.append(obj)
+
+    for rel_src in _runtime_sources_from_cmake(lay.root / 'CMakeLists.txt'):
+        src = lay.root / rel_src
+        obj = (obj_dir / 'rt' / rel_src).with_suffix('.obj')
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        ext = src.suffix.lower()
+        if ext == '.rc':
+            lines.append(f'build {esc(obj.as_posix())}: rc_rt {esc(src.as_posix())}')
+        elif ext == '.cpp':
+            if rel_src == 'runtime/vk_vma.cpp':
+                extra = '-std=c++17 -Wno-nullability-completeness'
+            elif rel_src in ('runtime/ui/menu.cpp', 'runtime/ui/menu_win.cpp', 'runtime/ui/option_rows.cpp'):
+                extra = '-std=c++20'
+            elif rel_src.startswith('runtime/third_party/imgui/'):
+                extra = '-std=c++17 -w'
+            else:
+                extra = '-std=c++17'
+            lines.append(f'build {esc(obj.as_posix())}: cxx_rt {esc(src.as_posix())}')
+            lines.append(f'  extra = {extra}')
+        else:
+            lines.append(f'build {esc(obj.as_posix())}: cc_rt {esc(src.as_posix())}')
+            lines.append('  extra = ')
+        objs.append(obj)
+
+    glue_c = glue / 'modules.c'
+    glue_obj = obj_dir / 'glue' / 'modules.obj'
+    glue_obj.parent.mkdir(parents=True, exist_ok=True)
+    lines.append(f'build {esc(glue_obj.as_posix())}: cc_rt {esc(glue_c.as_posix())}')
+    lines.append('  extra = ')
+    objs.append(glue_obj)
+
+    exe = out / EXE
+    lines.append(f'build {esc(exe.as_posix())}: link ' + ' '.join(esc(o.as_posix()) for o in objs))
+    lines.append(f'default {esc(exe.as_posix())}')
+    (tree / 'build.ninja').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return exe
+
+
 def build(ctx, step, modules, out, portable):
-    """Glue and CMake build of mtf-recomp.exe into out (its own build tree in the temp folder)."""
+    """Glue and build of mtf-recomp.exe into out (its own build tree in the temp folder)."""
     lay = ctx.layout
     glue = ctx.temp / ('glue-portable' if portable else 'glue')
     dirs = [gen(ctx, m) for m in modules]
@@ -373,15 +479,30 @@ def build(ctx, step, modules, out, portable):
         glue_args += ['--exefs', exefs(ctx), '--romfs', romfs(ctx), '--user', ctx.temp / 'profile']
     run_tool(ctx, step, glue_args, 'glue', phase='glue')
     tree = ctx.temp / ('cmake-portable' if portable else 'cmake')
-    toolchain = lay.root / 'tools' / 'cmake' / 'llvm-mingw.cmake'
-    run_tool(ctx, step, [lay.cmake, '-S', lay.root, '-B', tree, '-G', 'Ninja',
-                         f'-DCMAKE_TOOLCHAIN_FILE={toolchain.as_posix()}', '-DCMAKE_BUILD_TYPE=Release',
-                         f'-DCMAKE_MAKE_PROGRAM={lay.ninja.as_posix()}',
-                         f'-DMTF_GENERATED_DIRS={";".join(d.as_posix() for d in dirs)}', f'-DMTF_GLUE_DIR={glue.as_posix()}',
-                         f'-DMTF_OUTPUT_DIR={out.as_posix()}', f'-DMTF_DEPS_DIR={lay.deps.as_posix()}',
-                         f'-DMTF_CPU_LEVEL={cpu_level()}'], 'cmake-configure', phase='configure')
-    run_tool(ctx, step, [lay.cmake, '--build', tree, '--parallel', ctx.options.jobs], 'cmake-build', phase='compile',
-             progress=(NINJA_LINE, 'objects'))
+    if lay.cmake is not None and lay.cmake.is_file():
+        toolchain = lay.root / 'tools' / 'cmake' / 'llvm-mingw.cmake'
+        run_tool(ctx, step, [lay.cmake, '-S', lay.root, '-B', tree, '-G', 'Ninja',
+                             f'-DCMAKE_TOOLCHAIN_FILE={toolchain.as_posix()}', '-DCMAKE_BUILD_TYPE=Release',
+                             f'-DCMAKE_MAKE_PROGRAM={lay.ninja.as_posix()}',
+                             f'-DMTF_GENERATED_DIRS={";".join(d.as_posix() for d in dirs)}', f'-DMTF_GLUE_DIR={glue.as_posix()}',
+                             f'-DMTF_OUTPUT_DIR={out.as_posix()}', f'-DMTF_DEPS_DIR={lay.deps.as_posix()}',
+                             f'-DMTF_CPU_LEVEL={cpu_level()}'], 'cmake-configure', phase='configure')
+        run_tool(ctx, step, [lay.cmake, '--build', tree, '--parallel', ctx.options.jobs], 'cmake-build', phase='compile',
+                 progress=(NINJA_LINE, 'objects'))
+    else:
+        lvl = cpu_level()
+        march = '-march=x86-64-v2' if lvl == 'v2' else '-march=x86-64-v3'
+        cpu_def = 'RT_CPU_LEVEL=2' if lvl == 'v2' else 'RT_CPU_LEVEL=3'
+        _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def)
+        run_tool(ctx, step, [lay.ninja, '-C', tree, '-j', ctx.options.jobs], 'ninja-build', phase='compile',
+                 progress=(NINJA_LINE, 'objects'))
+        for dll in (lay.deps / 'bin').glob('*.dll'):
+            shutil.copy2(dll, out / dll.name)
+        rt_bin = lay.llvm / 'x86_64-w64-mingw32' / 'bin'
+        for name in ('libc++.dll', 'libunwind.dll', 'libwinpthread-1.dll'):
+            src_dll = rt_bin / name
+            if src_dll.is_file():
+                shutil.copy2(src_dll, out / name)
     exe = out / EXE
     if not exe.is_file():
         raise InstallError('build.no_exe', path=str(exe))
