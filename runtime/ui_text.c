@@ -106,12 +106,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_TESS] = "Grass blades",
     [UI_MENU_TESS_DESC] = "The blades of the grass courts, drawn by tessellation. Off, the courts are flat.",
     [UI_MENU_GRAPHICS_PRESET] = "Graphics preset",
-    [UI_MENU_GRAPHICS_PRESET_DESC] = "Applies a preset across resolution, render scale, filtering, grass tessellation and "
-        "shadows. Low targets weaker PCs and handhelds; changing any option below switches to Custom.",
+    [UI_MENU_GRAPHICS_PRESET_DESC] = "Applies a preset across render scale, filtering, grass tessellation, AA and "
+        "shadows (output resolution stays independent). Low targets weaker PCs; changing any linked option switches to Custom.",
     [UI_MENU_GPRESET_LOW] = "Low (Weak PC)",
-    [UI_MENU_GPRESET_BALANCED] = "Balanced (1080p)",
-    [UI_MENU_GPRESET_HIGH] = "High (1440p)",
-    [UI_MENU_GPRESET_ULTRA] = "Ultra (4K)",
+    [UI_MENU_GPRESET_BALANCED] = "Balanced",
+    [UI_MENU_GPRESET_HIGH] = "High",
+    [UI_MENU_GPRESET_ULTRA] = "Ultra",
     [UI_MENU_GPRESET_CUSTOM] = "Custom",
     [UI_MENU_SHADOW_SCALE] = "Shadow resolution",
     [UI_MENU_SHADOW_SCALE_DESC] = "Multiplies the game's shadow map resolution (1x = Switch default, 2x-4x = sharper "
@@ -508,12 +508,12 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_TESS] = "Folhas de grama",
     [UI_MENU_TESS_DESC] = "As folhas de grama das quadras, desenhadas por tesselação. Desligado, as quadras ficam lisas.",
     [UI_MENU_GRAPHICS_PRESET] = "Predefinição gráfica",
-    [UI_MENU_GRAPHICS_PRESET_DESC] = "Aplica um perfil completo de resolução, escala de renderização, filtragem, grama e "
-        "sombras. Baixo é voltado para PCs fracos e portáteis; alterar qualquer opção abaixo muda para Personalizado.",
+    [UI_MENU_GRAPHICS_PRESET_DESC] = "Aplica um perfil de escala de renderização, filtragem, grama, AA e sombras "
+        "(a resolução de saída é independente). Baixo é voltado para PCs fracos; alterar uma opção muda para Personalizado.",
     [UI_MENU_GPRESET_LOW] = "Baixo (PC Fraco)",
-    [UI_MENU_GPRESET_BALANCED] = "Equilibrado (1080p)",
-    [UI_MENU_GPRESET_HIGH] = "Alto (1440p)",
-    [UI_MENU_GPRESET_ULTRA] = "Ultra (4K)",
+    [UI_MENU_GPRESET_BALANCED] = "Equilibrado",
+    [UI_MENU_GPRESET_HIGH] = "Alto",
+    [UI_MENU_GPRESET_ULTRA] = "Ultra",
     [UI_MENU_GPRESET_CUSTOM] = "Personalizado",
     [UI_MENU_SHADOW_SCALE] = "Resolução das sombras",
     [UI_MENU_SHADOW_SCALE_DESC] = "Multiplica a resolução dos mapas de sombra do jogo (1x = padrão do Switch, 2x-4x = "

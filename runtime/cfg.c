@@ -65,7 +65,7 @@ static const struct { const char *key, *def; } defaults[] = {
     {"FPS_LIMIT", "60"},
     {"FRAMEGEN", "off"},
     {"BACKGROUND_FPS", "15"},       // gfx_present.c: with no focus and no controller in use; 0 for no limit
-    {"VK_PRESENT", "fifo"},          // gfx_present.c: fifo (VSync), mailbox or immediate; the menu changes it live
+    {"VK_PRESENT", "mailbox"},       // gfx_present.c: fifo (VSync), mailbox or immediate; the menu changes it live
     {"FRAME_QUEUE", "0"},
     {"PAD_LAYOUT", "auto"},
     {"STICK_DEADZONE", "8"},

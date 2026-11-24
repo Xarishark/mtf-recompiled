@@ -420,8 +420,7 @@ static void row_output_res(void) {
     const char *names[] = {menu_text(UI_MENU_OUTPUT_RES_AUTO), "1280 \xc3\x97 720", "1920 \xc3\x97 1080",
                            "2560 \xc3\x97 1440", "3840 \xc3\x97 2160 (4K)", "5120 \xc3\x97 2880 (5K)",
                            "7680 \xc3\x97 4320 (8K)"};
-    if (opt_choice_list("MTF_OUTPUT_RES", UI_MENU_OUTPUT_RES, vals, names, 7, UI_MENU_OUTPUT_RES_DESC))
-        cfg_set("MTF_GRAPHICS_PRESET", "custom");
+    opt_choice_list("MTF_OUTPUT_RES", UI_MENU_OUTPUT_RES, vals, names, 7, UI_MENU_OUTPUT_RES_DESC);
 }
 
 static void row_render_scale(void) {
@@ -434,12 +433,12 @@ static void row_render_scale(void) {
 
 static void row_graphics_preset(void) {
     static const struct {
-        const char *name, *rscale, *outres, *up, *dlaa, *aniso, *tess, *fxaa, *shadow;
+        const char *name, *rscale, *up, *dlaa, *aniso, *tess, *fxaa, *shadow;
     } presets[] = {
-        {"low",      "75",  "720",  "fsr", "0", "game", "0", "0", "1"},
-        {"balanced", "100", "1080", "fsr", "0", "4",    "1", "1", "1"},
-        {"high",     "100", "1440", "fsr", "0", "8",    "1", "1", "2"},
-        {"ultra",    "100", "2160", "fsr", "0", "16",   "1", "1", "2"},
+        {"low",      "75",  "fsr", "0", "game", "0", "0", "1"},
+        {"balanced", "100", "fsr", "0", "4",    "1", "1", "1"},
+        {"high",     "100", "fsr", "0", "8",    "1", "1", "2"},
+        {"ultra",    "100", "fsr", "0", "16",   "1", "1", "2"},
     };
     static const UiTextId names[] = {
         UI_MENU_GPRESET_LOW, UI_MENU_GPRESET_BALANCED, UI_MENU_GPRESET_HIGH,
@@ -450,7 +449,6 @@ static void row_graphics_preset(void) {
         for (const auto &e : presets) {
             if (!strcmp(p, e.name)) {
                 cfg_set("MTF_RENDER_SCALE", e.rscale);
-                cfg_set("MTF_OUTPUT_RES", e.outres);
                 cfg_set("MTF_UPSCALER", e.up);
                 cfg_set("MTF_DLAA", e.dlaa);
                 cfg_set("MTF_ANISO", e.aniso);
@@ -518,6 +516,9 @@ static void rows_color(void) {
 
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
+    row_graphics_preset();
+    row_output_res();
+    row_render_scale();
     opt_toggle("MTF_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
     row_window_size();
     static const UiTextId present[] = {UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE};
@@ -553,9 +554,6 @@ static void tab_screen(float scale) {
     opt_choice_list("MTF_BACKGROUND_FPS", UI_MENU_BACKGROUND_FPS, background, background_names, 5,
                     UI_MENU_BACKGROUND_FPS_DESC);
     opt_group(UI_MENU_GRAPHICS);
-    row_graphics_preset();
-    row_render_scale();
-    row_output_res();
     static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
     bool gfx_custom = opt_choice("MTF_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
     opt_slider("MTF_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
