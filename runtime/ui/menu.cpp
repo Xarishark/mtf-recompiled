@@ -35,6 +35,7 @@ extern "C" {
 #include "cfg.h"
 #include "update_check.h"
 int gfx_window_refresh_hz(void);
+int vk_dlaa_supported(void);
 #include "input.h"
 #include "platform/platform.h"
 #include "ui/menu.h"
@@ -427,7 +428,43 @@ static void row_render_scale(void) {
     static const char *const vals[] = {"game", "50", "67", "75", "100", "125", "150", "200"};
     const char *names[] = {menu_text(UI_MENU_RENDER_SCALE_GAME), "50 %", "67 %", "75 %", "100 %",
                            "125 %", "150 %", "200 %"};
-    opt_choice_list("MTF_RENDER_SCALE", UI_MENU_RENDER_SCALE, vals, names, 8, UI_MENU_RENDER_SCALE_DESC);
+    if (opt_choice_list("MTF_RENDER_SCALE", UI_MENU_RENDER_SCALE, vals, names, 8, UI_MENU_RENDER_SCALE_DESC))
+        cfg_set("MTF_GRAPHICS_PRESET", "custom");
+}
+
+static void row_graphics_preset(void) {
+    static const struct {
+        const char *name, *rscale, *up, *dlaa, *aniso, *tess, *fxaa, *shadow;
+    } presets[] = {
+        {"low",      "75",  "fsr", "0", "game", "0", "0", "1"},
+        {"balanced", "100", "fsr", "0", "4",    "1", "1", "1"},
+        {"high",     "100", "fsr", "0", "8",    "1", "1", "2"},
+        {"ultra",    "100", "fsr", "0", "16",   "1", "1", "2"},
+    };
+    static const UiTextId names[] = {
+        UI_MENU_GPRESET_LOW, UI_MENU_GPRESET_BALANCED, UI_MENU_GPRESET_HIGH,
+        UI_MENU_GPRESET_ULTRA, UI_MENU_GPRESET_CUSTOM,
+    };
+    if (opt_choice("MTF_GRAPHICS_PRESET", UI_MENU_GRAPHICS_PRESET, names, 5, UI_MENU_GRAPHICS_PRESET_DESC)) {
+        const char *p = cfg_value("MTF_GRAPHICS_PRESET");
+        for (const auto &e : presets) {
+            if (!strcmp(p, e.name)) {
+                bool ultra_dlaa = !strcmp(p, "ultra") && vk_dlaa_supported();
+                cfg_set("MTF_RENDER_SCALE", e.rscale);
+                cfg_set("MTF_UPSCALER", e.up);
+                cfg_set("MTF_DLAA", ultra_dlaa ? "1" : e.dlaa);
+                if (ultra_dlaa) cfg_set("MTF_DLSS", "dlaa");
+                cfg_set("MTF_ANISO", e.aniso);
+                cfg_set("MTF_TESS", e.tess);
+                cfg_set("MTF_FXAA", ultra_dlaa ? "0" : e.fxaa);
+                cfg_set("MTF_SMAA", ultra_dlaa ? "off" : (!strcmp(p, "ultra") ? "high" : !strcmp(p, "high") ? "medium" : "off"));
+                cfg_set("MTF_SHADOW_SCALE", e.shadow);
+                opt_save_soon();
+                opt_note_restart();
+                break;
+            }
+        }
+    }
 }
 
 // The game language (ov_system.c): the languages the game ships, by their own names.
@@ -483,6 +520,9 @@ static void rows_color(void) {
 
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
+    row_graphics_preset();
+    row_output_res();
+    row_render_scale();
     opt_toggle("MTF_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
     row_window_size();
     static const UiTextId present[] = {UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE};
@@ -518,12 +558,10 @@ static void tab_screen(float scale) {
     opt_choice_list("MTF_BACKGROUND_FPS", UI_MENU_BACKGROUND_FPS, background, background_names, 5,
                     UI_MENU_BACKGROUND_FPS_DESC);
     opt_group(UI_MENU_GRAPHICS);
-    row_render_scale();
-    row_output_res();
     static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
-    opt_choice("MTF_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
+    bool gfx_custom = opt_choice("MTF_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
     opt_slider("MTF_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
-    opt_toggle("MTF_DLAA", UI_MENU_DLAA, UI_MENU_DLAA_DESC);
+    gfx_custom |= opt_toggle("MTF_DLAA", UI_MENU_DLAA, UI_MENU_DLAA_DESC);
     static const UiTextId dlss[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
                                     UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
     opt_choice("MTF_DLSS", UI_MENU_DLSS, dlss, 5, UI_MENU_DLSS_DESC);
@@ -533,9 +571,18 @@ static void tab_screen(float scale) {
     opt_choice("MTF_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
     static const char *const aniso[] = {"game", "2", "4", "8", "16"};
     const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
-    opt_choice_list("MTF_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
-    opt_toggle("MTF_TESS", UI_MENU_TESS, UI_MENU_TESS_DESC);
-    opt_toggle("MTF_FXAA", UI_MENU_FXAA, UI_MENU_FXAA_DESC);
+    gfx_custom |= opt_choice_list("MTF_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
+    static const char *const shadow[] = {"1", "2", "3", "4"};
+    static const char *const shadow_names[] = {"1x", "2x", "3x", "4x"};
+    gfx_custom |= opt_choice_list("MTF_SHADOW_SCALE", UI_MENU_SHADOW_SCALE, shadow, shadow_names, 4, UI_MENU_SHADOW_SCALE_DESC);
+    gfx_custom |= opt_toggle("MTF_TESS", UI_MENU_TESS, UI_MENU_TESS_DESC);
+    gfx_custom |= opt_toggle("MTF_FXAA", UI_MENU_FXAA, UI_MENU_FXAA_DESC);
+    static const UiTextId smaa[] = {UI_MENU_OFF, UI_MENU_SMAA_LOW, UI_MENU_SMAA_MEDIUM, UI_MENU_SMAA_HIGH};
+    gfx_custom |= opt_choice("MTF_SMAA", UI_MENU_SMAA, smaa, 4, UI_MENU_SMAA_DESC);
+    if (gfx_custom && strcmp(cfg_value("MTF_GRAPHICS_PRESET"), "custom")) {
+        cfg_set("MTF_GRAPHICS_PRESET", "custom");
+        opt_save_soon();
+    }
     rows_color();
     opt_group(UI_MENU_HDR_GROUP);
     opt_toggle("MTF_HDR", UI_MENU_HDR, UI_MENU_HDR_DESC);

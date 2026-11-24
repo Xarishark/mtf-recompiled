@@ -105,6 +105,23 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "sharp into the distance instead of blurring. Game: the level the game asks for, as on the Switch.",
     [UI_MENU_TESS] = "Grass blades",
     [UI_MENU_TESS_DESC] = "The blades of the grass courts, drawn by tessellation. Off, the courts are flat.",
+    [UI_MENU_GRAPHICS_PRESET] = "Graphics preset",
+    [UI_MENU_GRAPHICS_PRESET_DESC] = "Applies a preset across render scale, filtering, grass tessellation, AA and "
+        "shadows (output resolution stays independent). Low targets weaker PCs; changing any linked option switches to Custom.",
+    [UI_MENU_GPRESET_LOW] = "Low (Weak PC)",
+    [UI_MENU_GPRESET_BALANCED] = "Balanced",
+    [UI_MENU_GPRESET_HIGH] = "High",
+    [UI_MENU_GPRESET_ULTRA] = "Ultra",
+    [UI_MENU_GPRESET_CUSTOM] = "Custom",
+    [UI_MENU_SHADOW_SCALE] = "Shadow resolution",
+    [UI_MENU_SHADOW_SCALE_DESC] = "Multiplies the game's shadow map resolution (1x = Switch default, 2x-4x = sharper "
+        "shadows at higher GPU cost).",
+    [UI_MENU_SMAA] = "SMAA",
+    [UI_MENU_SMAA_DESC] = "Morphological anti-aliasing (SMAA 1x) on the finished picture: smooths edges on any GPU "
+        "(useful when NVIDIA DLAA is unavailable).",
+    [UI_MENU_SMAA_LOW] = "Low",
+    [UI_MENU_SMAA_MEDIUM] = "Medium",
+    [UI_MENU_SMAA_HIGH] = "High",
     [UI_MENU_DLAA] = "NVIDIA DLSS / DLAA",
     [UI_MENU_DLAA_DESC] = "NVIDIA DLSS on RTX GPUs, with nvngx_dlss.dll beside mtf-recomp.exe: anti-aliasing from the game's "
         "motion, sharper and steadier than FXAA. The DLSS mode below picks the scene size.",
@@ -496,6 +513,23 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
         "continuam nítidos ao longe em vez de borrar. Jogo: o nível que o jogo pede, como no Switch.",
     [UI_MENU_TESS] = "Folhas de grama",
     [UI_MENU_TESS_DESC] = "As folhas de grama das quadras, desenhadas por tesselação. Desligado, as quadras ficam lisas.",
+    [UI_MENU_GRAPHICS_PRESET] = "Predefinição gráfica",
+    [UI_MENU_GRAPHICS_PRESET_DESC] = "Aplica um perfil de escala de renderização, filtragem, grama, AA e sombras "
+        "(a resolução de saída é independente). Baixo é voltado para PCs fracos; alterar uma opção muda para Personalizado.",
+    [UI_MENU_GPRESET_LOW] = "Baixo (PC Fraco)",
+    [UI_MENU_GPRESET_BALANCED] = "Equilibrado",
+    [UI_MENU_GPRESET_HIGH] = "Alto",
+    [UI_MENU_GPRESET_ULTRA] = "Ultra",
+    [UI_MENU_GPRESET_CUSTOM] = "Personalizado",
+    [UI_MENU_SHADOW_SCALE] = "Resolução das sombras",
+    [UI_MENU_SHADOW_SCALE_DESC] = "Multiplica a resolução dos mapas de sombra do jogo (1x = padrão do Switch, 2x-4x = "
+        "sombras mais nítidas com maior custo de GPU).",
+    [UI_MENU_SMAA] = "SMAA",
+    [UI_MENU_SMAA_DESC] = "Anti-aliasing morfológico (SMAA 1x) na imagem final: suaviza serrilhados em qualquer GPU "
+        "(ótimo quando o NVIDIA DLAA não está disponível).",
+    [UI_MENU_SMAA_LOW] = "Baixo",
+    [UI_MENU_SMAA_MEDIUM] = "Médio",
+    [UI_MENU_SMAA_HIGH] = "Alto",
     [UI_MENU_DLAA] = "NVIDIA DLSS / DLAA",
     [UI_MENU_DLAA_DESC] = "NVIDIA DLSS em GPUs RTX, com o nvngx_dlss.dll ao lado do mtf-recomp.exe: anti-aliasing a partir do "
         "movimento do jogo, mais nítido e estável que o FXAA. O modo DLSS abaixo escolhe o tamanho da cena.",

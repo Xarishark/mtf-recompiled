@@ -34,6 +34,7 @@ static const struct { const char *key, *def; } defaults[] = {
     {"VOLUME", "100"},        // audio_mixer.c: master volume, 0-100
     {"RENDER_SCALE", "100"},        // ov_resolution.c: the scene's size in percent of the output (50-100), or game (80 docked)
     {"OUTPUT_RES", "auto"},         // ov_resolution.c: the game's output, 720, 1080, 1440 or 2160 lines; auto: the display's
+    {"GRAPHICS_PRESET", "custom"},  // menu.cpp: low | balanced | high | ultra | custom
     {"DLSS", "dlaa"},               // vk_dlaa.c: with DLAA on, dlaa (scene size) or quality, balanced, performance,
                                     // ultra_performance (the scene at NVIDIA's share of the output)
     {"AUDIO_CHANNELS", "auto"},     // audio_mixer.c, ov_audioout.c: auto (the device's layout), stereo or 5.1
@@ -64,7 +65,7 @@ static const struct { const char *key, *def; } defaults[] = {
     {"FPS_LIMIT", "60"},
     {"FRAMEGEN", "off"},
     {"BACKGROUND_FPS", "15"},       // gfx_present.c: with no focus and no controller in use; 0 for no limit
-    {"VK_PRESENT", "fifo"},          // gfx_present.c: fifo (VSync), mailbox or immediate; the menu changes it live
+    {"VK_PRESENT", "mailbox"},       // gfx_present.c: fifo (VSync), mailbox or immediate; the menu changes it live
     {"FRAME_QUEUE", "0"},
     {"PAD_LAYOUT", "auto"},
     {"STICK_DEADZONE", "8"},
@@ -132,11 +133,14 @@ static CfgMeta metas[] = {
     {"BACKGROUND_FPS", NULL, "0|10|15|20|30", LIVE},
     {"OUTPUT_RES", NULL, "auto|720|1080|1440|2160|2880|4320", RESTART},
     {"RENDER_SCALE", NULL, "game|50|67|75|100|125|150|200", RESTART},
+    {"GRAPHICS_PRESET", "custom", "low|balanced|high|ultra|custom", RESTART},
     {"UPSCALER", NULL, "fsr|bilinear", LIVE}, {"SHARPNESS", NULL, "0..100", LIVE},
     {"ASPECT", NULL, "fit|stretch", LIVE}, {"ANISO", NULL, "game|2|4|8|16", RESTART},
+    {"SHADOW_SCALE", "1", "1|2|3|4", RESTART},
     {"TESS", NULL, "0|1", RESTART},
     {"DLAA", "0", "0|1", RESTART}, {"DLSS", NULL, "dlaa|quality|balanced|performance|ultra_performance", RESTART},
     {"DLSS_PRESET", "default", "default|k|j", LIVE}, {"FXAA", "1", "0|1", LIVE},
+    {"SMAA", "off", "off|low|medium|high", LIVE},
     {"COLOR_PRESET", "default", "default|vivid|clarity|custom", LIVE}, {"COLOR_BRIGHTNESS", NULL, "-30..30", LIVE},
     {"COLOR_CONTRAST", NULL, "70..150", LIVE}, {"COLOR_SATURATION", NULL, "50..200", LIVE},
     {"COLOR_GAMMA", NULL, "0.8..1.2", LIVE},
