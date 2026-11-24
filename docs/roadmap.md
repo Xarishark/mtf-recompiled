@@ -72,8 +72,8 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
 2. **Render Resolution, Upscaling & Camera/Ultrawide**
    - [x] **Clear Render Resolution + Upscaling + >4K/Supersampling flow:** `OUTPUT_RES=auto` tracks the window/display (`1080p` in a `1080p` window, no forced `1440p` downscale), `ov_resolution.c` supports up to `5K (2880p)` / `8K (4320p)`, and `RENDER_SCALE` spans `50%` to `200%` (supersampling); `F1` menu reorganized in order: Render scale → Output resolution → Upscaler (`FSR 1`/`Bilinear`) → `DLAA/DLSS`.
    - [ ] *(Optional / future)* Evaluate `FSR 3.1` / `NIS` from RAG (`xc2-ns2-recomp`, `Recompia`) and implement `ULTRAWIDE` (`21:9`/`32:9`), `HUD_POSITION`, and `FOV`.
-   - [ ] Implement `ULTRAWIDE`, `HUD_POSITION` (`edges|centered`), and `ASPECT_PATCH`.
-   - [ ] Implement `FOV` (`res_fov_live()`), `WINDOW_MODE` (`windowed|borderless|fullscreen`), and `DEVICE_PROFILE`.
+   - [ ] *(Experimental)* `ULTRAWIDE` (`21:9`/`32:9`), `HUD_POSITION` (`edges|centered`), and `ASPECT_PATCH` (`nro0` 3D court expands, but 2D menus stretch, match HUD stays in 16:9 bounds, and announcer 3D portrait is hidden — needs `nro0` UI/viewport patches).
+   - [x] Implement `FOV` (`res_fov_live()`), `WINDOW_MODE` (`windowed|borderless|fullscreen`), and `HDR` luminance/shadow-lift tuning.
 3. **Anti-Aliasing, Upscaling & Native HDR**
    - [ ] Port `SMAA` (`vk_smaa.c` + `smaa_*_spv.h`).
    - [ ] Port `HDR_NATIVE` + `spirv_hdr_shoulder.c`.

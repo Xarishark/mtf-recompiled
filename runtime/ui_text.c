@@ -103,8 +103,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ASPECT] = "Picture shape",
     [UI_MENU_ASPECT_DESC] = "When the window's shape differs from the game resolution's (a 16:9 picture on a 21:9 screen): keep "
         "the picture's shape with black bars, or stretch it over the window.",
-    [UI_MENU_ULTRAWIDE] = "Ultrawide aspect",
-    [UI_MENU_ULTRAWIDE_DESC] = "Expands the game's output and 3D camera horizontally for 21:9 or 32:9 monitors.",
+    [UI_MENU_ULTRAWIDE] = "Ultrawide aspect (Experimental)",
+    [UI_MENU_ULTRAWIDE_DESC] = "Experimental: expands the 3D court horizontally for 21:9 or 32:9 monitors. "
+        "2D menus may stretch, match HUD stays in the 16:9 area, and the announcer portrait may be hidden.",
     [UI_MENU_HUD_POSITION] = "Ultrawide HUD",
     [UI_MENU_HUD_POSITION_EDGES] = "Edges",
     [UI_MENU_HUD_POSITION_CENTERED] = "Centered",
@@ -523,8 +524,9 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_ASPECT] = "Formato da imagem",
     [UI_MENU_ASPECT_DESC] = "Quando o formato da janela difere do da resolução do jogo (uma imagem 16:9 numa tela 21:9): manter o"
         " formato da imagem com barras pretas ou esticá-la sobre a janela.",
-    [UI_MENU_ULTRAWIDE] = "Proporção Ultrawide",
-    [UI_MENU_ULTRAWIDE_DESC] = "Expande a saída do jogo e a câmera 3D horizontalmente para monitores 21:9 ou 32:9.",
+    [UI_MENU_ULTRAWIDE] = "Proporção Ultrawide (Experimental)",
+    [UI_MENU_ULTRAWIDE_DESC] = "Experimental: expande a quadra 3D horizontalmente para monitores 21:9 ou 32:9. "
+        "Menus 2D podem esticar, o HUD permanece na área 16:9 e o retrato do locutor pode ficar oculto.",
     [UI_MENU_HUD_POSITION] = "Posição do HUD (Ultrawide)",
     [UI_MENU_HUD_POSITION_EDGES] = "Bordas",
     [UI_MENU_HUD_POSITION_CENTERED] = "Centralizado",
