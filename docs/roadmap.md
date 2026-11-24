@@ -75,9 +75,9 @@ Base: clean 1:1 fork (`build/fork/bin/mtf-recomp.exe` via `tools/build_fork.py`)
    - [ ] *(Experimental)* `ULTRAWIDE` (`21:9`/`32:9`), `HUD_POSITION` (`edges|centered`), and `ASPECT_PATCH` (`nro0` 3D court expands, but 2D menus stretch, match HUD stays in 16:9 bounds, and announcer 3D portrait is hidden — needs `nro0` UI/viewport patches).
    - [x] Implement `FOV` (`res_fov_live()`), `WINDOW_MODE` (`windowed|borderless|fullscreen`), and `HDR` luminance/shadow-lift tuning.
 3. **Anti-Aliasing, Upscaling & Native HDR**
-   - [ ] Port `SMAA` (`vk_smaa.c` + `smaa_*_spv.h`).
-   - [ ] Port `HDR_NATIVE` + `spirv_hdr_shoulder.c`.
-   - [ ] Expose `SHADOW_RES` and `SHADOW_SCALE` in the in-game menu (`metas[]` in `runtime/cfg.c`).
+   - [x] Port `SMAA` (`vk_smaa.c` + `smaa_*_spv.h`) and `SHADOW_SCALE` in `F1 -> Screen`.
+   - [ ] *(Deferred / low ROI)* `HDR_NATIVE` + `spirv_hdr_shoulder.c`: unlike DKB, MTF has no native HDR10 pipeline (tonemaps directly to 8-bit sRGB); `hdr_compose.comp` already reconstructs HDR from pre-tonemap `light` + `bloom` + `exposure`, whereas promoting post-tonemap targets to `RGBA16F` across ~22 shaders adds high complexity for minimal gain.
+   - [ ] Expose `SHADOW_RES` in the in-game menu (`metas[]` in `runtime/cfg.c`).
 4. **CPU, GPU & Memory Optimizations (Vulkan Backend — Tier 2)**
    A/B measurement methodology and evolution table in [docs/perf-methodology.md](perf-methodology.md).
    - **Stage 2.1 — Memory, VRAM & Stutter Reduction (16 GB RAM / 8 GB VRAM PCs):**
