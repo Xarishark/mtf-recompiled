@@ -80,7 +80,7 @@ extern "C" void menu_toggle(void) {
 }
 
 // ---- events from the window adapter, queued while the menu is open; the present path hands them to ImGui
-enum { EV_KEY, EV_POS, EV_BUTTON, EV_WHEEL, EV_FOCUS, EV_MAX = 256 };
+enum { EV_KEY, EV_CHAR, EV_POS, EV_BUTTON, EV_WHEEL, EV_FOCUS, EV_MAX = 256 };
 struct Ev { int type, a, b; float x, y; };
 static PlatMutex ev_lock = PLAT_MUTEX_INIT;
 static Ev ev_q[EV_MAX];
@@ -95,6 +95,7 @@ static void push(Ev e) {
 }
 
 extern "C" void menu_event_key(int key, int down) { push({EV_KEY, key, down, 0, 0}); }
+extern "C" void menu_event_char(unsigned int c) { push({EV_CHAR, (int)c, 0, 0, 0}); }
 extern "C" void menu_event_mouse_pos(float x, float y) { push({EV_POS, 0, 0, x, y}); }
 extern "C" void menu_event_mouse_button(int button, int down) { push({EV_BUTTON, button, down, 0, 0}); }
 extern "C" void menu_event_wheel(float dx, float dy) { push({EV_WHEEL, 0, 0, dx, dy}); }
@@ -111,6 +112,7 @@ static void drain_events(ImGuiIO &io) {
         const Ev &e = q[i];
         switch (e.type) {
         case EV_KEY: io.AddKeyEvent((ImGuiKey)e.a, e.b != 0); break;
+        case EV_CHAR: io.AddInputCharacter((unsigned int)e.a); break;
         case EV_POS: io.AddMousePosEvent(e.x, e.y); break;
         case EV_BUTTON: io.AddMouseButtonEvent(e.a, e.b != 0); break;
         case EV_WHEEL: io.AddMouseWheelEvent(e.x, e.y); break;
@@ -555,7 +557,51 @@ static void tab_game(float scale) {
 
 static void tab_sound(float scale) {
     opt_begin("##sound", scale);
-    opt_slider("MTF_VOLUME", UI_MENU_VOLUME, 0, 100, UI_MENU_VOLUME_DESC, 5, "%.0f %%");
+    {
+        bool from_env = cfg_from_env("MTF_VOLUME") != 0;
+        int vol = (int)lround(cfg_double("MTF_VOLUME"));
+        if (vol < 0) vol = 0;
+        if (vol > 100) vol = 100;
+        int prev_vol = vol;
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(menu_text(UI_MENU_VOLUME));
+        if (from_env) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%s)", menu_text(UI_MENU_SET_BY_ENV));
+            ImGui::BeginDisabled();
+        }
+        float avail_w = ImGui::GetContentRegionAvail().x;
+        float num_w = 72 * scale;
+        float pct_w = ImGui::CalcTextSize("%").x + 8 * scale;
+        float slider_w = avail_w - num_w - pct_w - 10 * scale;
+        if (slider_w < 120 * scale) slider_w = 120 * scale;
+
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * scale);
+        ImGui::SetNextItemWidth(slider_w);
+        bool changed = ImGui::SliderInt("##vol_bar", &vol, 0, 100, "");
+        ImGui::SameLine(0, 8 * scale);
+        ImGui::SetNextItemWidth(num_w);
+        if (ImGui::InputInt("##vol_num", &vol, 0, 0, ImGuiInputTextFlags_CharsDecimal)) changed = true;
+        ImGui::SameLine(0, 6 * scale);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("%");
+        ImGui::PopStyleVar();
+
+        if (from_env) ImGui::EndDisabled();
+
+        if (changed && !from_env) {
+            if (vol < 0) vol = 0;
+            if (vol > 100) vol = 100;
+            if (vol != prev_vol) {
+                char buf[16];
+                snprintf(buf, sizeof buf, "%d", vol);
+                cfg_set("MTF_VOLUME", buf);
+                opt_save_soon();
+            }
+        }
+        ImGui::Spacing();
+    }
     static const UiTextId channels[] = {UI_MENU_CHANNELS_AUTO, UI_MENU_CHANNELS_STEREO, UI_MENU_CHANNELS_51};
     opt_choice("MTF_AUDIO_CHANNELS", UI_MENU_AUDIO_CHANNELS, channels, 3, UI_MENU_AUDIO_CHANNELS_DESC);
     opt_end();
@@ -645,62 +691,133 @@ static void tab_multiplayer(float scale) {
                        "Remote players open the link in Chrome/Edge and automatically control Player 2-4.");
     ImGui::Spacing();
 
+    auto stream_selector = [&](const char *id, const char *label, const char *cfg_key,
+                               const char *const *vals, const char *const *names,
+                               const bool *avail, int count, float label_w, float box_w) {
+        const char *cur = cfg_value(cfg_key);
+        int idx = 0;
+        for (int i = 0; i < count; i++) {
+            if (!strcmp(cur, vals[i])) { idx = i; break; }
+        }
+        auto step_idx = [&](int dir) {
+            for (int k = 1; k <= count; k++) {
+                int ni = (idx + dir * k + count * 4) % count;
+                if (!avail || avail[ni]) {
+                    cfg_set(cfg_key, vals[ni]);
+                    opt_save_tick(1);
+                    break;
+                }
+            }
+        };
+
+        ImGui::PushID(id);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(label_w);
+        if (ImGui::Button("<", ImVec2(28 * scale, 0))) step_idx(-1);
+        ImGui::SameLine(0, 4 * scale);
+        char popup_id[64];
+        snprintf(popup_id, sizeof popup_id, "##popup_%s", id);
+        if (ImGui::Button(names[idx], ImVec2(box_w, 0))) ImGui::OpenPopup(popup_id);
+        if (ImGui::IsItemFocused()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, false))
+                step_idx(-1);
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, false))
+                step_idx(1);
+        }
+        ImGui::SameLine(0, 4 * scale);
+        if (ImGui::Button(">", ImVec2(28 * scale, 0))) step_idx(1);
+
+        if (ImGui::BeginPopup(popup_id)) {
+            for (int i = 0; i < count; i++) {
+                bool ok = !avail || avail[i];
+                if (!ok) ImGui::BeginDisabled();
+                if (ImGui::Selectable(names[i], i == idx) && ok) {
+                    cfg_set(cfg_key, vals[i]);
+                    opt_save_tick(1);
+                }
+                if (!ok) ImGui::EndDisabled();
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopID();
+    };
+
+    float sel_label_w = 135 * scale;
+    float sel_box_w = 260 * scale;
     {
-        const char *cur_q = cfg_value("MTF_STREAM_QUALITY");
         static const char *q_vals[3] = {"performance", "balanced", "quality"};
         static const char *q_names[3] = {"Performance (540p, 2.2 Mbps)", "Balanced (720p, 4.5 Mbps)", "Quality (720p, 7.5 Mbps)"};
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Stream Quality:");
-        for (int i = 0; i < 3; i++) {
-            ImGui::SameLine(0, 8 * scale);
-            bool active = !strcmp(cur_q, q_vals[i]);
-            if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.48f, 0.85f, 1.0f));
-            if (ImGui::Button(q_names[i])) {
-                cfg_set("MTF_STREAM_QUALITY", q_vals[i]);
-                opt_save_tick(1);
-            }
-            if (active) ImGui::PopStyleColor();
-        }
-        ImGui::Spacing();
+        stream_selector("stream_quality", "Stream Quality:", "MTF_STREAM_QUALITY", q_vals, q_names, nullptr, 3, sel_label_w, sel_box_w);
     }
 
     {
         int hw_mask = 0, active_c = 0;
         stream_host_codec_info(&hw_mask, &active_c);
-        const char *cur_c = cfg_value("MTF_STREAM_CODEC");
         static const char *c_vals[4] = {"auto", "av1", "h264", "vp8"};
         static const char *c_names[4] = {"Auto (Recommended)", "AV1 (GPU)", "H.264 (GPU)", "VP8 (CPU)"};
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Stream Codec:");
-        for (int i = 0; i < 4; i++) {
-            ImGui::SameLine(0, 8 * scale);
-            bool avail = (i == 0 || i == 3) || (i == 1 && (hw_mask & (1 << 2))) || (i == 2 && (hw_mask & (1 << 1)));
-            bool active = !strcmp(cur_c, c_vals[i]);
-            if (!avail) ImGui::BeginDisabled();
-            if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.48f, 0.85f, 1.0f));
-            if (ImGui::Button(c_names[i])) {
-                cfg_set("MTF_STREAM_CODEC", c_vals[i]);
-                opt_save_tick(1);
-            }
-            if (active) ImGui::PopStyleColor();
-            if (!avail) ImGui::EndDisabled();
-        }
+        bool c_avail[4] = {true, (hw_mask & (1 << 2)) != 0, (hw_mask & (1 << 1)) != 0, true};
+        stream_selector("stream_codec", "Stream Codec:", "MTF_STREAM_CODEC", c_vals, c_names, c_avail, 4, sel_label_w, sel_box_w);
+
         const char *act_name = active_c == 2 ? "AV1 (GPU)" : active_c == 1 ? "H.264 (GPU)" : "VP8 (CPU)";
+        ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("Detected GPU encoders: AV1=%s, H.264=%s | Active: %s",
                             (hw_mask & (1 << 2)) ? "Yes" : "No",
                             (hw_mask & (1 << 1)) ? "Yes" : "No",
                             act_name);
+        ImGui::SameLine(0, 14 * scale);
+
+        // Vector Cloudflare cloud logo + status checkmark (or Install button)
+        float h = ImGui::GetFrameHeight();
+        float icon_w = 28 * scale;
+        float check_w = info.cf_installed ? 18 * scale : 0;
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(icon_w + check_w, h));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", info.cf_installed ? "cloudflared.exe installed" : "cloudflared.exe not installed");
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImU32 cf_col = info.cf_installed ? IM_COL32(243, 128, 32, 255) : IM_COL32(140, 140, 140, 200);
+        float cy = p.y + h * 0.56f;
+        float cx = p.x + 13 * scale;
+        dl->AddCircleFilled(ImVec2(cx - 5 * scale, cy + 1 * scale), 4.5f * scale, cf_col);
+        dl->AddCircleFilled(ImVec2(cx + 1 * scale, cy - 3 * scale), 6.0f * scale, cf_col);
+        dl->AddCircleFilled(ImVec2(cx + 7 * scale, cy + 1.5f * scale), 4.0f * scale, cf_col);
+        dl->AddRectFilled(ImVec2(cx - 5 * scale, cy + 1 * scale), ImVec2(cx + 7 * scale, cy + 5.5f * scale), cf_col);
+        if (info.cf_installed) {
+            ImU32 chk = IM_COL32(85, 220, 115, 255);
+            float sx = p.x + icon_w + 2 * scale, sy = p.y + h * 0.52f;
+            dl->AddLine(ImVec2(sx, sy), ImVec2(sx + 4 * scale, sy + 4 * scale), chk, 2.2f * scale);
+            dl->AddLine(ImVec2(sx + 4 * scale, sy + 4 * scale), ImVec2(sx + 11 * scale, sy - 5 * scale), chk, 2.2f * scale);
+        } else {
+            ImGui::SameLine(0, 8 * scale);
+            if (info.cf_installing) {
+                ImGui::BeginDisabled();
+                ImGui::Button("Installing cloudflared...");
+                ImGui::EndDisabled();
+            } else {
+                if (ImGui::Button("Install Cloudflare")) stream_host_install_cloudflared();
+            }
+        }
+        if (info.cf_install_msg[0]) ImGui::TextDisabled("%s", info.cf_install_msg);
         ImGui::Spacing();
     }
 
     if (info.state == STREAM_STATE_OFF) {
         reveal_link = false;
+        const char *cf_lbl = "Cloudflare (WebSocket)";
+        const char *rtc_lbl = "WebRTC (Low Latency UDP)";
+        const char *loc_lbl = "Local Host";
+        float pad_x = 28 * scale;
+        float w_cf  = ImGui::CalcTextSize(cf_lbl).x + pad_x;
+        float w_rtc = ImGui::CalcTextSize(rtc_lbl).x + pad_x;
+        float w_loc = ImGui::CalcTextSize(loc_lbl).x + pad_x;
+
         if (!info.cf_installed) ImGui::BeginDisabled();
-        if (ImGui::Button("Cloudflare (WebSocket)", ImVec2(210 * scale, 0))) stream_host_start_mode(STREAM_MODE_CLOUDFLARE);
+        if (ImGui::Button(cf_lbl, ImVec2(w_cf, 0))) stream_host_start_mode(STREAM_MODE_CLOUDFLARE);
         if (!info.cf_installed) ImGui::EndDisabled();
 
         ImGui::SameLine(0, 10 * scale);
-        if (ImGui::Button("WebRTC (Low Latency UDP)", ImVec2(230 * scale, 0))) {
+        if (ImGui::Button(rtc_lbl, ImVec2(w_rtc, 0))) {
             if (info.cf_installed) {
                 stream_host_start_mode(STREAM_MODE_WEBRTC);
             } else {
@@ -710,7 +827,7 @@ static void tab_multiplayer(float scale) {
         }
 
         ImGui::SameLine(0, 10 * scale);
-        if (ImGui::Button("Local Host", ImVec2(140 * scale, 0))) {
+        if (ImGui::Button(loc_lbl, ImVec2(w_loc, 0))) {
             warn_open = true;
             ImGui::OpenPopup("Privacy Warning##no_cf_warn");
         }
@@ -720,22 +837,6 @@ static void tab_multiplayer(float scale) {
             reveal_link = false;
         }
     }
-
-    ImGui::SameLine(0, 18 * scale);
-    if (info.cf_installed) {
-        ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.45f, 1), "[x] cloudflared.exe installed");
-    } else {
-        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.30f, 1), "[ ] cloudflared.exe not installed");
-        ImGui::SameLine(0, 12 * scale);
-        if (info.cf_installing) {
-            ImGui::BeginDisabled();
-            ImGui::Button("Installing cloudflared...", ImVec2(210 * scale, 0));
-            ImGui::EndDisabled();
-        } else {
-            if (ImGui::Button("Install Cloudflare", ImVec2(180 * scale, 0))) stream_host_install_cloudflared();
-        }
-    }
-    if (info.cf_install_msg[0]) ImGui::TextDisabled("%s", info.cf_install_msg);
 
     if (ImGui::BeginPopupModal("Privacy Warning##no_cf_warn", &warn_open, ImGuiWindowFlags_AlwaysAutoResize)) {
         g_modal = true;
