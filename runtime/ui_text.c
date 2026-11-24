@@ -116,6 +116,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SHADOW_SCALE] = "Shadow resolution",
     [UI_MENU_SHADOW_SCALE_DESC] = "Multiplies the game's shadow map resolution (1x = Switch default, 2x-4x = sharper "
         "shadows at higher GPU cost).",
+    [UI_MENU_SMAA] = "SMAA",
+    [UI_MENU_SMAA_DESC] = "Morphological anti-aliasing (SMAA 1x) on the finished picture: smooths edges on any GPU "
+        "(useful when NVIDIA DLAA is unavailable).",
+    [UI_MENU_SMAA_LOW] = "Low",
+    [UI_MENU_SMAA_MEDIUM] = "Medium",
+    [UI_MENU_SMAA_HIGH] = "High",
     [UI_MENU_DLAA] = "NVIDIA DLSS / DLAA",
     [UI_MENU_DLAA_DESC] = "NVIDIA DLSS on RTX GPUs, with nvngx_dlss.dll beside mtf-recomp.exe: anti-aliasing from the game's "
         "motion, sharper and steadier than FXAA. The DLSS mode below picks the scene size.",
@@ -518,6 +524,12 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_SHADOW_SCALE] = "Resolução das sombras",
     [UI_MENU_SHADOW_SCALE_DESC] = "Multiplica a resolução dos mapas de sombra do jogo (1x = padrão do Switch, 2x-4x = "
         "sombras mais nítidas com maior custo de GPU).",
+    [UI_MENU_SMAA] = "SMAA",
+    [UI_MENU_SMAA_DESC] = "Anti-aliasing morfológico (SMAA 1x) na imagem final: suaviza serrilhados em qualquer GPU "
+        "(ótimo quando o NVIDIA DLAA não está disponível).",
+    [UI_MENU_SMAA_LOW] = "Baixo",
+    [UI_MENU_SMAA_MEDIUM] = "Médio",
+    [UI_MENU_SMAA_HIGH] = "Alto",
     [UI_MENU_DLAA] = "NVIDIA DLSS / DLAA",
     [UI_MENU_DLAA_DESC] = "NVIDIA DLSS em GPUs RTX, com o nvngx_dlss.dll ao lado do mtf-recomp.exe: anti-aliasing a partir do "
         "movimento do jogo, mais nítido e estável que o FXAA. O modo DLSS abaixo escolhe o tamanho da cena.",

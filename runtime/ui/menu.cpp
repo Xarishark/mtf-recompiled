@@ -35,6 +35,7 @@ extern "C" {
 #include "cfg.h"
 #include "update_check.h"
 int gfx_window_refresh_hz(void);
+int vk_dlaa_supported(void);
 #include "input.h"
 #include "platform/platform.h"
 #include "ui/menu.h"
@@ -448,12 +449,15 @@ static void row_graphics_preset(void) {
         const char *p = cfg_value("MTF_GRAPHICS_PRESET");
         for (const auto &e : presets) {
             if (!strcmp(p, e.name)) {
+                bool ultra_dlaa = !strcmp(p, "ultra") && vk_dlaa_supported();
                 cfg_set("MTF_RENDER_SCALE", e.rscale);
                 cfg_set("MTF_UPSCALER", e.up);
-                cfg_set("MTF_DLAA", e.dlaa);
+                cfg_set("MTF_DLAA", ultra_dlaa ? "1" : e.dlaa);
+                if (ultra_dlaa) cfg_set("MTF_DLSS", "dlaa");
                 cfg_set("MTF_ANISO", e.aniso);
                 cfg_set("MTF_TESS", e.tess);
-                cfg_set("MTF_FXAA", e.fxaa);
+                cfg_set("MTF_FXAA", ultra_dlaa ? "0" : e.fxaa);
+                cfg_set("MTF_SMAA", ultra_dlaa ? "off" : (!strcmp(p, "ultra") ? "high" : !strcmp(p, "high") ? "medium" : "off"));
                 cfg_set("MTF_SHADOW_SCALE", e.shadow);
                 opt_save_soon();
                 opt_note_restart();
@@ -573,6 +577,8 @@ static void tab_screen(float scale) {
     gfx_custom |= opt_choice_list("MTF_SHADOW_SCALE", UI_MENU_SHADOW_SCALE, shadow, shadow_names, 4, UI_MENU_SHADOW_SCALE_DESC);
     gfx_custom |= opt_toggle("MTF_TESS", UI_MENU_TESS, UI_MENU_TESS_DESC);
     gfx_custom |= opt_toggle("MTF_FXAA", UI_MENU_FXAA, UI_MENU_FXAA_DESC);
+    static const UiTextId smaa[] = {UI_MENU_OFF, UI_MENU_SMAA_LOW, UI_MENU_SMAA_MEDIUM, UI_MENU_SMAA_HIGH};
+    gfx_custom |= opt_choice("MTF_SMAA", UI_MENU_SMAA, smaa, 4, UI_MENU_SMAA_DESC);
     if (gfx_custom && strcmp(cfg_value("MTF_GRAPHICS_PRESET"), "custom")) {
         cfg_set("MTF_GRAPHICS_PRESET", "custom");
         opt_save_soon();

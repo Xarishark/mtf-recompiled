@@ -27,6 +27,9 @@
 #include "ui/menu.h"
 #include "vk.h"
 
+int vk_smaa_record(VkCommandBuffer cb, VkImage dst, const int to[4]);
+void vk_smaa_release(void);
+
 #define FRAMES 10
 #define MAX_IMAGES 16
 #define VSYNC_NS 1000000000ull
@@ -826,6 +829,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
             sync_barrier(cb, psrc, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
     }
+    if (general && !g_sc_hdr) vk_smaa_record(cb, dst, to);
     // last: the image's layout, and the stage and access of its last write, as each step leaves it
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     VkPipelineStageFlags2 last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -954,6 +958,7 @@ void gfx_window_release_vk(void) {
         vk_fg_release();
         menu_vk_release();
         vk_fsr_release();
+        vk_smaa_release();
         vk_color_release();
         vk_hdr_release();
         vk_contact_release();

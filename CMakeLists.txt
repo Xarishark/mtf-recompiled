@@ -123,6 +123,7 @@ set(MTF_RUNTIME_SOURCES
     runtime/vk_dlaa.c
     runtime/vk_framegen.c
     runtime/vk_fsr.c
+    runtime/vk_smaa.c
     runtime/vk_hdr.c
     runtime/vk_headroom.c
     runtime/vk_dump.c

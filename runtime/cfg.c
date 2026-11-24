@@ -140,6 +140,7 @@ static CfgMeta metas[] = {
     {"TESS", NULL, "0|1", RESTART},
     {"DLAA", "0", "0|1", RESTART}, {"DLSS", NULL, "dlaa|quality|balanced|performance|ultra_performance", RESTART},
     {"DLSS_PRESET", "default", "default|k|j", LIVE}, {"FXAA", "1", "0|1", LIVE},
+    {"SMAA", "off", "off|low|medium|high", LIVE},
     {"COLOR_PRESET", "default", "default|vivid|clarity|custom", LIVE}, {"COLOR_BRIGHTNESS", NULL, "-30..30", LIVE},
     {"COLOR_CONTRAST", NULL, "70..150", LIVE}, {"COLOR_SATURATION", NULL, "50..200", LIVE},
     {"COLOR_GAMMA", NULL, "0.8..1.2", LIVE},

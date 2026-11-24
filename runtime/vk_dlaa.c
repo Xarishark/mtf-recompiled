@@ -356,6 +356,7 @@ void vk_dlaa_init(void) {
 }
 
 int vk_dlaa_available(void) { return vk_dlaa_wanted() && N.available; }
+int vk_dlaa_supported(void) { return N.probed && N.available; }
 
 // ---------------------------------------------------------------- where DLAA runs in a deferred renderer's frame
 // A deferred frame as dumps show it (MTF_DUMP): the G-buffer passes draw into five targets with
