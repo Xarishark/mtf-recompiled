@@ -29,6 +29,7 @@ void menu_toggle(void);                   // F1 / Esc on the keyboard, Minus+Plu
 // ---- events from the window adapter, used only while the menu is open. key: an ImGuiKey; coordinates in pixels of the
 // window's client area, which is the swapchain image.
 void menu_event_key(int key, int down);
+void menu_event_char(unsigned int c);
 void menu_event_mouse_pos(float x, float y);
 void menu_event_mouse_button(int button, int down);   // 0 left, 1 right, 2 middle
 void menu_event_wheel(float dx, float dy);

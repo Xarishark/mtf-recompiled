@@ -47,6 +47,7 @@ int stream_copy_clipboard(const char *text);
 int stream_host_active(void);
 void stream_host_info(StreamHostInfo *out);
 void stream_host_target_size(int *w, int *h);
+void stream_host_codec_info(int *hw_mask, int *active_codec);
 
 void stream_host_push_video(const uint8_t *bgra, int w, int h, int stride);
 void stream_host_push_audio(const float *pcm_interleaved, uint32_t frames, int channels, int rate);

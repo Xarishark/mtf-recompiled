@@ -54,6 +54,9 @@ extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res)
         if (!menu_is_open()) return 0;
         if (ImGuiKey k = key_of(w)) menu_event_key(k, m == WM_KEYDOWN || m == WM_SYSKEYDOWN);
         return 0;   // F11, F12 and the system keys keep working
+    case WM_CHAR:
+        if (menu_is_open() && w > 0 && w < 0x10000) menu_event_char((unsigned int)w);
+        return 0;
     case WM_MOUSEMOVE:
         if (menu_is_open()) menu_event_mouse_pos((float)GET_X_LPARAM(l), (float)GET_Y_LPARAM(l));
         return 0;

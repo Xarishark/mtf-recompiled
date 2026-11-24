@@ -109,6 +109,7 @@ set(MTF_RUNTIME_SOURCES
     runtime/stream_host.c
     runtime/cheats.c
     runtime/stream_webrtc.cpp
+    runtime/stream_hwenc.cpp
     runtime/stubs.c
     runtime/svc.c
     runtime/tex_astc.c
@@ -177,7 +178,7 @@ set_source_files_properties(runtime/third_party/imgui/imgui.cpp runtime/third_pa
     runtime/third_party/imgui/backends/imgui_impl_vulkan.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17;-w")
 # A 16 MiB main-thread stack: the guest's boot runs on it before the first guest thread exists.
 target_link_options(mtf-recomp PRIVATE -fuse-ld=lld -Wl,--stack,16777216 -Wl,--error-limit=0)
-target_link_libraries(mtf-recomp PRIVATE vulkan-1 SDL3 opus vpx datachannel juice srtp2 usrsctp mbedtls mbedx509 mbedcrypto everest p256m iphlpapi psapi bcrypt user32 gdi32 dwmapi imm32 winmm ole32 shell32 uuid pdh rstrtmgr ws2_32 winhttp)
+target_link_libraries(mtf-recomp PRIVATE vulkan-1 SDL3 opus vpx datachannel juice srtp2 usrsctp mbedtls mbedx509 mbedcrypto everest p256m iphlpapi psapi bcrypt user32 gdi32 dwmapi imm32 winmm ole32 oleaut32 mfplat mfuuid shell32 uuid pdh rstrtmgr ws2_32 winhttp)
 
 # The DLLs the executable loads, beside it (Vulkan's loader comes with the GPU driver), and llvm-mingw's C++ runtime
 # for the C++ files (the menu, ImGui, Vulkan Memory Allocator).
