@@ -41,7 +41,7 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 
 - [x] Implement Switch 2 texture GOB deswizzling (`tex_deswizzle.c`), ASTC (`tex_astc.c`, `vk_astc.c`), `nvnWindowSetCrop`, and silent ignore of null vertex streams `16..31` (`nvn_api_cmd.c`).
 - [x] Implement Vulkan 1.3 renderer, recorder thread (`vk_rec.c`), offline NVN2 SPIR-V loader (`gfx_shader.c`), and SPIR-V `OpVariable` / `GenerateCall` / unused `c0` binding fixes (`Module.cs`, `Instructions.cs`, `gfx_shader.c`).
-- [ ] **Gate F5:** Opening movie, menus, Adventure intro, and Free Play singles on Stadium Court render at 60 FPS with 0 Vulkan validation errors (60 FPS Vulkan boot, swapchain presentation, 600+ frames, and VP9 2560x1440 opening movie verified; awaiting interactive Stadium Court playthrough and `VK_LAYER_KHRONOS_validation` check).
+- [ ] **Gate F5:** Opening movie, menus, Adventure intro, and Free Play singles on Stadium Court render at 60 FPS (all verified in-game at 60–144 FPS) with 0 Vulkan validation errors (awaiting `VK_LAYER_KHRONOS_validation` check with Vulkan SDK installed).
 
 ## F6 — PC Features (4K, DLSS/DLAA/FSR1, HDR10, Gyro, PT-BR/EN Menu)
 
@@ -52,7 +52,7 @@ Target: *Mario Tennis Fever* (Nintendo Switch 2 / `Ounce`, Title ID `0400D4201C6
 ## F7 — Diagnostics, Frame Replay & Visual Bugfixes
 
 - [x] Port flight recorder & thread snapshots (`runtime/flight.c`, `flight.h`, `tools/flight_view.py`), RenderDoc integration (`runtime/rdoc.c`), and VRAM headroom tracker (`runtime/vk_headroom.c`).
-- [ ] Investigate close-up grass blade rendering and non-NVIDIA shadow portability (ongoing visual QA).
+- [x] Close-up grass blade rendering (`TESS`, `hs`/`ds` tessellation stages) and non-NVIDIA shadow/grass portability (`DEPTH_TWIN` in `runtime/vk_exec_draw.c`, AMD omap/image fixes in `runtime/vk_pipeline.c` and `runtime/vk_texture.c`) implemented.
 
 ## F8 — End-User Installer (`MTF-Setup.exe`) & Release Packaging
 
