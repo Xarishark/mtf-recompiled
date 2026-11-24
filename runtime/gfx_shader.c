@@ -518,6 +518,35 @@ static int nvn2_read(const char *hex, const char *variant, const char *want, uin
     return 0;
 }
 
+static void ensure_storage_caps(uint32_t **spirv, uint64_t *words) {
+    const uint32_t *w = *spirv;
+    uint64_t n = *words;
+    if (!w || n < 5) return;
+    int has_rcap = 0, has_wcap = 0, has_read = 0, has_write = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) return;
+        if (op == 17 && len == 2) {
+            if (w[i + 1] == 55) has_rcap = 1;   // OpCapability StorageImageReadWithoutFormat
+            else if (w[i + 1] == 56) has_wcap = 1;   // OpCapability StorageImageWriteWithoutFormat
+        } else if (op == 98) has_read = 1;      // OpImageRead
+        else if (op == 99) has_write = 1;       // OpImageWrite
+        i += len;
+    }
+    uint32_t add = (uint32_t)((has_read && !has_rcap ? 1 : 0) + (has_write && !has_wcap ? 1 : 0));
+    if (!add) return;
+    uint32_t *out = malloc((size_t)(n + add * 2) * 4);
+    if (!out) return;
+    memcpy(out, w, 5 * 4);
+    uint64_t k = 5;
+    if (has_read && !has_rcap) { out[k++] = (2u << 16) | 17u; out[k++] = 55u; }
+    if (has_write && !has_wcap) { out[k++] = (2u << 16) | 17u; out[k++] = 56u; }
+    memcpy(out + k, w + 5, (size_t)(n - 5) * 4);
+    free(*spirv);
+    *spirv = out;
+    *words = n + add * 2;
+}
+
 // The shader object of files nvn2_read checked (it takes them), entered in the table; NULL when the replay cannot bind it.
 static GfxShader *nvn2_make(const uint8_t key[32], const char *hex, const char *want, int stage, uint8_t *res, uint64_t res_size,
                             uint8_t *spv, uint64_t spv_size) {
@@ -527,6 +556,7 @@ static GfxShader *nvn2_make(const uint8_t key[32], const char *hex, const char *
     memcpy(s->iid, key, 32);
     s->spirv = (uint32_t *)spv;
     s->words = spv_size / 4;
+    ensure_storage_caps(&s->spirv, &s->words);
     s->reflection = (char *)res;
     s->reflection_size = res_size;
     reflect(s);

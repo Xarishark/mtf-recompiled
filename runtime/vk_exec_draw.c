@@ -588,7 +588,7 @@ static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
 // saturated). Colour images are created MUTABLE_FORMAT (vk_texture.c); the view keeps the image's format when either
 // format is emulated (ASTC decoded, RGB expanded, a stand-in component order), is depth or stencil, is compressed in a
 // different block size, or cannot be sampled.
-static VkFormat sampled_format(const VkTexImage *img, const view_t *v, int hv) {
+static VkFormat sampled_format(const VkTexImage *img, const view_t *v, int hv, int storage) {
     if (!hv || !v->set_format || v->format == img->nvn_format || img->block_views || img->chan[0] ||
         (img->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
         return img->format;
@@ -601,13 +601,24 @@ static VkFormat sampled_format(const VkTexImage *img, const view_t *v, int hv) {
     if (!bpb || bpb != vbpb || bw != vbw || bh != vbh) return img->format;
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, b.vk, &fp);
-    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return img->format;
+    VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (!(fp.optimalTilingFeatures & need)) return img->format;
     return b.vk;
 }
 
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
-static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
+static int is_int_shader_fmt(uint8_t code) {
+    switch (code) {
+    case 3: case 4: case 8: case 9: case 11: case 12: case 15: case 16:
+    case 20: case 21: case 23: case 24: case 27: case 28: case 32: case 33:
+    case 35: case 36: case 38: return 1;
+    default: return 0;
+    }
+}
+
+static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype,
+                            uint8_t rformat, int storage) {
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
     if ((img->samples > 1) != ms || (storage && ms)) return VK_NULL_HANDLE;
@@ -655,7 +666,11 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    VkFormat vfmt = storage ? img->format : sampled_format(img, v, hv);
+    VkFormat vfmt = sampled_format(img, v, hv, storage);
+    if (storage && (vfmt == VK_FORMAT_R32_UINT || vfmt == VK_FORMAT_R32_SINT) &&
+        !is_int_shader_fmt(rformat) && !img->block_views &&
+        !(img->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
+        vfmt = VK_FORMAT_R32_SFLOAT;
     ViewKey k = {img->image, vfmt, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
@@ -1372,7 +1387,7 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         view_t v;
         int hv;
         const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
-        if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
+        if (img) view = get_view(ex, img, &v, hv, r->type, r->format, storage), *image = img->image;
         if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {
