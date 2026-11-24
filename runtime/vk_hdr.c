@@ -412,7 +412,8 @@ VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat f
     // the scene: this frame's or the last one's tonemap inputs, of the crop's size
     plat_mutex_lock(&T.lock);
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    int scene = codes && T.light && T.bloom && T.lw == (uint32_t)crop[2] && T.lh == (uint32_t)crop[3] && now - T.frame <= 2;
+    int scene = codes && T.light && T.bloom && T.lw >= (uint32_t)(crop[2] / 2) && T.lh >= (uint32_t)(crop[3] / 2) &&
+                now - T.frame <= 2;
     VkImage light = T.light, bloom = T.bloom;
     VkFormat lfmt = T.lfmt, bfmt = T.bfmt;
     float exposure = T.exposure;
