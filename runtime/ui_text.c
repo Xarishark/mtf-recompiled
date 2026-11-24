@@ -26,7 +26,6 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RENDER_SCALE_DESC] = "The size the 3D scene is drawn at, as a share of the output resolution; the HUD always has the full "
         "size. The game's own choice docked is 80 %. Under 100 % DLSS (with DLAA on) or the game's FXAA "
         "scales the scene up. A DLSS mode other than DLAA sets this itself.",
-        "more GPU time.",
     [UI_MENU_LANGNAME_EN] = "English (US)",
     [UI_MENU_LANGNAME_EN_GB] = "English (UK)",
     [UI_MENU_LANGNAME_JA] = "Japanese",
@@ -63,6 +62,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_COLOR_GAMMA_DESC] = "Below 1 brightens dark and middle tones, above 1 darkens them; 1 leaves them.",
     [UI_MENU_FULLSCREEN] = "Fullscreen",
     [UI_MENU_FULLSCREEN_DESC] = "Fills the screen with the game; F11 toggles it.",
+    [UI_MENU_WINDOW_MODE] = "Window mode",
+    [UI_MENU_WINDOW_MODE_WINDOWED] = "Windowed",
+    [UI_MENU_WINDOW_MODE_BORDERLESS] = "Borderless",
+    [UI_MENU_WINDOW_MODE_FULLSCREEN] = "Fullscreen",
+    [UI_MENU_WINDOW_MODE_DESC] = "Windowed, borderless fullscreen, or topmost fullscreen; F11 toggles fullscreen.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox",
     [UI_MENU_PRESENT_VSYNC] = "VSync",
     [UI_MENU_PRESENT_IMMEDIATE] = "Immediate",
@@ -99,6 +103,14 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ASPECT] = "Picture shape",
     [UI_MENU_ASPECT_DESC] = "When the window's shape differs from the game resolution's (a 16:9 picture on a 21:9 screen): keep "
         "the picture's shape with black bars, or stretch it over the window.",
+    [UI_MENU_ULTRAWIDE] = "Ultrawide aspect",
+    [UI_MENU_ULTRAWIDE_DESC] = "Expands the game's output and 3D camera horizontally for 21:9 or 32:9 monitors.",
+    [UI_MENU_HUD_POSITION] = "Ultrawide HUD",
+    [UI_MENU_HUD_POSITION_EDGES] = "Edges",
+    [UI_MENU_HUD_POSITION_CENTERED] = "Centered",
+    [UI_MENU_HUD_POSITION_DESC] = "Places HUD elements at the ultrawide edges or centered in the 16:9 safe area.",
+    [UI_MENU_FOV] = "Camera FOV",
+    [UI_MENU_FOV_DESC] = "Scales the 3D camera field of view (70 % to 140 %, 100 % = game default).",
     [UI_MENU_ANISO_GAME] = "Game",
     [UI_MENU_ANISO] = "Texture filtering",
     [UI_MENU_ANISO_DESC] = "Anisotropic filtering of surface textures: ground, roads and walls seen at a shallow angle stay "
@@ -434,7 +446,6 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_RENDER_SCALE_DESC] = "O tamanho em que a cena 3D é desenhada, como parte da resolução de saída; o HUD sempre tem o tamanho"
         " todo. A escolha do próprio jogo na TV é 80 %. Abaixo de 100 % o DLSS (com o DLAA ligado) ou o FXAA "
         "do jogo amplia a cena. Um modo DLSS que não seja DLAA decide isso sozinho.",
-        "mais finas por mais tempo de GPU.",
     [UI_MENU_LANGNAME_EN] = "Inglês (EUA)",
     [UI_MENU_LANGNAME_EN_GB] = "Inglês (Reino Unido)",
     [UI_MENU_LANGNAME_JA] = "Japonês",
@@ -471,6 +482,11 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_COLOR_GAMMA_DESC] = "Abaixo de 1 clareia os tons escuros e médios, acima de 1 os escurece; 1 não muda nada.",
     [UI_MENU_FULLSCREEN] = "Tela cheia",
     [UI_MENU_FULLSCREEN_DESC] = "O jogo ocupa a tela inteira; F11 alterna.",
+    [UI_MENU_WINDOW_MODE] = "Modo de janela",
+    [UI_MENU_WINDOW_MODE_WINDOWED] = "Janela",
+    [UI_MENU_WINDOW_MODE_BORDERLESS] = "Sem bordas",
+    [UI_MENU_WINDOW_MODE_FULLSCREEN] = "Tela cheia",
+    [UI_MENU_WINDOW_MODE_DESC] = "Modo janela, tela cheia sem bordas ou tela cheia em primeiro plano; F11 alterna.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox",
     [UI_MENU_PRESENT_VSYNC] = "VSync",
     [UI_MENU_PRESENT_IMMEDIATE] = "Imediato",
@@ -507,6 +523,14 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_ASPECT] = "Formato da imagem",
     [UI_MENU_ASPECT_DESC] = "Quando o formato da janela difere do da resolução do jogo (uma imagem 16:9 numa tela 21:9): manter o"
         " formato da imagem com barras pretas ou esticá-la sobre a janela.",
+    [UI_MENU_ULTRAWIDE] = "Proporção Ultrawide",
+    [UI_MENU_ULTRAWIDE_DESC] = "Expande a saída do jogo e a câmera 3D horizontalmente para monitores 21:9 ou 32:9.",
+    [UI_MENU_HUD_POSITION] = "Posição do HUD (Ultrawide)",
+    [UI_MENU_HUD_POSITION_EDGES] = "Bordas",
+    [UI_MENU_HUD_POSITION_CENTERED] = "Centralizado",
+    [UI_MENU_HUD_POSITION_DESC] = "Mantém o HUD nas bordas da tela ultrawide ou centralizado na área 16:9.",
+    [UI_MENU_FOV] = "FOV da câmera",
+    [UI_MENU_FOV_DESC] = "Ajusta o campo de visão da câmera 3D (70 % a 140 %, 100 % = padrão do jogo).",
     [UI_MENU_ANISO_GAME] = "Jogo",
     [UI_MENU_ANISO] = "Filtragem de texturas",
     [UI_MENU_ANISO_DESC] = "Filtragem anisotrópica das texturas de superfície: chão, estradas e paredes vistos em ângulo raso "

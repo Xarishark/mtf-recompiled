@@ -523,7 +523,10 @@ static void tab_screen(float scale) {
     row_graphics_preset();
     row_output_res();
     row_render_scale();
-    opt_toggle("MTF_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
+    static const UiTextId win_modes[] = {UI_MENU_WINDOW_MODE_WINDOWED, UI_MENU_WINDOW_MODE_BORDERLESS,
+                                         UI_MENU_WINDOW_MODE_FULLSCREEN};
+    if (opt_choice("MTF_WINDOW_MODE", UI_MENU_WINDOW_MODE, win_modes, 3, UI_MENU_WINDOW_MODE_DESC))
+        cfg_set("MTF_FULLSCREEN", strcmp(cfg_value("MTF_WINDOW_MODE"), "windowed") ? "1" : "0");
     row_window_size();
     static const UiTextId present[] = {UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE};
     opt_choice("MTF_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC);
@@ -569,6 +572,12 @@ static void tab_screen(float scale) {
     opt_choice("MTF_DLSS_PRESET", UI_MENU_DLSS_PRESET, preset, 3, UI_MENU_DLSS_PRESET_DESC);
     static const UiTextId aspect[] = {UI_MENU_ASPECT_FIT, UI_MENU_ASPECT_STRETCH};
     opt_choice("MTF_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
+    static const char *const uw_vals[] = {"off", "21:9", "32:9"};
+    const char *uw_names[] = {menu_text(UI_MENU_OFF), "21:9", "32:9"};
+    opt_choice_list("MTF_ULTRAWIDE", UI_MENU_ULTRAWIDE, uw_vals, uw_names, 3, UI_MENU_ULTRAWIDE_DESC);
+    static const UiTextId hud_pos[] = {UI_MENU_HUD_POSITION_EDGES, UI_MENU_HUD_POSITION_CENTERED};
+    opt_choice("MTF_HUD_POSITION", UI_MENU_HUD_POSITION, hud_pos, 2, UI_MENU_HUD_POSITION_DESC);
+    opt_slider("MTF_FOV", UI_MENU_FOV, 70, 140, UI_MENU_FOV_DESC, 5, "%.0f %%");
     static const char *const aniso[] = {"game", "2", "4", "8", "16"};
     const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
     gfx_custom |= opt_choice_list("MTF_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);

@@ -109,40 +109,47 @@ static void keep_awake(int on) {
 // F11: borderless window over the whole monitor, and back to the saved window. The swapchain follows through WM_SIZE.
 // Not Alt+Enter: Enter is the Plus button (input_win.c). A background window (test runs) keeps its place behind the
 // user's windows and takes no focus.
-static void toggle_fullscreen(HWND h) {
+static void set_window_mode(HWND h, int mode) {
     LONG style = GetWindowLongW(h, GWL_STYLE);
-    if (style & WS_OVERLAPPEDWINDOW) {
+    int cur_fs = (style & WS_OVERLAPPEDWINDOW) == 0;
+    if (mode > 0) {
         MONITORINFO mi = {sizeof mi};
-        if (!GetWindowPlacement(h, &g_saved_place) || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi))
-            return;
-        SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
-        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top,
-                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (g_background ? SWP_NOZORDER | SWP_NOACTIVATE : 0));
-    } else {
+        if (!cur_fs && !GetWindowPlacement(h, &g_saved_place)) return;
+        if (!GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi)) return;
+        if (!cur_fs) SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        HWND z = (mode == 2) ? HWND_TOPMOST : HWND_NOTOPMOST;
+        UINT flags = SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (g_background ? SWP_NOZORDER | SWP_NOACTIVATE : 0);
+        SetWindowPos(h, z, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, flags);
+    } else if (cur_fs) {
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_POPUP) | WND_STYLE);
         if (g_background) g_saved_place.showCmd = SW_SHOWNOACTIVATE;
         SetWindowPlacement(h, &g_saved_place);
-        SetWindowPos(h, NULL, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED |
-                         (g_background ? SWP_NOACTIVATE : 0));
+        SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED |
+                         (g_background ? SWP_NOZORDER | SWP_NOACTIVATE : 0));
     }
 }
 
-// The window size and fullscreen state last taken from the settings (window thread). apply_settings acts on a change of
+static void toggle_fullscreen(HWND h) {
+    set_window_mode(h, is_fullscreen(h) ? 0 : 1);
+}
+
+// The window size and window mode last taken from the settings (window thread). apply_settings acts on a change of
 // either value only, so a window resized by hand keeps its size when another setting changes.
 static char g_applied_size[32];
-static int g_applied_fs;
+static int g_applied_mode;
 
 static void note_applied(void) {
     snprintf(g_applied_size, sizeof g_applied_size, "%s", cfg_value("MTF_WINDOW_SIZE"));
-    g_applied_fs = cfg_fullscreen();
+    g_applied_mode = gfx_cfg_window_mode();
 }
 
-// Window thread: the window takes the size and fullscreen state of the settings when they changed. In fullscreen the
+// Window thread: the window takes the size and window mode of the settings when they changed. In fullscreen the
 // size goes into the placement restored when fullscreen ends.
 static void apply_settings(HWND h) {
-    int size_changed = strcmp(cfg_value("MTF_WINDOW_SIZE"), g_applied_size) != 0, fs = cfg_fullscreen(), fs_changed = fs != g_applied_fs;
+    int size_changed = strcmp(cfg_value("MTF_WINDOW_SIZE"), g_applied_size) != 0;
+    int mode = gfx_cfg_window_mode(), mode_changed = mode != g_applied_mode;
     note_applied();
     if (size_changed) {
         int cw, ch, ow, oh;
@@ -160,9 +167,9 @@ static void apply_settings(HWND h) {
             }
         }
     }
-    if (fs_changed && fs != is_fullscreen(h)) {
+    if (mode_changed) {
         input_cursor_suspend(1);
-        toggle_fullscreen(h);
+        set_window_mode(h, mode);
         input_cursor_suspend(0);
     }
 }
@@ -244,6 +251,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             toggle_fullscreen(h);
             input_cursor_suspend(0);
             cfg_set("MTF_FULLSCREEN", is_fullscreen(h) ? "1" : "0");   // the menu shows it; the next start keeps it
+            cfg_set("MTF_WINDOW_MODE", is_fullscreen(h) ? "borderless" : "windowed");
             cfg_save();
             note_applied();   // what cfg_get reads now (the environment may still override it)
         }
@@ -261,9 +269,9 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_APP_FULLSCREEN:
-        if (cfg_fullscreen() && !is_fullscreen(h)) {
+        if (gfx_cfg_window_mode() > 0 && !is_fullscreen(h)) {
             input_cursor_suspend(1);
-            toggle_fullscreen(h);
+            set_window_mode(h, gfx_cfg_window_mode());
             input_cursor_suspend(0);
         }
         return 0;

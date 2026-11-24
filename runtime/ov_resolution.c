@@ -68,16 +68,27 @@ int ov_resolution_lines(void) {
     return lines;
 }
 
-// The output size when it is not the game's own 2560x1440.
+// The output size when it is not the game's own 2560x1440 (or when ultrawide is enabled).
 static int output_size(int *w, int *h) {
     int r = ov_resolution_lines();
-    if (r == 1440) {
+    const char *uw = cfg_value("MTF_ULTRAWIDE");
+    int wide = !strcmp(uw, "32:9") ? 2 : !strcmp(uw, "21:9") ? 1 : 0;
+    if (r == 1440 && !wide) {
         *w = *h = 0;
         return 0;
     }
     *h = r;
-    *w = r == 4320 ? 7680 : r == 2880 ? 5120 : r == 2160 ? 3840 : r == 1080 ? 1920 : r == 720 ? 1280
-         : ((r * 16 + 8) / 9 + 1) & ~1;
+    if (wide == 1) {
+        *w = r == 2160 ? 5120 : r == 1440 ? 3440 : r == 1080 ? 2560 : r == 720 ? 1680
+             : ((r * 21 + 4) / 9 + 1) & ~1;
+    } else if (wide == 2) {
+        *w = r == 2160 ? 7680 : r == 1440 ? 5120 : r == 1080 ? 3840 : r == 720 ? 2560
+             : ((r * 32 + 4) / 9 + 1) & ~1;
+    } else {
+        *w = r == 4320 ? 7680 : r == 2880 ? 5120 : r == 2160 ? 3840 : r == 1080 ? 1920 : r == 720 ? 1280
+             : ((r * 16 + 8) / 9 + 1) & ~1;
+    }
+    if (*w > 7680) *w = 7680;
     return 1;
 }
 
@@ -144,4 +155,31 @@ void ov_resolution_apply(Cpu *c) {
 // The sizes decided above, for DLSS (vk_dlaa.c res_sizes); 0 before the game asked.
 void ov_resolution_sizes(unsigned out[2], unsigned scene[2]) {
     out[0] = (unsigned)out_w, out[1] = (unsigned)out_h, scene[0] = (unsigned)scene_w, scene[1] = (unsigned)scene_h;
+}
+
+// Live camera aspect & FOV hook (called on present when settings change, gfx_present.c).
+// f_7002bbb810 writes (aspect=1.778f, near=0.1f, far=10000.0f, fov=0.526f) at *(0x700355ecd8) + 64..76.
+void res_fov_live(void) {
+    static unsigned seen_cfg = ~0u;
+    static uint64_t seen_cam;
+    static float base_fov;
+    unsigned v = cfg_version();
+    if (!mem_guest_readable(0x700355ecd8ull, 8)) return;
+    uint64_t cam = *(const uint64_t *)(uintptr_t)0x700355ecd8ull;
+    if (!cam || !mem_guest_readable(cam + 64, 16)) return;
+    if (cam != seen_cam) {
+        float near_z = *(const float *)(uintptr_t)(cam + 68);
+        float fov = *(const float *)(uintptr_t)(cam + 76);
+        if (!(near_z > 0.01f && near_z < 10.0f && fov > 0.05f && fov < 3.0f)) return;
+        seen_cam = cam;
+        base_fov = fov;
+        seen_cfg = ~0u;
+    }
+    if (v == seen_cfg) return;
+    seen_cfg = v;
+    if (out_w > 0 && out_h > 0 && strcmp(cfg_value("MTF_ULTRAWIDE"), "off") != 0)
+        *(float *)(uintptr_t)(cam + 64) = (float)out_w / (float)out_h;
+    int pct = cfg_int("MTF_FOV");
+    if (pct < 70 || pct > 140) pct = 100;
+    if (base_fov > 0.0f) *(float *)(uintptr_t)(cam + 76) = base_fov * ((float)pct / 100.0f);
 }

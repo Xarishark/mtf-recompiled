@@ -119,13 +119,22 @@ void gfx_window_request_restart(void) {
 
 // MTF_FULLSCREEN=1: borderless window over the monitor. MTF_WINDOW_SIZE=<w>x<h>: client area of the window (the
 // swapchain follows the window; the game image is scaled to it).
-int gfx_cfg_fullscreen(void) {
-    if (!cfg_from_env("MTF_FULLSCREEN")) {
+// MTF_WINDOW_MODE=windowed|borderless|fullscreen (or legacy MTF_FULLSCREEN=1).
+// Returns 0=windowed, 1=borderless, 2=fullscreen.
+int gfx_cfg_window_mode(void) {
+    if (cfg_from_env("MTF_FULLSCREEN")) return cfg_bool("MTF_FULLSCREEN") ? 1 : 0;
+    const char *wm = cfg_value("MTF_WINDOW_MODE");
+    if (!strcmp(wm, "fullscreen")) return 2;
+    if (!strcmp(wm, "borderless")) return 1;
+    if (!cfg_from_env("MTF_WINDOW_MODE")) {
         const char *mode = getenv("RECOMPLAUNCHER_MODE");
         if (mode && !strcmp(mode, "bigpicture")) return 1;
+        if (cfg_bool("MTF_FULLSCREEN")) return 1;
     }
-    return cfg_bool("MTF_FULLSCREEN");
+    return 0;
 }
+
+int gfx_cfg_fullscreen(void) { return gfx_cfg_window_mode() != 0; }
 
 void gfx_cfg_window_size(int *w, int *h) {
     int x = 0, y = 0;

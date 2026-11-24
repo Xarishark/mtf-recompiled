@@ -25,7 +25,7 @@ void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n) { (void)cb, (void)kind, 
 #endif
 
 // ---- camera field of view, resolution switch and play time: not in this game
-void res_fov_live(void) {}
+
 void res_present(Cpu *c) { (void)c; }
 void playtime_save(void) {}
 

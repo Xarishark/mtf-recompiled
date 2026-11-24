@@ -20,4 +20,5 @@ void gfx_shots_request(const char *prefix, int n);   // the next n pictures, one
 void gfx_window_closed(void);              // the player closed the window: saves, then ends the process
 void gfx_window_set_refresh(double hz);    // the refresh rate of the window's monitor, 0 unknown
 int gfx_cfg_fullscreen(void);              // MTF_FULLSCREEN
+int gfx_cfg_window_mode(void);             // MTF_WINDOW_MODE: 0=windowed, 1=borderless, 2=fullscreen
 void gfx_cfg_window_size(int *w, int *h);  // MTF_WINDOW_SIZE, the default when unparsable or out of range

@@ -45,9 +45,13 @@ static const struct { const char *key, *def; } defaults[] = {
     {"COLOR_SATURATION", "100"},    // %, 100 = unchanged
     {"COLOR_GAMMA", "1"},           // exponent, 1 = unchanged
     {"FULLSCREEN", "0"},            // gfx_present.c (F11 toggles)
+    {"WINDOW_MODE", "windowed"},    // gfx_window_win.c: windowed, borderless, fullscreen
     {"UPSCALER", "fsr"},            // vk_fsr.c: FSR 1 (or bilinear) when the window is larger than the game's output
     {"SHARPNESS", "80"},
     {"ASPECT", "fit"},              // fit (bars) or stretch
+    {"ULTRAWIDE", "off"},           // ov_resolution.c: off (16:9), 21:9, or 32:9
+    {"HUD_POSITION", "edges"},      // edges or centered (16:9 safe zone in ultrawide)
+    {"FOV", "100"},                 // ov_resolution.c: camera FOV % (70..140, 100 = game default)
     {"MOVIE_ASPECT", "keep"},
     {"ANISO", "game"},              // vk_texture.c: the game's anisotropy, or 2..16
     {"SHADOW_RES", "game"},
@@ -125,13 +129,16 @@ static const struct { const char *key, *def; } defaults[] = {
 #define RESTART 0
 static CfgMeta metas[] = {
     // Screen
-    {"FULLSCREEN", NULL, "0|1", LIVE}, {"WINDOW_SIZE", NULL, NULL, LIVE},
+    {"WINDOW_MODE", NULL, "windowed|borderless|fullscreen", LIVE}, {"FULLSCREEN", NULL, "0|1", LIVE}, {"WINDOW_SIZE", NULL, NULL, LIVE},
     {"VK_PRESENT", NULL, "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
     {"FPS_LIMIT", NULL, "30|45|60|90|120|display|unlimited", LIVE},
     {"FRAMEGEN", NULL, "off|120|monitor|unlimited", LIVE},
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"BACKGROUND_FPS", NULL, "0|10|15|20|30", LIVE},
     {"OUTPUT_RES", NULL, "auto|720|1080|1440|2160|2880|4320", RESTART},
+    {"ULTRAWIDE", NULL, "off|21:9|32:9", RESTART},
+    {"HUD_POSITION", NULL, "edges|centered", LIVE},
+    {"FOV", NULL, "70..140", LIVE},
     {"RENDER_SCALE", NULL, "game|50|67|75|100|125|150|200", RESTART},
     {"GRAPHICS_PRESET", "custom", "low|balanced|high|ultra|custom", RESTART},
     {"UPSCALER", NULL, "fsr|bilinear", LIVE}, {"SHARPNESS", NULL, "0..100", LIVE},
