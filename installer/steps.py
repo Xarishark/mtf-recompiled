@@ -462,7 +462,8 @@ class Shaders(Step):
     def key(self, ctx):
         lay = ctx.layout
         answers = lay.root / 'profiles' / TITLE / 'shader_answers.tsv'
-        return fingerprint('shaders-1', ctx.keys['extract'], file_sha256(lay.xlate), file_sha256(answers),
+        xlate_hash = file_sha256(lay.xlate) if lay.xlate.is_file() else 'missing'
+        return fingerprint('shaders-1', ctx.keys['extract'], xlate_hash, file_sha256(answers),
                            file_sha256(lay.root / 'tools' / 'shaders' / 'translate.py'))
 
     def current(self, ctx, record):

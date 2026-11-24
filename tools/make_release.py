@@ -107,7 +107,7 @@ PLAYER_FILES = [
 ]
 
 
-def make_windows_zip(version: str, out_dir: Path, setup_path: Path) -> Path:
+def make_windows_zip(version: str, out_dir: Path, setup_path: Path, bundle_dir: Path | None = None) -> Path:
     """Package MTF-Recomp-v<version>-Windows-x64.zip for players / RecompLauncher (no docs/tests/installer .py)."""
     win_zip = out_dir / f"MTF-Recomp-v{version}-Windows-x64.zip"
     top = Path(f"MTF-Recomp-v{version}-Windows-x64")
@@ -131,6 +131,10 @@ def make_windows_zip(version: str, out_dir: Path, setup_path: Path) -> Path:
                     zf.write(p, top / p.relative_to(setup_path))
         elif setup_path.is_file():
             zf.write(setup_path, top / setup_path.name)
+        if bundle_dir is not None and bundle_dir.is_dir():
+            for p in sorted(bundle_dir.rglob("*")):
+                if p.is_file():
+                    zf.write(p, top / p.relative_to(bundle_dir))
     return win_zip
 
 
@@ -139,6 +143,7 @@ def main() -> int:
     ap.add_argument("--version", default="0.1.0-dev", help="Release version tag")
     ap.add_argument("--out", type=Path, default=ROOT / "build" / "release", help="Output directory")
     ap.add_argument("--windows-zip", action="store_true", help="Also build MTF-Recomp-v<version>-Windows-x64.zip")
+    ap.add_argument("--bundle-dir", type=Path, default=None, help="Optional self-contained toolchain dir (python/llvm/cmake/bin/deps) to include in Windows zip")
     args = ap.parse_args()
     zip_path = make_release(args.version, args.out)
     size_mb = zip_path.stat().st_size / (1024 * 1024)
@@ -146,7 +151,7 @@ def main() -> int:
     if args.windows_zip:
         onedir = args.out / "MTF-Recomp-Setup"
         setup_path = onedir if onedir.is_dir() else (args.out / "MTF-Recomp-Setup.exe")
-        win_zip = make_windows_zip(args.version, args.out, setup_path)
+        win_zip = make_windows_zip(args.version, args.out, setup_path, args.bundle_dir)
         win_mb = win_zip.stat().st_size / (1024 * 1024)
         print(f"Created RecompLauncher Windows archive: {win_zip} ({win_mb:.2f} MiB)")
     return 0
