@@ -385,23 +385,24 @@ def _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def):
         return s.replace('$', '$$').replace(':', '$:').replace(' ', '$ ')
 
     fmap = ' '.join(
-        f'-ffile-prefix-map={p.as_posix()}=.'
+        f'"-ffile-prefix-map={p.as_posix()}=."'
         for p in (lay.root, tree, glue, lay.deps, *dirs)
     )
-    gen_flags = f'-O2 -fwrapv -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden {march} -DNDEBUG {fmap} -I{esc((lay.root / "runtime").as_posix())}'
-    rt_inc = f'-I{esc((lay.root / "runtime").as_posix())} -I{esc((lay.root / "runtime" / "third_party" / "imgui").as_posix())} -I{esc(glue.as_posix())} -isystem {esc((lay.deps / "include").as_posix())} -isystem {esc((lay.deps / "include" / "vma").as_posix())}'
+    gen_flags = f'-O2 -fwrapv -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden {march} -DNDEBUG {fmap} -I"{(lay.root / "runtime").as_posix()}"'
+    rt_inc = f'-I"{(lay.root / "runtime").as_posix()}" -I"{(lay.root / "runtime" / "third_party" / "imgui").as_posix()}" -I"{glue.as_posix()}" -isystem "{(lay.deps / "include").as_posix()}" -isystem "{(lay.deps / "include" / "vma").as_posix()}"'
     rt_defs = f'-D{cpu_def} -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNDEBUG'
     rt_common = f'-O2 -g -Wall -fno-strict-aliasing {march} {rt_defs} {fmap} {rt_inc}'
 
     prebuilt_rt = (lay.deps / 'lib' / 'libmtfrt.a').is_file()
     link_driver = '$cc' if prebuilt_rt else '$cxx'
     rt_libs = '-lmtfrt -lc++ ' if prebuilt_rt else ''
+    rsp_file = tree / 'objects.rsp'
 
     lines = [
         'ninja_required_version = 1.5',
-        f'cc = {esc(cc)}',
-        f'cxx = {esc(cxx)}',
-        f'rc = {esc(rc)}',
+        f'cc = "{cc}"',
+        f'cxx = "{cxx}"',
+        f'rc = "{rc}"',
         'rule cc_gen',
         f'  command = $cc --target=x86_64-w64-windows-gnu {gen_flags} -std=gnu17 -MD -MF $out.d -c $in -o $out',
         '  depfile = $out.d',
@@ -415,11 +416,9 @@ def _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def):
         '  depfile = $out.d',
         '  deps = gcc',
         'rule rc_rt',
-        '  command = $rc --target=pe-x86-64 -O coff -i $in -o $out',
+        f'  command = $rc --target=pe-x86-64 -O coff -i $in -o $out',
         'rule link',
-        f'  command = {link_driver} --target=x86_64-w64-windows-gnu -O2 -g {march} -fuse-ld=lld -Wl,--stack,16777216 -Wl,--error-limit=0 @$out.rsp -L{esc((lay.deps / "lib").as_posix())} {rt_libs}-lvulkan-1 -lSDL3 -lopus -lvpx -ldatachannel -ljuice -lsrtp2 -lusrsctp -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -liphlpapi -lpsapi -lbcrypt -luser32 -lgdi32 -ldwmapi -limm32 -lwinmm -lole32 -loleaut32 -lmfplat -lmfuuid -lshell32 -luuid -lpdh -lrstrtmgr -lws2_32 -lwinhttp -o $out',
-        '  rspfile = $out.rsp',
-        '  rspfile_content = $in',
+        f'  command = {link_driver} --target=x86_64-w64-windows-gnu -O2 -g {march} -fuse-ld=lld -Wl,--stack,16777216 -Wl,--error-limit=0 @"{rsp_file.as_posix()}" -L"{(lay.deps / "lib").as_posix()}" {rt_libs}-lvulkan-1 -lSDL3 -lopus -lvpx -ldatachannel -ljuice -lsrtp2 -lusrsctp -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -liphlpapi -lpsapi -lbcrypt -luser32 -lgdi32 -ldwmapi -limm32 -lwinmm -lole32 -loleaut32 -lmfplat -lmfuuid -lshell32 -luuid -lpdh -lrstrtmgr -lws2_32 -lwinhttp -o $out',
         '',
     ]
 
@@ -476,6 +475,7 @@ def _write_build_ninja(lay, tree, dirs, glue, out, march, cpu_def):
     objs.append(glue_obj)
 
     exe = out / EXE
+    rsp_file.write_text('\n'.join(f'"{o.as_posix()}"' for o in objs) + '\n', encoding='utf-8')
     lines.append(f'build {esc(exe.as_posix())}: link ' + ' '.join(esc(o.as_posix()) for o in objs))
     lines.append(f'default {esc(exe.as_posix())}')
     (tree / 'build.ninja').write_text('\n'.join(lines) + '\n', encoding='utf-8')
