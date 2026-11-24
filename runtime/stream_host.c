@@ -251,10 +251,21 @@ static int ws_broadcast_bin(const uint8_t *payload, size_t len) {
         for (int i = 0; i < 8; i++) hdr[2 + i] = (uint8_t)(((uint64_t)len >> ((7 - i) * 8)) & 0xff);
         hlen = 10;
     }
+    int is_video_delta = (len >= 2 && payload[0] == 1 && (payload[1] & 1) == 0);
     plat_mutex_lock(&g_send_lock);
     for (int i = 0; i < STREAM_MAX_CLIENTS; i++) {
         if (!g_clients[i].active || g_clients[i].sock == INVALID_SOCKET) continue;
         if (g_mode == STREAM_MODE_WEBRTC && webrtc_peer_is_open(i)) continue;
+        if (is_video_delta) {
+            fd_set wfds;
+            struct timeval tv = {0, 0};
+            FD_ZERO(&wfds);
+            FD_SET(g_clients[i].sock, &wfds);
+            if (select(0, NULL, &wfds, NULL, &tv) <= 0 || !FD_ISSET(g_clients[i].sock, &wfds)) {
+                dropped = 1;
+                continue;
+            }
+        }
         if (sock_send_all(g_clients[i].sock, hdr, hlen) < 0 || sock_send_all(g_clients[i].sock, payload, len) < 0) {
             closesocket(g_clients[i].sock);
             g_clients[i].sock = INVALID_SOCKET;
@@ -393,14 +404,14 @@ static const char k_html_page[] =
 "if(!('VideoDecoder'in window)){statEl.textContent='WebCodecs not supported in this browser';return;}"
 "initDecoders();useRtc=false;"
 "const proto=location.protocol==='https:'?'wss://':'ws://';"
-"ws=new WebSocket(proto+location.host+'/ws'+(roomCode?'?code='+encodeURIComponent(roomCode):''));"
-"ws.binaryType='arraybuffer';"
+"const curWs=new WebSocket(proto+location.host+'/ws'+(roomCode?'?code='+encodeURIComponent(roomCode):''));"
+"ws=curWs;ws.binaryType='arraybuffer';"
 "ws.onopen=async()=>{statEl.textContent='Connected (waiting frames...)';"
 "let av1=false,h264=false;"
 "try{av1=(await VideoDecoder.isConfigSupported({codec:'av01.0.04M.08',optimizeForLatency:true})).supported;}catch(_){}"
 "try{h264=(await VideoDecoder.isConfigSupported({codec:'avc1.42E01F',optimizeForLatency:true})).supported;}catch(_){}"
 "if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'caps',av1,h264}));};"
-"ws.onclose=e=>{if(!useRtc)statEl.textContent='Disconnected ('+(e.reason||e.code)+')';};"
+"ws.onclose=e=>{if(ws!==curWs)return;statEl.textContent='Disconnected ('+(e.reason||e.code)+') - reconnecting...';setTimeout(()=>{if(ws===curWs)connect();},1500);};"
 "ws.onmessage=async ev=>{"
 "if(typeof ev.data==='string'){"
 "const msg=JSON.parse(ev.data);"
@@ -627,6 +638,10 @@ static void handle_http_conn(SOCKET s) {
     if (total <= 0) { closesocket(s); return; }
     rcv_to = 0;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rcv_to, sizeof(rcv_to));
+    DWORD snd_to = 1500;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&snd_to, sizeof(snd_to));
+    int nodelay = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
 
     if (strcasestr_ci(req, "Upgrade: websocket")) {
         // In Local Host mode, verify ?code=; in Cloudflare mode, the random tunnel URL itself is the secret token.
